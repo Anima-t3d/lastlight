@@ -1013,6 +1013,31 @@ The `http.extraheader` path above is unaffected and stays: `clone` / `fetch` /
 `merge` still need the token, and the local scratch commits still need the
 `GIT_AUTHOR_*` / `GIT_COMMITTER_*` identity.
 
+### Invariant: host git never trusts the agent's `.git`
+
+The harness runs git itself, as the server's user, on a checkout the agent has
+written to: provisioning's clone, refresh (`fetch` / `checkout -B` / `reset` /
+`clean`) and base fetch, and `post-review`'s `rev-parse` / `rev-list` / `diff`.
+Git reads programs to run from that checkout — `.git/hooks/*`, and config keys
+such as `core.fsmonitor`, `diff.external` or `filter.*` — and places to act on,
+such as `core.worktree` or `url.*.insteadOf`. On every backend that is an escape
+from the sandbox, so two layers (`src/engine/host-git.ts`) keep all of it inert:
+
+- **Every host git call carries `-c core.hooksPath=/dev/null -c
+  core.fsmonitor=false`** (`HOST_GIT_GUARD`, through `hostGit`), which wins over
+  any config file.
+- **`sanitizeCheckout` runs before host git touches a checkout the agent has
+  had.** It refuses a checkout dir that leaves the workspace (a symlink) and a
+  `.git` that is not a plain directory (a symlink, or a gitfile naming another
+  repository) or borrows one through `commondir`; then removes every symlink
+  under `.git` and any object alternates, and rewrites `.git/config` keeping
+  only `remote.origin.url` (reset to the plain GitHub URL), its
+  `refs/heads/* → refs/remotes/origin/*` fetch refspecs and branch tracking.
+
+A refused checkout fails a later phase of the same run (the run tampered with
+it), is discarded and re-cloned for a new run, and fails `post-review` rather
+than review it.
+
 ### Invariant: an in-process run mutates no globals
 
 The container backends hand each run its own env, so they were always isolated.
