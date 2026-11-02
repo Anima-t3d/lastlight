@@ -42,7 +42,7 @@
  *   re-reads the namespace and merges into it.
  */
 
-import { closeSync, constants, openSync, readFileSync, readSync, rmSync, statSync } from "fs";
+import { closeSync, fstatSync, lstatSync, openSync, readFileSync, readSync, rmSync } from "fs";
 import { join, resolve, sep } from "path";
 import type { StateDb } from "../state/db.js";
 import type { WorkflowRun } from "../state/workflow-run-store.js";
@@ -56,7 +56,7 @@ import {
   type FixOutcomeMarker,
 } from "./fix-markers.js";
 import { PR_NOTES_FILE_NAME, VERIFY_SCRIPT_NAME } from "./fix-scratch.js";
-import { isContainedRealPath, readWorkspaceFile } from "./workspace-fs.js";
+import { NOFOLLOW_READ, isContainedRealPath, readWorkspaceFile } from "./workspace-fs.js";
 import {
   boundNotes,
   coerceNotes,
@@ -266,14 +266,17 @@ const MAX_NOTES_FILE_BYTES = 64 * 1024;
 function readTail(path: string): string | null {
   let size: number;
   try {
-    size = statSync(path).size;
+    const st = lstatSync(path);
+    if (!st.isFile()) return null; // a FIFO here would block the open below
+    size = st.size;
   } catch {
     return null; // no journal — the overwhelmingly common case
   }
   let fd: number | undefined;
   try {
     // O_NOFOLLOW closes the gap between the caller's lstat check and this open.
-    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fd = openSync(path, NOFOLLOW_READ);
+    if (!fstatSync(fd).isFile()) return null;
     if (size <= MAX_NOTES_FILE_BYTES) return readFileSync(fd, "utf8");
     const buf = Buffer.alloc(MAX_NOTES_FILE_BYTES);
     const read = readSync(fd, buf, 0, MAX_NOTES_FILE_BYTES, size - MAX_NOTES_FILE_BYTES);
