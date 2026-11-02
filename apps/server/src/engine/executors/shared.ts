@@ -1,5 +1,5 @@
-import { resolve, basename, join } from "path";
-import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync } from "fs";
+import { resolve, basename, join, relative } from "path";
+import { closeSync, constants, cpSync, existsSync, lstatSync, openSync, rmSync, symlinkSync, unlinkSync, writeSync } from "fs";
 import type { RunResult, ThinkingLevel } from "agentic-pi";
 import {
   type ExecutorConfig,
@@ -11,6 +11,13 @@ import { AgenticShim, truncateForLog, safeStringify } from "../event-shim.js";
 import { BuildAssetStore, type BuildAssetRef } from "../../state/build-assets.js";
 import { PR_NOTES_FILE_NAME, VERIFY_SCRIPT_NAME } from "../fix-scratch.js";
 import { logger } from "../../logging/logger.js";
+import {
+  isContainedRealPath,
+  mkdirWorkspaceDir,
+  readWorkspaceFile,
+  removeSymlinksUnder,
+  writeWorkspaceFile,
+} from "../workspace-fs.js";
 
 const log = logger("executor");
 
@@ -126,11 +133,18 @@ export function stageSkillBundle(
   mode: "symlink" | "copy",
 ): string[] | undefined {
   const bundleDir = join(workspaceRoot, SKILL_BUNDLE_ROOT, phaseKey);
-  if (existsSync(bundleDir)) {
-    rmSync(bundleDir, { recursive: true, force: true });
+  // The agent had this workspace a moment ago: a symlinked bundle root would
+  // turn the rm/mkdir/cp below into operations on a host directory.
+  if (!isContainedRealPath(workspaceRoot, join(workspaceRoot, SKILL_BUNDLE_ROOT))) {
+    log.warn("Refusing to stage skills: the skill bundle root is not a plain directory", { workspaceRoot });
+    return undefined;
   }
+  let existing;
+  try { existing = lstatSync(bundleDir); } catch { /* not staged yet */ }
+  if (existing?.isSymbolicLink()) unlinkSync(bundleDir);
+  else if (existing) rmSync(bundleDir, { recursive: true, force: true });
   if (!skillPaths?.length) return undefined;
-  mkdirSync(bundleDir, { recursive: true });
+  mkdirWorkspaceDir(workspaceRoot, join(SKILL_BUNDLE_ROOT, phaseKey));
   const staged: string[] = [];
   for (const hostPath of skillPaths) {
     const dest = join(bundleDir, basename(hostPath));
@@ -171,14 +185,28 @@ export function skillBundleKey(config: ExecutorConfig): string {
 export function excludeFromGit(repoDir: string, entry: string): void {
   const gitDir = join(repoDir, ".git");
   if (!existsSync(gitDir)) return; // not a checkout — nothing to exclude
-  const infoDir = join(gitDir, "info");
-  const excludeFile = join(infoDir, "exclude");
+  const excludeRel = join(".git", "info", "exclude");
+  const excludeFile = join(repoDir, excludeRel);
   const line = `/${entry}/`;
-  let current = "";
-  try { current = readFileSync(excludeFile, "utf8"); } catch { /* may not exist yet */ }
+  // `.git/` sits in the agent's workspace: never create, read or append through a symlink there.
+  try {
+    mkdirWorkspaceDir(repoDir, join(".git", "info"));
+  } catch (err: unknown) {
+    log.warn("Not excluding from git: .git/info is not a plain directory", { repoDir, err });
+    return;
+  }
+  if (!isContainedRealPath(repoDir, excludeFile)) {
+    log.warn("Not excluding from git: .git/info/exclude is a symlink", { repoDir });
+    return;
+  }
+  const current = readWorkspaceFile(repoDir, excludeRel) ?? "";
   if (current.split(/\r?\n/).includes(line)) return;
-  mkdirSync(infoDir, { recursive: true });
-  appendFileSync(excludeFile, `${current.length && !current.endsWith("\n") ? "\n" : ""}${line}\n`);
+  const fd = openSync(excludeFile, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o644);
+  try {
+    writeSync(fd, `${current.length && !current.endsWith("\n") ? "\n" : ""}${line}\n`);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 // ── Server-mode build assets ────────────────────────────────────────
@@ -235,6 +263,10 @@ export function stageArtifactsIn(art: ServerArtifacts | undefined): void {
     // clone the repo into a *subdir* — so `repoDir` is the workspace root and a
     // `.lastlight/` there never collides with the agent's clone. (A future
     // workflow that `git clone … .` into cwd would be the one exception.)
+    // The doc dir is in the agent's workspace: create it without following a
+    // symlink, and drop any it left inside — `cpSync` writes through one.
+    mkdirWorkspaceDir(art.repoDir, relative(art.repoDir, art.dir));
+    removeSymlinksUnder(art.dir);
     art.store.stageInto(art.ref, art.dir);
     // Backstop the prompt-level commit gate: when this is a real checkout, keep
     // the docs out of the agent's `git add -A` feature commit. No-op at the
@@ -250,6 +282,13 @@ export function stageArtifactsIn(art: ServerArtifacts | undefined): void {
 export function harvestArtifactsOut(art: ServerArtifacts | undefined): void {
   if (!art) return;
   try {
+    // Never harvest through a symlinked doc dir (it would copy a host directory
+    // into the store), and store no symlinks the agent left inside it.
+    if (!isContainedRealPath(art.repoDir, art.dir)) {
+      if (existsSync(art.dir)) log.warn("Not harvesting build assets: the doc dir is not a plain directory", { dir: art.dir });
+      return;
+    }
+    removeSymlinksUnder(art.dir);
     art.store.harvestFrom(art.ref, art.dir);
   } catch (err: unknown) {
     log.warn("Could not harvest build assets", { err });
@@ -812,4 +851,14 @@ export function githubAuthEnvFrom(env: Record<string, string>): Record<string, s
     if (env[k]) out[k] = env[k];
   }
   return out;
+}
+
+/**
+ * Write a `type: script` phase's script into the workspace at `scriptDir/fileName`
+ * (both workspace-relative), never through a symlink the agent left there.
+ * Throws on a symlinked directory — the phase must not run someone else's file.
+ */
+export function stageScriptFile(hostWorkspaceDir: string, scriptDir: string, fileName: string, body: string): void {
+  mkdirWorkspaceDir(hostWorkspaceDir, scriptDir);
+  writeWorkspaceFile(hostWorkspaceDir, join(scriptDir, fileName), body);
 }
