@@ -2,6 +2,7 @@ import { execFileSync } from "child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { isAbsolute, join, relative, resolve, sep } from "path";
 import { DockerSandbox, type WorkspaceMount } from "./docker.js";
+import { defaultReclaim } from "./reap.js";
 import { SANDBOX_IMAGE, isSandboxAvailable } from "./images.js";
 import { githubBasicAuthB64, githubExtraheaderArgs } from "./git-http-auth.js";
 import { resetPrNotesJournal, resetVerifyScript } from "../engine/executors/shared.js";
@@ -160,7 +161,7 @@ export async function createTaskSandbox(opts: {
     throw new Error(`Invalid taskId path escape attempt: ${opts.taskId}`);
   }
 
-  mkdirSync(workDir, { recursive: true });
+  ensureWorkspaceDir(workDir, defaultReclaim());
 
   if (opts.prePopulate) {
     prePopulateWorkspace(workDir, opts.prePopulate);
@@ -816,4 +817,18 @@ function refreshExistingClone(
       reason,
     });
   }
+}
+
+/**
+ * Create the per-task workspace, or — when it already exists (per-PR reuse, or
+ * a run that died mid-phase) and `reclaim` is given — re-own it first, so the
+ * host-side refresh, AGENTS.md and skill staging that follow can write to it.
+ * On rootless docker an abandoned tree belongs to the sandbox's `agent` subuid.
+ */
+export function ensureWorkspaceDir(workDir: string, reclaim?: (dir: string) => void): void {
+  if (existsSync(workDir)) {
+    reclaim?.(workDir);
+    return;
+  }
+  mkdirSync(workDir, { recursive: true });
 }
