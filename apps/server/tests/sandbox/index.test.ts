@@ -41,6 +41,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { __prePopulateWorkspaceForTest as prePopulateWorkspace, WorkspaceBusyError } from "#src/sandbox/index.js";
 import { markRunLive, __resetLiveRunsForTest } from "#src/workflows/live-runs.js";
+import { HOST_GIT_GUARD, UnsafeCheckoutError } from "#src/engine/host-git.js";
 
 const mockExec = vi.mocked(execFileSync);
 
@@ -102,7 +103,7 @@ describe("prePopulateWorkspace token-leak protection", () => {
     expect(url).toBe("https://github.com/cliftonc/lastlight.git");
     expect(clone.join(" ")).not.toContain(TOKEN);
     // Auth rides a one-shot `-c http.extraheader=AUTHORIZATION: basic <b64>`.
-    const cfg = clone[clone.indexOf("-c") + 1];
+    const cfg = clone.find((a) => a.startsWith("http."))!;
     expect(cfg).toBe(`http.https://github.com/.extraheader=AUTHORIZATION: basic ${authB64(TOKEN)}`);
   });
 
@@ -113,7 +114,7 @@ describe("prePopulateWorkspace token-leak protection", () => {
     });
     const setUrl = calledArgs().find((a) => a.includes("set-url"))!;
     expect(setUrl).toEqual([
-      "-C", "/tmp/work/lastlight", "remote", "set-url", "origin",
+      "-C", "/tmp/work/lastlight", ...HOST_GIT_GUARD, "remote", "set-url", "origin",
       "https://github.com/cliftonc/lastlight.git",
     ]);
   });
@@ -170,7 +171,7 @@ describe("prePopulateWorkspace token-leak protection", () => {
       owner: "x", repo: "y", branch: "z", token: weird,
     });
     const clone = findClone();
-    const cfg = clone[clone.indexOf("-c") + 1];
+    const cfg = clone.find((a) => a.startsWith("http."))!;
     // The extraheader base64 decodes back to the exact token.
     const b64 = cfg.replace(/^.*AUTHORIZATION: basic /, "");
     expect(Buffer.from(b64, "base64").toString("utf8")).toBe(`x-access-token:${weird}`);
@@ -328,6 +329,95 @@ describe("prePopulateWorkspace clone depth + per-PR reuse (issue #107)", () => {
   });
 });
 
+// Host git runs as the server's user on a checkout the agent wrote to: its
+// hooks and `.git/config` must never get to run a program or redirect git.
+describe("prePopulateWorkspace never lets host git trust the agent's .git", () => {
+  let workDir: string;
+  const REPO = "lastlight";
+  const repoGit = () => join(workDir, REPO, ".git");
+
+  beforeEach(() => {
+    workDir = mkdtempSync(join(tmpdir(), "ll-hostgit-"));
+    mockExec.mockReturnValue(Buffer.from(""));
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    mockExec.mockReset();
+    __resetLiveRunsForTest();
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  const gitCalls = () => mockExec.mock.calls.filter((c) => c[0] === "git").map((c) => c[1] as string[]);
+
+  it("switches hooks and fsmonitor off on every git call, fresh clone and refresh alike", () => {
+    prePopulateWorkspace(workDir, { owner: "o", repo: REPO, branch: "b", baseBranch: "main", token: TOKEN, runId: "r1" });
+    mkdirSync(repoGit(), { recursive: true });
+    writeFileSync(join(workDir, ".lastlight-run"), "r0");
+    prePopulateWorkspace(workDir, { owner: "o", repo: REPO, branch: "b", baseBranch: "main", token: TOKEN, runId: "r1" });
+    const calls = gitCalls().filter((a) => gitVerb(a) !== "config" || !a.includes("--file"));
+    expect(calls.length).toBeGreaterThan(5);
+    for (const a of calls) {
+      expect(a).toContain("core.hooksPath=/dev/null");
+      expect(a).toContain("core.fsmonitor=false");
+    }
+  });
+
+  it("rewrites a planted .git/config before refreshing a reused checkout", () => {
+    mkdirSync(repoGit(), { recursive: true });
+    writeFileSync(join(workDir, ".lastlight-run"), "old-run");
+    writeFileSync(join(repoGit(), "config"), "[core]\n\tfsmonitor = /tmp/evil\n[diff]\n\texternal = /tmp/evil\n");
+    prePopulateWorkspace(workDir, { owner: "o", repo: REPO, branch: "b", token: TOKEN, runId: "new-run" });
+    const cfg = readFileSync(join(repoGit(), "config"), "utf8");
+    expect(cfg).not.toContain("evil");
+    expect(cfg).toContain("url = https://github.com/o/lastlight.git");
+  });
+
+  it("rewrites a planted .git/config before a later phase of the same run fetches the base", () => {
+    mkdirSync(repoGit(), { recursive: true });
+    writeFileSync(join(workDir, ".lastlight-run"), "r1");
+    writeFileSync(join(repoGit(), "config"), "[core]\n\tworktree = /\n");
+    prePopulateWorkspace(workDir, { owner: "o", repo: REPO, branch: "b", baseBranch: "main", token: TOKEN, runId: "r1" });
+    expect(readFileSync(join(repoGit(), "config"), "utf8")).not.toContain("worktree");
+  });
+
+  it("refuses a later phase of the same run whose .git now points at another repository", () => {
+    mkdirSync(join(workDir, REPO), { recursive: true });
+    writeFileSync(repoGit(), "gitdir: /var/lib/lastlight/elsewhere\n");
+    writeFileSync(join(workDir, ".lastlight-run"), "r1");
+    expect(() =>
+      prePopulateWorkspace(workDir, { owner: "o", repo: REPO, branch: "b", token: TOKEN, runId: "r1" }),
+    ).toThrow(UnsafeCheckoutError);
+    expect(gitCalls()).toEqual([]);
+  });
+
+  it("discards a reused checkout whose .git is a gitfile and clones fresh for a new run", () => {
+    mkdirSync(join(workDir, REPO), { recursive: true });
+    writeFileSync(repoGit(), "gitdir: /var/lib/lastlight/elsewhere\n");
+    writeFileSync(join(workDir, ".lastlight-run"), "old-run");
+    prePopulateWorkspace(workDir, { owner: "o", repo: REPO, branch: "b", token: TOKEN, runId: "new-run" });
+    expect(gitVerbs()[0]).toBe("clone");
+    expect(gitVerbs()).not.toContain("fetch");
+    expect(existsSync(repoGit())).toBe(false);
+  });
+
+  it("never runs git through a checkout dir the agent symlinked out of the workspace", () => {
+    const hostRepo = mkdtempSync(join(tmpdir(), "ll-hostrepo-"));
+    try {
+      mkdirSync(join(hostRepo, ".git"));
+      writeFileSync(join(hostRepo, "keep.txt"), "k");
+      symlinkSync(hostRepo, join(workDir, REPO));
+      writeFileSync(join(workDir, ".lastlight-run"), "old-run");
+      prePopulateWorkspace(workDir, { owner: "o", repo: REPO, branch: "b", token: TOKEN, runId: "new-run" });
+      expect(gitCalls().some((a) => a.includes(hostRepo))).toBe(false);
+      expect(gitVerbs()[0]).toBe("clone");
+      expect(lstatSync(join(workDir, REPO), { throwIfNoEntry: false })?.isSymbolicLink() ?? false).toBe(false);
+      expect(readFileSync(join(hostRepo, "keep.txt"), "utf8")).toBe("k");
+    } finally {
+      rmSync(hostRepo, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("prePopulateWorkspace base merge-base availability (pr-review diff)", () => {
   let workDir: string;
   const REPO = "lastlight";
@@ -461,7 +551,7 @@ describe("prePopulateWorkspace same-run base refresh (stuck-PR recovery)", () =>
     // the whole safety argument for doing this on the preserve path.
     expect(gitVerbs()).toEqual(["config", "remote", "fetch", "fetch", "merge-base"]);
     const setBranches = calledArgs().find((a) => a.includes("set-branches"))!;
-    expect(setBranches).toEqual(["-C", join(workDir, REPO), "remote", "set-branches", "--add", "origin", "main"]);
+    expect(setBranches).toEqual(["-C", join(workDir, REPO), ...HOST_GIT_GUARD, "remote", "set-branches", "--add", "origin", "main"]);
   });
 
   it("stays a pure no-op on a same-run revisit when base equals the head branch", () => {
@@ -519,7 +609,7 @@ describe("prePopulateWorkspace recreate-from-base (build, issue #153)", () => {
     const clone = findClone();
     expect(clone).not.toContain("--branch");
     const checkout = calledArgs().find((a) => a.includes("checkout"))!;
-    expect(checkout).toEqual(["-C", join(workDir, REPO), "checkout", "-B", FEATURE]);
+    expect(checkout).toEqual(["-C", join(workDir, REPO), ...HOST_GIT_GUARD, "checkout", "-B", FEATURE]);
     // Marker advanced to the new run.
     expect(readFileSync(join(workDir, ".lastlight-run"), "utf-8")).toBe("new-run");
   });
