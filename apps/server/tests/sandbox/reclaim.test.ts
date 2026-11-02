@@ -25,8 +25,8 @@ vi.mock("#src/logging/logger.js", () => {
 });
 
 import { execFileSync } from "child_process";
-import { reapSandboxWorkspace, reclaimWorkspaceDir, sandboxRoot } from "#src/sandbox/reap.js";
-import { ensureWorkspaceDir } from "#src/sandbox/index.js";
+import { hasLiveSandboxFor, reapSandboxWorkspace, reclaimWorkspaceDir, sandboxRoot } from "#src/sandbox/reap.js";
+import { ensureWorkspaceDir, WorkspaceBusyError } from "#src/sandbox/index.js";
 
 const mockExec = vi.mocked(execFileSync);
 const tmps: string[] = [];
@@ -162,16 +162,35 @@ describe("ensureWorkspaceDir", () => {
     expect(reclaim).not.toHaveBeenCalled();
   });
 
-  it("leaves a workspace alone while another live run's container owns it", () => {
+  it("refuses a workspace another live sandbox container owns, without touching it", () => {
     const dir = tmp("ws-");
     const reclaim = vi.fn();
-    ensureWorkspaceDir(dir, reclaim, () => true);
+    expect(() => ensureWorkspaceDir(dir, reclaim, () => true)).toThrow(WorkspaceBusyError);
     expect(reclaim).not.toHaveBeenCalled();
+  });
+
+  it("keeps upstream behaviour (no busy refusal) when not on rootless docker", () => {
+    const dir = tmp("ws-");
+    expect(() => ensureWorkspaceDir(dir, undefined, () => true)).not.toThrow();
   });
 
   it("does nothing extra when no reclaim is given", () => {
     const dir = tmp("ws-");
     expect(() => ensureWorkspaceDir(dir)).not.toThrow();
     expect(mockExec).not.toHaveBeenCalled();
+  });
+});
+
+describe("hasLiveSandboxFor", () => {
+  it("matches this task's sandbox containers exactly, not a task whose id merely extends it", () => {
+    mockExec.mockReturnValue("lastlight-sandbox-acme-12-1234abcd\n");
+    expect(hasLiveSandboxFor("acme-1")).toBe(false);
+    mockExec.mockReturnValue("lastlight-sandbox-acme-12-1234abcd\nlastlight-sandbox-acme-1-deadbeef\n");
+    expect(hasLiveSandboxFor("acme-1")).toBe(true);
+  });
+
+  it("treats an unreachable docker as no live sandbox", () => {
+    mockExec.mockImplementation(() => { throw new Error("no daemon"); });
+    expect(hasLiveSandboxFor("acme-1")).toBe(false);
   });
 });
