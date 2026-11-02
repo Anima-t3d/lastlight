@@ -123,6 +123,21 @@ agentic-pi's VM. Container name: `lastlight-sandbox-{taskId}-{uuid}`.
 - Network: `lastlight_sandbox-egress` (internal — no host route).
 - DNS: `--dns 172.30.0.10` (strict) or `--dns 172.30.0.11` (open).
 - Memory: `--memory 2g --memory-swap 2g` by default.
+- Opt-in hardening, each off unless set (a malformed value fails sandbox
+  creation, naming the variable):
+  - `SANDBOX_PIDS_LIMIT=<n>`: `--pids-limit <n>`.
+  - `SANDBOX_CPUS=<n>`: `--cpus <n>` (decimals allowed).
+  - `SANDBOX_CAP_DROP=1`: `--cap-drop ALL`, then only the capabilities the
+    entrypoint needs (`CHOWN SETUID SETGID DAC_OVERRIDE FOWNER`), plus
+    `--security-opt no-new-privileges`.
+- Rootless Docker: `SANDBOX_ROOTLESS=1`. The image's `agent` (uid 10001)
+  matches the harness user only on a rootful daemon. Rootless maps it to a
+  subuid, so the host could no longer stage into, refresh or remove a
+  workspace the entrypoint chowned. In this mode:
+  - the workspace belongs to container root (the host user) between runs;
+  - it belongs to `agent` only while an agent or command runs;
+  - reap and workspace reuse first re-own a tree a crashed run left behind,
+    using a throwaway container with no network.
 - Timeout: the phase's `timeout_seconds`, else `sandbox.agentTimeoutSeconds`
   (1800 in `config/default.yaml`; no code default); runs longer are killed.
 - Image: the lean `lastlight-sandbox:latest` (`sandbox.Dockerfile`) by
