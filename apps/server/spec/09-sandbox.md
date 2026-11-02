@@ -137,7 +137,15 @@ agentic-pi's VM. Container name: `lastlight-sandbox-{taskId}-{uuid}`.
   - the workspace belongs to container root (the host user) between runs;
   - it belongs to `agent` only while an agent or command runs;
   - reap and workspace reuse first re-own a tree a crashed run left behind,
-    using a throwaway container with no network.
+    using a throwaway container with no network. Neither happens while
+    another live container still owns the workspace.
+  - every hand-back first kills the agent's leftover background processes
+    (PID 1 is spared), so nothing the agent started can keep writing after
+    the host takes the tree back;
+  - overlapping runs (fanout) share one hand-over, and a new hand-over waits
+    for an unfinished hand-back;
+  - a phase that must stage skills while a sibling run holds the workspace
+    fails rather than running without them.
 - Timeout: the phase's `timeout_seconds`, else `sandbox.agentTimeoutSeconds`
   (1800 in `config/default.yaml`; no code default); runs longer are killed.
 - Image: the lean `lastlight-sandbox:latest` (`sandbox.Dockerfile`) by

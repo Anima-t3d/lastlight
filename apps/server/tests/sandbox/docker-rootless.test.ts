@@ -37,7 +37,7 @@ vi.mock("#src/logging/logger.js", () => {
 });
 
 import { spawn, execFile } from "child_process";
-import { DockerSandbox } from "#src/sandbox/docker.js";
+import { DockerSandbox, WorkspaceHeldError } from "#src/sandbox/docker.js";
 
 const mockSpawn = vi.mocked(spawn);
 const mockExecFile = vi.mocked(execFile);
@@ -190,6 +190,64 @@ describe("DockerSandbox on rootless docker — workspace ownership", () => {
     children[0].emit("close", 0);
     children[1].emit("close", 0);
     await Promise.all([a, b]);
+  });
+
+  it("a run arriving during a hand-back waits for it before taking the workspace", async () => {
+    let finishHandBack: (() => void) | undefined;
+    mockExecFile.mockImplementation(((_cmd: string, args: string[], opts: unknown, cb?: unknown) => {
+      const done = (typeof opts === "function" ? opts : cb) as (e: unknown, r: unknown) => void;
+      if (args.includes("0:0") && !finishHandBack) {
+        events.push("chown:0:0:start");
+        finishHandBack = () => {
+          events.push("chown:0:0:end");
+          done(null, { stdout: "", stderr: "" });
+        };
+        return;
+      }
+      if (args.includes("chown")) events.push(`chown:${args[args.length - 2]}`);
+      done(null, { stdout: "", stderr: "" });
+    }) as unknown as typeof execFile);
+    const s = sandbox(true);
+    const first = s.runAgent("task-001", "a", RUN);
+    await vi.waitFor(() => expect(children).toHaveLength(1));
+    children[0].emit("close", 0);
+    await vi.waitFor(() => expect(finishHandBack).toBeDefined());
+    const second = s.runCommand("task-001", "true", { timeoutSeconds: 5 });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(events.filter((e) => e === "chown:agent:agent")).toHaveLength(1);
+    finishHandBack!();
+    await first;
+    await vi.waitFor(() => expect(children).toHaveLength(2));
+    const end = events.indexOf("chown:0:0:end");
+    expect(events.indexOf("chown:agent:agent", end)).toBeGreaterThan(end);
+    children[1].emit("close", 0);
+    await second;
+  });
+
+  it("the hand-back first kills the agent's leftover processes, sparing PID 1", async () => {
+    const s = sandbox(true);
+    const run = s.runAgent("task-001", "hi", RUN);
+    await vi.waitFor(() => expect(children).toHaveLength(1));
+    children[0].emit("close", 0);
+    await run;
+    const calls = mockExecFile.mock.calls.map((c) => c[1] as string[]);
+    const kill = calls.findIndex((a) => a[0] === "exec" && a.includes("sh") && a.join(" ").includes("kill -9"));
+    const back = calls.findIndex((a) => a.includes("0:0"));
+    expect(kill).toBeGreaterThan(-1);
+    expect(kill).toBeLessThan(back);
+    expect(calls[kill].slice(0, 4)).toEqual(["exec", "-u", "0", "test-container"]);
+    expect(calls[kill].at(-1)).toMatch(/\[ "\$p" = 1 \] && continue/);
+  });
+
+  it("reports a held workspace while a run executes, and a free one after", async () => {
+    const s = sandbox(true);
+    expect(() => s.assertWorkspaceFree("task-001")).not.toThrow();
+    const run = s.runAgent("task-001", "hi", RUN);
+    await vi.waitFor(() => expect(children).toHaveLength(1));
+    expect(() => s.assertWorkspaceFree("task-001")).toThrow(WorkspaceHeldError);
+    children[0].emit("close", 0);
+    await run;
+    expect(() => s.assertWorkspaceFree("task-001")).not.toThrow();
   });
 
   it("without rootless no ownership exec is issued", async () => {

@@ -379,6 +379,9 @@ export async function runAgentIn(
     try {
       skillDirs = sandbox.stageSkills(skillBundleKey(config), config.skillPaths);
     } catch (err: unknown) {
+      // A held workspace (rootless docker, a sibling run active) is not a
+      // degradable failure: the phase would silently run without its skills.
+      if (err instanceof Error && err.name === "WorkspaceHeldError") throw err;
       log.warn("Could not stage skills", { err });
     }
 

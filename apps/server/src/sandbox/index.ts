@@ -1,11 +1,13 @@
 import { execFileSync } from "child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
-import { isAbsolute, join, relative, resolve, sep } from "path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "path";
 import { DockerSandbox, parseSandboxLimits, type WorkspaceMount } from "./docker.js";
-import { defaultReclaim } from "./reap.js";
+import { defaultReclaim, hasLiveContainer } from "./reap.js";
+import { resolveWorkspaceMount } from "./workspace-mount.js";
 import { SANDBOX_IMAGE, isSandboxAvailable } from "./images.js";
 import { githubBasicAuthB64, githubExtraheaderArgs } from "./git-http-auth.js";
 import { resetPrNotesJournal, resetVerifyScript } from "../engine/executors/shared.js";
+import { readWorkspaceFile, writeWorkspaceFile } from "../engine/workspace-fs.js";
 import { logger } from "../logging/logger.js";
 import { isRunLive } from "../workflows/live-runs.js";
 
@@ -161,7 +163,7 @@ export async function createTaskSandbox(opts: {
     throw new Error(`Invalid taskId path escape attempt: ${opts.taskId}`);
   }
 
-  ensureWorkspaceDir(workDir, defaultReclaim());
+  ensureWorkspaceDir(workDir, defaultReclaim(opts.stateDir), () => hasLiveContainer(opts.taskId));
 
   if (opts.prePopulate) {
     prePopulateWorkspace(workDir, opts.prePopulate);
@@ -190,50 +192,6 @@ export async function createTaskSandbox(opts: {
     log.warn("Failed to create sandbox", { err });
     return null;
   }
-}
-
-/**
- * Decide how the sandbox container should mount `/home/agent/workspace`.
- *
- * The harness writes the per-task workspace to `workDir`, which is always
- * under `stateDir` (`sandboxes/<taskId>/`). In production, `stateDir` is
- * served by a named docker volume mounted into the harness container. A
- * plain `-v workDir:/home/agent/workspace` bind makes the daemon resolve
- * `workDir` against the *host* filesystem, where the named volume's
- * content is not visible — docker silently creates an empty dir at that
- * host path and mounts it, so the sandbox sees an empty workspace and the
- * skills the harness staged are never reachable.
- *
- * In volume mode we ask docker for a `volume-subpath` mount instead, so
- * the sandbox sees exactly the harness's view. In path mode (local dev,
- * or any deployment where SANDBOX_DATA_VOLUME is a host path) a normal
- * bind is correct because both views point at the same FS path.
- *
- * Edge case: if `opts.sandboxDir` was overridden to live outside `stateDir`,
- * we can't carve a volume-subpath out of the data volume — fall back to
- * a bind mount. That keeps the no-data-volume dev path working; the
- * named-volume + custom-sandboxDir combination isn't currently used.
- */
-function resolveWorkspaceMount(
-  stateDir: string,
-  workDir: string,
-): WorkspaceMount {
-  const dataVolumeRaw = process.env.SANDBOX_DATA_VOLUME || "lastlight_agent-data";
-  if (isPathLike(dataVolumeRaw)) {
-    return { type: "bind", hostPath: workDir };
-  }
-  const rel = relative(resolve(stateDir), workDir);
-  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
-    return { type: "bind", hostPath: workDir };
-  }
-  return { type: "volume-subpath", volume: dataVolumeRaw, subpath: rel };
-}
-
-function isPathLike(value: string): boolean {
-  return value.startsWith("/") ||
-    value.startsWith("./") ||
-    value.startsWith("../") ||
-    value.startsWith("~");
 }
 
 /**
@@ -693,18 +651,16 @@ function ensureBaseAvailable(
   }
 }
 
+// The marker sits at a fixed path in a workspace the agent controlled: read and
+// write it without following a symlink (one could point at the database).
 function readMarker(markerPath: string): string | null {
-  try {
-    return readFileSync(markerPath, "utf-8").trim() || null;
-  } catch {
-    return null;
-  }
+  return readWorkspaceFile(dirname(markerPath), basename(markerPath))?.trim() || null;
 }
 
 function writeMarker(markerPath: string, runId: string | undefined): void {
   if (!runId) return;
   try {
-    writeFileSync(markerPath, runId);
+    writeWorkspaceFile(dirname(markerPath), basename(markerPath), runId);
   } catch {
     // Best-effort — a missing marker just means the next reuse refreshes
     // (the safe direction), never a wrong-preserve.
@@ -825,9 +781,14 @@ function refreshExistingClone(
  * host-side refresh, AGENTS.md and skill staging that follow can write to it.
  * On rootless docker an abandoned tree belongs to the sandbox's `agent` subuid.
  */
-export function ensureWorkspaceDir(workDir: string, reclaim?: (dir: string) => void): void {
+export function ensureWorkspaceDir(
+  workDir: string,
+  reclaim?: (dir: string) => void,
+  /** A live container still owns this workspace: leave it for the busy check below to refuse. */
+  isBusy?: () => boolean,
+): void {
   if (existsSync(workDir)) {
-    reclaim?.(workDir);
+    if (reclaim && !isBusy?.()) reclaim(workDir);
     return;
   }
   mkdirSync(workDir, { recursive: true });
