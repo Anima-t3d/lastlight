@@ -170,6 +170,7 @@ export async function createTaskSandbox(opts: {
     imageName: opts.imageName || SANDBOX_IMAGE,
     env: opts.env || {},
     memoryLimit: process.env.SANDBOX_MEMORY_LIMIT || undefined,
+    rootless: process.env.SANDBOX_ROOTLESS === "1",
     dnsIp: opts.dnsIp,
   });
 
