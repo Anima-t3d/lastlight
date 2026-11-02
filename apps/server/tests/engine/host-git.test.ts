@@ -62,6 +62,22 @@ describe("hostGit", () => {
     hostGit(repo, ["checkout", "-q", "-B", "other"]);
     expect(existsSync(marker)).toBe(false);
   });
+
+  it("never discovers a repository above a checkout that has no .git", () => {
+    // The workspace root is the agent's to write: a `.git` there, with its own
+    // config, must not stand in for the checkout's missing one.
+    rmSync(join(repo, ".git"), { recursive: true });
+    execFileSync("git", ["-C", ws, "init", "-q"]);
+    execFileSync("git", ["-C", ws, "config", "diff.external", evilScript()]);
+    writeFileSync(join(ws, "f.txt"), "a");
+    execFileSync("git", ["-C", ws, "add", "f.txt"]);
+    writeFileSync(join(ws, "f.txt"), "b");
+
+    sanitizeCheckout(ws, repo, ORIGIN);
+    expect(() => hostGit(repo, ["rev-parse", "--git-dir"], { stdio: "pipe" })).toThrow();
+    expect(() => hostGit(repo, ["diff", "--", "../f.txt"], { stdio: "pipe" })).toThrow();
+    expect(existsSync(marker)).toBe(false);
+  });
 });
 
 describe("sanitizeCheckout", () => {
