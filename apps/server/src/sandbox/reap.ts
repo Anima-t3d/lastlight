@@ -3,6 +3,7 @@ import { rmSync } from "fs";
 import { join, resolve, sep } from "path";
 import { logger } from "../logging/logger.js";
 import { SERVICE_LABEL_SELECTOR } from "./service-containers-docker.js";
+import { SANDBOX_IMAGE } from "./images.js";
 
 const log = logger("reap");
 
@@ -93,6 +94,30 @@ export interface ReapResult {
 }
 
 /**
+ * Give an abandoned workspace back to the host user on rootless docker. A run
+ * that died between hand-overs (see `DockerSandbox` `rootless`) leaves the tree
+ * owned by the sandbox's `agent` subuid, which the host cannot delete or reuse.
+ * Container root IS the host user there, so a throwaway container with only the
+ * ownership caps and no network re-owns it. `-h -P`: planted symlinks are
+ * re-owned, never followed. Throws on failure.
+ */
+export function reclaimWorkspaceDir(hostDir: string, imageName: string): void {
+  execFileSync("docker", [
+    "run", "--rm", "--network", "none",
+    "--cap-drop", "ALL", "--cap-add", "CHOWN", "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
+    "--entrypoint", "chown",
+    "-v", `${hostDir}:/w`,
+    imageName,
+    "-R", "-h", "-P", "0:0", "/w",
+  ], { stdio: "pipe", timeout: 120_000 });
+}
+
+/** The reclaim reap and reuse use by default: only on rootless docker. */
+export function defaultReclaim(): ((dir: string) => void) | undefined {
+  return process.env.SANDBOX_ROOTLESS === "1" ? (dir) => reclaimWorkspaceDir(dir, SANDBOX_IMAGE) : undefined;
+}
+
+/**
  * Remove the workspace dir backing `taskId`. Best-effort: a missing dir is a
  * no-op success (`force: true`), and any failure is swallowed into
  * `{ removed: false, reason: "error" }` — reaping must never fail an
@@ -106,6 +131,8 @@ export function reapSandboxWorkspace(opts: {
   skipIfLiveContainer?: boolean;
   /** Injectable live-container probe (test seam); defaults to {@link hasLiveContainer}. */
   isLive?: (taskId: string) => boolean;
+  /** Re-owns an abandoned workspace before a retry (test seam); defaults to {@link defaultReclaim}. */
+  reclaim?: (dir: string) => void;
 }): ReapResult {
   const base = sandboxRoot(opts.stateDir, opts.sandboxDir);
   const workDir = resolve(base, opts.taskId);
@@ -125,11 +152,23 @@ export function reapSandboxWorkspace(opts: {
     // collect them. This is the backstop for that; the happy path is
     // `DockerSandbox.destroy`. Kubernetes needs no equivalent (the pod is the boundary).
     reapServiceContainers(opts.taskId);
-    rmSync(workDir, { recursive: true, force: true });
+    removeWorkspace(workDir, opts.reclaim ?? defaultReclaim());
     log.info("Removed workspace", { taskId: opts.taskId });
     return { removed: true };
   } catch (err) {
     log.warn("Failed to remove workspace", { taskId: opts.taskId, err });
     return { removed: false, reason: "error" };
+  }
+}
+
+/** `rmSync`, retried once after `reclaim` when the host lacks permission. */
+function removeWorkspace(workDir: string, reclaim: ((dir: string) => void) | undefined): void {
+  try {
+    rmSync(workDir, { recursive: true, force: true });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (!reclaim || (code !== "EACCES" && code !== "EPERM")) throw err;
+    reclaim(workDir);
+    rmSync(workDir, { recursive: true, force: true });
   }
 }
