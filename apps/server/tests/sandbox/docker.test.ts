@@ -38,7 +38,7 @@ vi.mock("#src/logging/logger.js", () => {
 });
 
 import { spawn, execFile, execFileSync } from "child_process";
-import { DockerSandbox } from "#src/sandbox/docker.js";
+import { DockerSandbox, parseSandboxLimits } from "#src/sandbox/docker.js";
 
 const mockSpawn = vi.mocked(spawn);
 const mockExecFileSync = vi.mocked(execFileSync);
@@ -294,5 +294,80 @@ describe("DockerSandbox.create — shared package cache (issue #107)", () => {
       if (prev === undefined) delete process.env.LASTLIGHT_PKG_CACHE_VOLUME;
       else process.env.LASTLIGHT_PKG_CACHE_VOLUME = prev;
     }
+  });
+});
+
+describe("DockerSandbox.create — opt-in hardening flags", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockExecFileSync.mockReturnValue("container-xyz\n");
+  });
+
+  async function argvFor(extra: Partial<ConstructorParameters<typeof DockerSandbox>[0]>): Promise<string[]> {
+    const manager = new DockerSandbox({ imageName: "img", env: {}, ...extra });
+    await manager.create({
+      taskId: "t",
+      worktreePath: "/tmp/work",
+      workspaceMount: { type: "bind", hostPath: "/tmp/work" },
+    });
+    const call = mockExecFileSync.mock.calls.find((c) => Array.isArray(c[1]) && (c[1] as string[])[0] === "run");
+    return ((call?.[1] as string[]) ?? []).map((a) => a.replace(/^lastlight-sandbox-t-[0-9a-f]{8}$/, "<name>"));
+  }
+
+  it("adds --pids-limit, --cpus and the capability set before the workdir", async () => {
+    const argv = await argvFor({ pidsLimit: 1024, cpus: "2", capDrop: true });
+    const w = argv.indexOf("-w");
+    const flags = argv.slice(0, w);
+    expect(flags.join(" ")).toContain("--pids-limit 1024");
+    expect(flags.join(" ")).toContain("--cpus 2");
+    expect(flags.join(" ")).toContain(
+      "--cap-drop ALL --cap-add CHOWN --cap-add SETUID --cap-add SETGID --cap-add DAC_OVERRIDE --cap-add FOWNER --security-opt no-new-privileges",
+    );
+  });
+
+  it("leaves the docker run argv exactly as upstream when nothing is set", async () => {
+    const argv = await argvFor({});
+    expect(argv).toEqual([
+      "run", "-d", "--name", "<name>", "--memory", "8g", "--memory-swap", "8g",
+      "--network", "lastlight_sandbox-egress",
+      "-v", "lastlight_agent-data:/data",
+      "-v", "/tmp/work:/home/agent/workspace",
+      "-v", "lastlight_pkg-cache:/cache",
+      "-e", "npm_config_cache=/cache/npm",
+      "-e", "npm_config_store_dir=/cache/pnpm",
+      "-e", "YARN_CACHE_FOLDER=/cache/yarn",
+      "-e", "UV_CACHE_DIR=/cache/uv",
+      "-e", "UV_PYTHON_DOWNLOADS=never",
+      "-w", "/home/agent/workspace", "img",
+    ]);
+  });
+});
+
+describe("parseSandboxLimits", () => {
+  it("reads all four settings", () => {
+    expect(parseSandboxLimits({ SANDBOX_PIDS_LIMIT: "1024", SANDBOX_CPUS: "1.5", SANDBOX_CAP_DROP: "1", SANDBOX_ROOTLESS: "1" }))
+      .toEqual({ pidsLimit: 1024, cpus: "1.5", capDrop: true, rootless: true });
+  });
+
+  it("treats unset and empty values as off", () => {
+    expect(parseSandboxLimits({ SANDBOX_PIDS_LIMIT: "", SANDBOX_CPUS: "" }))
+      .toEqual({ pidsLimit: undefined, cpus: undefined, capDrop: false, rootless: false });
+  });
+
+  it("refuses a pids limit that is not a positive integer", () => {
+    expect(() => parseSandboxLimits({ SANDBOX_PIDS_LIMIT: "abc" })).toThrow(/SANDBOX_PIDS_LIMIT/);
+    expect(() => parseSandboxLimits({ SANDBOX_PIDS_LIMIT: "0" })).toThrow(/SANDBOX_PIDS_LIMIT/);
+    expect(() => parseSandboxLimits({ SANDBOX_PIDS_LIMIT: "12.5" })).toThrow(/SANDBOX_PIDS_LIMIT/);
+  });
+
+  it("refuses a cpu count that is not a positive number", () => {
+    expect(() => parseSandboxLimits({ SANDBOX_CPUS: "0" })).toThrow(/SANDBOX_CPUS/);
+    expect(() => parseSandboxLimits({ SANDBOX_CPUS: "two" })).toThrow(/SANDBOX_CPUS/);
+    expect(() => parseSandboxLimits({ SANDBOX_CPUS: "-1" })).toThrow(/SANDBOX_CPUS/);
+  });
+
+  it("only the literal 1 switches cap-drop and rootless on", () => {
+    expect(parseSandboxLimits({ SANDBOX_CAP_DROP: "true", SANDBOX_ROOTLESS: "yes" }))
+      .toMatchObject({ capDrop: false, rootless: false });
   });
 });
