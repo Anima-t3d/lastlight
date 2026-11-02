@@ -102,6 +102,26 @@ export interface SandboxConfig {
   capDrop?: boolean;
 }
 
+/**
+ * Kill every process owned by `agent` except PID 1 (the container's keep-alive
+ * `gosu agent sleep infinity`). Plain sh + /proc: the image has no pkill.
+ */
+const KILL_AGENT_PROCESSES =
+  'a=$(id -u agent); for d in /proc/[0-9]*; do p=${d#/proc/}; [ "$p" = 1 ] && continue; ' +
+  '[ "$(stat -c %u "$d" 2>/dev/null)" = "$a" ] && kill -9 "$p" 2>/dev/null; done; true';
+
+/**
+ * Rootless mode: the host tried to write into a workspace while a run holds it
+ * as `agent` (e.g. a fanout branch staging skills while a sibling runs). Fatal
+ * by design — running the phase without what it needed would be silent.
+ */
+export class WorkspaceHeldError extends Error {
+  constructor(taskId: string) {
+    super(`The workspace of ${taskId} is held by a running agent (rootless docker); the host cannot stage into it now`);
+    this.name = "WorkspaceHeldError";
+  }
+}
+
 /** Capabilities `deploy/sandbox-entrypoint.sh` needs as root (chown the mounts, gosu to agent). */
 export const SANDBOX_ENTRYPOINT_CAPS = ["CHOWN", "SETUID", "SETGID", "DAC_OVERRIDE", "FOWNER"] as const;
 
@@ -170,6 +190,8 @@ export class DockerSandbox {
    * before the first one's chown has finished).
    */
   private agentHolds: Map<string, { count: number; ready: Promise<void> }> = new Map();
+  /** Rootless mode: a hand-back still in flight per task; the next hand-over waits for it. */
+  private handBacks: Map<string, Promise<void>> = new Map();
 
   constructor(config: SandboxConfig) {
     this.config = config;
@@ -357,6 +379,16 @@ export class DockerSandbox {
   private async setWorkspaceOwner(info: SandboxInfo, owner: "agent" | "host"): Promise<void> {
     const spec = owner === "agent" ? "agent:agent" : "0:0";
     try {
+      // A background process the agent started (`setsid … &`) survives its
+      // `docker exec`, and owning a file is not needed to keep writing to one it
+      // opened or to a dir it made world-writable. Stop them before the host
+      // touches the tree. PID 1 is `gosu agent sleep infinity` — it keeps the
+      // container alive and is spared.
+      if (owner === "host") {
+        await execFileAsync("docker", ["exec", "-u", "0", info.containerName, "sh", "-c", KILL_AGENT_PROCESSES], {
+          timeout: 30_000,
+        });
+      }
       await execFileAsync("docker", [
         "exec", "-u", "0", info.containerName,
         "chown", "-R", "-h", "-P", spec, WORKSPACE_DIR,
@@ -364,6 +396,11 @@ export class DockerSandbox {
     } catch (err: any) {
       throw new Error(`Could not hand the workspace of ${info.containerName} to ${owner}: ${err.message}`);
     }
+  }
+
+  /** Rootless mode: throw {@link WorkspaceHeldError} while a run holds (or is handing back) the workspace. */
+  assertWorkspaceFree(taskId: string): void {
+    if (this.agentHolds.has(taskId) || this.handBacks.has(taskId)) throw new WorkspaceHeldError(taskId);
   }
 
   /**
@@ -377,7 +414,10 @@ export class DockerSandbox {
     if (hold) {
       hold.count += 1;
     } else {
-      hold = { count: 1, ready: this.setWorkspaceOwner(info, "agent") };
+      // Never chown to `agent` while an earlier hand-back's `chown -R 0:0` is
+      // still walking the tree — two concurrent walks leave mixed ownership.
+      const pending = this.handBacks.get(taskId) ?? Promise.resolve();
+      hold = { count: 1, ready: pending.catch(() => undefined).then(() => this.setWorkspaceOwner(info, "agent")) };
       this.agentHolds.set(taskId, hold);
     }
     try {
@@ -387,7 +427,13 @@ export class DockerSandbox {
       hold.count -= 1;
       if (hold.count === 0) {
         this.agentHolds.delete(taskId);
-        await this.setWorkspaceOwner(info, "host");
+        const back = this.setWorkspaceOwner(info, "host");
+        this.handBacks.set(taskId, back);
+        try {
+          await back;
+        } finally {
+          if (this.handBacks.get(taskId) === back) this.handBacks.delete(taskId);
+        }
       }
     }
   }
