@@ -42,7 +42,7 @@
  *   re-reads the namespace and merges into it.
  */
 
-import { closeSync, openSync, readFileSync, readSync, rmSync, statSync } from "fs";
+import { closeSync, constants, openSync, readFileSync, readSync, rmSync, statSync } from "fs";
 import { join, resolve, sep } from "path";
 import type { StateDb } from "../state/db.js";
 import type { WorkflowRun } from "../state/workflow-run-store.js";
@@ -56,6 +56,7 @@ import {
   type FixOutcomeMarker,
 } from "./fix-markers.js";
 import { PR_NOTES_FILE_NAME, VERIFY_SCRIPT_NAME } from "./fix-scratch.js";
+import { isContainedRealPath, readWorkspaceFile } from "./workspace-fs.js";
 import {
   boundNotes,
   coerceNotes,
@@ -269,16 +270,11 @@ function readTail(path: string): string | null {
   } catch {
     return null; // no journal — the overwhelmingly common case
   }
-  if (size <= MAX_NOTES_FILE_BYTES) {
-    try {
-      return readFileSync(path, "utf8");
-    } catch {
-      return null;
-    }
-  }
   let fd: number | undefined;
   try {
-    fd = openSync(path, "r");
+    // O_NOFOLLOW closes the gap between the caller's lstat check and this open.
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    if (size <= MAX_NOTES_FILE_BYTES) return readFileSync(fd, "utf8");
     const buf = Buffer.alloc(MAX_NOTES_FILE_BYTES);
     const read = readSync(fd, buf, 0, MAX_NOTES_FILE_BYTES, size - MAX_NOTES_FILE_BYTES);
     // Drop the first (probably partial) line rather than parsing half a note.
@@ -316,10 +312,10 @@ const MAX_VERIFY_SCRIPT_BYTES = 8 * 1024;
  * Never throws: a failed read must not fail the phase that produced it.
  */
 export function readVerifyScript(repoDir: string): string | null {
-  const path = join(repoDir, VERIFY_SCRIPT_NAME);
   try {
-    const body = readFileSync(path, "utf8");
-    if (!body.trim()) return null;
+    // The agent wrote this path; a symlink there must not pull a host file into the record.
+    const body = readWorkspaceFile(repoDir, VERIFY_SCRIPT_NAME);
+    if (body === null || !body.trim()) return null;
     return body.length > MAX_VERIFY_SCRIPT_BYTES
       ? `${body.slice(0, MAX_VERIFY_SCRIPT_BYTES)}\n… truncated at ${MAX_VERIFY_SCRIPT_BYTES} bytes`
       : body;
@@ -341,6 +337,8 @@ export function readVerifyScript(repoDir: string): string | null {
  */
 export function drainPrNotes(repoDir: string, provenance: NoteProvenance): PrNote[] {
   const path = join(repoDir, PR_NOTES_FILE_NAME);
+  // A symlink here (or above it) is not the journal: never read or delete through it.
+  if (!isContainedRealPath(repoDir, path)) return [];
   const body = readTail(path);
   if (body === null) return [];
   try {

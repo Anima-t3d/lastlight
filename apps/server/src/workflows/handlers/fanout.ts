@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import {
   PhaseRef,
@@ -43,6 +42,7 @@ import { safeSpanAttributes, withSpan } from "../../telemetry/index.js";
 import { OI, SpanKind, splitProviderModel } from "../../telemetry/openinference.js";
 import { logger } from "../../logging/logger.js";
 import { HOST_READABLE_WORKSPACE } from "./host-repo-dir.js";
+import { readWorkspaceFile } from "../../engine/workspace-fs.js";
 
 const log = logger("fanout");
 
@@ -163,18 +163,17 @@ function branchContextSection(
   // against something the workflow author did not name, which is the failure
   // this key exists to remove rather than relocate.
   const unsafe = isAbsolute(relPath) || relPath.split(/[\\/]/).includes("..");
-  const abs = unsafe ? "" : join(hostAgentCwd, relPath);
 
   let body: string | undefined;
   let reason: string | undefined;
   if (unsafe) {
     reason = `\`${relPath}\` is not a workspace-relative path`;
   } else {
-    try {
-      body = readFileSync(abs, "utf8");
-    } catch (err: unknown) {
-      reason = err instanceof Error ? err.message : String(err);
-    }
+    // Never through a symlink: the agent wrote this tree, and following one
+    // would paste a host file into the branch prompt.
+    const read = readWorkspaceFile(hostAgentCwd, relPath);
+    if (read === null) reason = `\`${relPath}\` is missing or not a plain file inside the workspace`;
+    else body = read;
   }
 
   if (body !== undefined && body.trim().length > 0) {
@@ -499,7 +498,8 @@ export class FanoutHandler implements PhaseTypeHandler {
     let resolved: ReturnType<typeof resolveDynamicBranches>;
     try {
       // The schema already refused absolute and `..` paths.
-      const raw = readFileSync(join(session.hostAgentCwd, from.file), "utf8");
+      const raw = readWorkspaceFile(session.hostAgentCwd, from.file);
+      if (raw === null) throw new Error("missing or not a plain file inside the workspace");
       resolved = resolveDynamicBranches(phase, parseBranchManifest(raw), this.run.ctx);
     } catch (err: unknown) {
       throw new BranchManifestError(`${phase.name}: branches_from \`${from.file}\`: ${err instanceof Error ? err.message : String(err)}`);
