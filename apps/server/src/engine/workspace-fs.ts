@@ -8,6 +8,8 @@
  * to a host file (the database, the App key), and a plain `readFileSync` /
  * `writeFileSync` running as the harness user would follow it. Every helper
  * here checks each path component with `lstat` and opens with `O_NOFOLLOW`.
+ * Only regular files are opened (and with `O_NONBLOCK`): a planted FIFO would
+ * otherwise block the open — and with it the harness's event loop — forever.
  */
 
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync, writeSync } from "fs";
@@ -46,13 +48,17 @@ export function isContainedRealPath(root: string, absPath: string): boolean {
   return true;
 }
 
+/** Flags for opening a workspace file the agent may have tampered with. */
+export const NOFOLLOW_READ = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
 /** The file's text, or null when it is absent, not a regular file, symlinked anywhere, or outside `root`. */
 export function readWorkspaceFile(root: string, relPath: string): string | null {
   const abs = resolve(root, relPath);
   if (!isContainedRealPath(root, abs)) return null;
   let fd: number;
   try {
-    fd = openSync(abs, constants.O_RDONLY | constants.O_NOFOLLOW);
+    if (!lstatSync(abs).isFile()) return null;
+    fd = openSync(abs, NOFOLLOW_READ);
   } catch {
     return null;
   }
@@ -71,11 +77,16 @@ export function readWorkspaceFile(root: string, relPath: string): string | null 
  */
 export function writeWorkspaceFile(root: string, relPath: string, data: string): void {
   const abs = resolve(root, relPath);
-  if (!isContainedRealPath(root, abs) && !plantedLeafLink(root, abs)) {
+  const planted = plantedLeaf(root, abs);
+  if (!planted && !isContainedRealPath(root, abs)) {
     throw new Error(`Refusing to write ${relPath}: not a plain path inside the workspace`);
   }
-  if (plantedLeafLink(root, abs)) unlinkSync(abs);
-  const fd = openSync(abs, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o644);
+  if (planted) unlinkSync(abs);
+  const fd = openSync(
+    abs,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    0o644,
+  );
   try {
     writeSync(fd, data);
   } finally {
@@ -138,15 +149,19 @@ export function removeSymlinksUnder(dir: string): number {
   return removed;
 }
 
-/** The leaf is a symlink but everything above it is a plain in-root directory. */
-function plantedLeafLink(root: string, abs: string): boolean {
+/**
+ * The leaf is something the harness never puts there — a symlink, FIFO, socket
+ * or device — while everything above it is a plain in-root directory.
+ */
+function plantedLeaf(root: string, abs: string): boolean {
   const parent = dirname(abs);
   try {
     const parentOk = resolve(parent) === resolve(root)
       ? !lstatSync(parent).isSymbolicLink()
       : isContainedRealPath(root, parent) && lstatSync(parent).isDirectory();
     if (!parentOk) return false;
-    return lstatSync(abs).isSymbolicLink();
+    const st = lstatSync(abs);
+    return !st.isFile() && !st.isDirectory();
   } catch {
     return false;
   }

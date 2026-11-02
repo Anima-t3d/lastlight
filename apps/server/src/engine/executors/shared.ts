@@ -195,13 +195,17 @@ export function excludeFromGit(repoDir: string, entry: string): void {
     log.warn("Not excluding from git: .git/info is not a plain directory", { repoDir, err });
     return;
   }
-  if (!isContainedRealPath(repoDir, excludeFile)) {
-    log.warn("Not excluding from git: .git/info/exclude is a symlink", { repoDir });
+  if (!isContainedRealPath(repoDir, excludeFile) || !isFileOrAbsent(excludeFile)) {
+    log.warn("Not excluding from git: .git/info/exclude is not a regular file", { repoDir });
     return;
   }
   const current = readWorkspaceFile(repoDir, excludeRel) ?? "";
   if (current.split(/\r?\n/).includes(line)) return;
-  const fd = openSync(excludeFile, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o644);
+  const fd = openSync(
+    excludeFile,
+    constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    0o644,
+  );
   try {
     writeSync(fd, `${current.length && !current.endsWith("\n") ? "\n" : ""}${line}\n`);
   } finally {
@@ -861,4 +865,12 @@ export function githubAuthEnvFrom(env: Record<string, string>): Record<string, s
 export function stageScriptFile(hostWorkspaceDir: string, scriptDir: string, fileName: string, body: string): void {
   mkdirWorkspaceDir(hostWorkspaceDir, scriptDir);
   writeWorkspaceFile(hostWorkspaceDir, join(scriptDir, fileName), body);
+}
+
+function isFileOrAbsent(path: string): boolean {
+  try {
+    return lstatSync(path).isFile();
+  } catch {
+    return true;
+  }
 }

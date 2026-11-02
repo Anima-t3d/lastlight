@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { execFileSync } from "child_process";
 import { join } from "path";
 import { tmpdir } from "os";
 
@@ -188,5 +189,31 @@ describe("server-mode build assets", () => {
     const again = join(base, "restage2");
     art.store.stageInto(ref as never, again);
     expect(readdirSync(again)).not.toContain("stolen.md");
+  });
+});
+
+// A named pipe at a fixed path would block a plain open() until something
+// opens the other end — freezing the harness's event loop, not just one run.
+describe("planted FIFOs never block the harness", () => {
+  const fifo = (path: string) => execFileSync("mkfifo", [path]);
+
+  it("readVerifyScript and drainPrNotes treat a FIFO as missing", () => {
+    fifo(join(repo, ".git", "lastlight-verify.sh"));
+    fifo(join(repo, ".git", "lastlight-notes"));
+    expect(readVerifyScript(repo)).toBeNull();
+    expect(drainPrNotes(repo, PROV)).toEqual([]);
+  });
+
+  it("AGENTS.md delivery replaces a FIFO with a regular file", () => {
+    fifo(join(ws, "AGENTS.md"));
+    writeAgentContext(ws, "# persona");
+    expect(lstatSync(join(ws, "AGENTS.md")).isFile()).toBe(true);
+    expect(readFileSync(join(ws, "AGENTS.md"), "utf8")).toBe("# persona");
+  });
+
+  it("excludeFromGit skips a FIFO exclude file", () => {
+    mkdirSync(join(repo, ".git", "info"));
+    fifo(join(repo, ".git", "info", "exclude"));
+    expect(() => excludeFromGit(repo, ".lastlight")).not.toThrow();
   });
 });
