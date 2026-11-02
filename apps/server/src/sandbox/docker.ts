@@ -79,6 +79,17 @@ export interface SandboxConfig {
    * honours HTTP_PROXY / HTTPS_PROXY.
    */
   dnsIp?: string;
+  /**
+   * The daemon is rootless docker. There the image's `agent` (uid 10001)
+   * maps to a subuid, not to the host user running the harness, so the
+   * uid-sharing that `sandbox-base.Dockerfile` relies on is gone: once the
+   * entrypoint chowns the workspace to `agent`, host-side staging (AGENTS.md,
+   * skills, scripts, build assets), host git on a reused workspace and reap
+   * all hit EACCES. In this mode the agent owns the workspace only while a
+   * run executes; between runs it belongs to container root, which IS the
+   * host user. Off by default — rootful deployments keep the shared uid.
+   */
+  rootless?: boolean;
 }
 
 export interface SandboxInfo {
@@ -112,6 +123,12 @@ const PKG_CACHE_DIR = "/cache";
 export class DockerSandbox {
   private config: SandboxConfig;
   private activeContainers: Map<string, SandboxInfo> = new Map();
+  /**
+   * Rootless mode: per task, how many runs hold the workspace as `agent`, and
+   * the hand-over they all wait on (a second overlapping run must not start
+   * before the first one's chown has finished).
+   */
+  private agentHolds: Map<string, { count: number; ready: Promise<void> }> = new Map();
 
   constructor(config: SandboxConfig) {
     this.config = config;
@@ -270,10 +287,55 @@ export class DockerSandbox {
       // The entrypoint drops to `gosu agent sleep infinity` when done —
       // we detect readiness by checking for the .credentials.json symlink.
       await this.waitForReady(containerName);
+      if (this.config.rootless) await this.setWorkspaceOwner(info, "host");
 
       return info;
     } catch (err: any) {
       throw new Error(`Failed to create sandbox: ${err.message}`);
+    }
+  }
+
+  /**
+   * Rootless mode: chown the whole workspace to `agent` or back to container
+   * root (= the host user). `-h -P` so a symlink the agent planted is re-owned
+   * itself and never followed. Throws — a workspace stuck on the wrong owner
+   * breaks the next host-side step, so the run must surface it.
+   */
+  private async setWorkspaceOwner(info: SandboxInfo, owner: "agent" | "host"): Promise<void> {
+    const spec = owner === "agent" ? "agent:agent" : "0:0";
+    try {
+      await execFileAsync("docker", [
+        "exec", "-u", "0", info.containerName,
+        "chown", "-R", "-h", "-P", spec, WORKSPACE_DIR,
+      ], { timeout: 120_000 });
+    } catch (err: any) {
+      throw new Error(`Could not hand the workspace of ${info.containerName} to ${owner}: ${err.message}`);
+    }
+  }
+
+  /**
+   * Run `fn` with the workspace owned by `agent` (rootless mode only). Runs of
+   * one task can overlap (fanout), so ownership flips to `agent` on the first
+   * and back to the host when the last one settles — never under a live run.
+   */
+  private async withAgentOwnership<T>(taskId: string, info: SandboxInfo, fn: () => Promise<T>): Promise<T> {
+    if (!this.config.rootless) return fn();
+    let hold = this.agentHolds.get(taskId);
+    if (hold) {
+      hold.count += 1;
+    } else {
+      hold = { count: 1, ready: this.setWorkspaceOwner(info, "agent") };
+      this.agentHolds.set(taskId, hold);
+    }
+    try {
+      await hold.ready;
+      return await fn();
+    } finally {
+      hold.count -= 1;
+      if (hold.count === 0) {
+        this.agentHolds.delete(taskId);
+        await this.setWorkspaceOwner(info, "host");
+      }
     }
   }
 
@@ -474,7 +536,7 @@ export class DockerSandbox {
     // We keep only a small bounded tail of stderr so the error-path message
     // is still useful.
     const STDERR_TAIL_BYTES = 8 * 1024;
-    return await new Promise<void>((resolvePromise, reject) => {
+    return await this.withAgentOwnership(taskId, info, () => new Promise<void>((resolvePromise, reject) => {
       const child = spawn("docker", args, { stdio: ["pipe", "pipe", "pipe"] });
       child.stdin.write(prompt);
       child.stdin.end();
@@ -528,7 +590,7 @@ export class DockerSandbox {
           reject(new Error(`Sandbox agent failed (exit ${code}): ${stderrTail || "no output"}`));
         }
       });
-    });
+    }));
   }
 
   /**
@@ -593,7 +655,7 @@ export class DockerSandbox {
     // `{{phaseOutputs.*}}` reference to be useful.
     const STDOUT_TAIL_BYTES = 256 * 1024;
     const STDERR_TAIL_BYTES = 32 * 1024;
-    return await new Promise((resolvePromise, reject) => {
+    return await this.withAgentOwnership(taskId, info, () => new Promise((resolvePromise, reject) => {
       const child = spawn("docker", args, { stdio: ["ignore", "pipe", "pipe"] });
       let stdoutTail = "";
       let stderrTail = "";
@@ -644,7 +706,7 @@ export class DockerSandbox {
           timedOut,
         });
       });
-    });
+    }));
   }
 
   /**
