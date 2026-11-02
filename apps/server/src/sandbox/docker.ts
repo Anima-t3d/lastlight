@@ -91,6 +91,47 @@ export interface SandboxConfig {
    * host user. Off by default — rootful deployments keep the shared uid.
    */
   rootless?: boolean;
+  /** `--pids-limit` per sandbox (`SANDBOX_PIDS_LIMIT`). Unset: docker's default (none). */
+  pidsLimit?: number;
+  /** `--cpus` per sandbox (`SANDBOX_CPUS`), e.g. "2" or "1.5". Unset: no cap. */
+  cpus?: string;
+  /**
+   * `SANDBOX_CAP_DROP=1`: drop every capability except the few the entrypoint
+   * needs to chown the mounts and drop to `agent` via gosu, and set
+   * no-new-privileges. Off by default so existing images keep docker's set.
+   */
+  capDrop?: boolean;
+}
+
+/** Capabilities `deploy/sandbox-entrypoint.sh` needs as root (chown the mounts, gosu to agent). */
+export const SANDBOX_ENTRYPOINT_CAPS = ["CHOWN", "SETUID", "SETGID", "DAC_OVERRIDE", "FOWNER"] as const;
+
+/**
+ * Read the opt-in sandbox hardening settings from the environment. A value
+ * that is set but malformed throws naming the variable — a typo must not
+ * silently run sandboxes without the limit the operator asked for. Empty
+ * counts as unset.
+ */
+export function parseSandboxLimits(env: NodeJS.ProcessEnv): {
+  pidsLimit?: number;
+  cpus?: string;
+  capDrop: boolean;
+  rootless: boolean;
+} {
+  const pidsRaw = env.SANDBOX_PIDS_LIMIT?.trim() || undefined;
+  if (pidsRaw !== undefined && !/^[1-9][0-9]*$/.test(pidsRaw)) {
+    throw new Error(`SANDBOX_PIDS_LIMIT must be a positive integer, got "${pidsRaw}"`);
+  }
+  const cpus = env.SANDBOX_CPUS?.trim() || undefined;
+  if (cpus !== undefined && !(/^[0-9]+(\.[0-9]+)?$/.test(cpus) && Number(cpus) > 0)) {
+    throw new Error(`SANDBOX_CPUS must be a positive number, got "${cpus}"`);
+  }
+  return {
+    pidsLimit: pidsRaw === undefined ? undefined : Number(pidsRaw),
+    cpus,
+    capDrop: env.SANDBOX_CAP_DROP === "1",
+    rootless: env.SANDBOX_ROOTLESS === "1",
+  };
 }
 
 export interface SandboxInfo {
@@ -268,6 +309,17 @@ export class DockerSandbox {
     // than the real one.
     const dnsArgs = this.config.dnsIp ? ["--dns", this.config.dnsIp] : [];
 
+    // Opt-in hardening (see parseSandboxLimits). Docker's own defaults leave
+    // the process count unbounded and the full default capability set on.
+    const limitArgs: string[] = [];
+    if (this.config.pidsLimit) limitArgs.push("--pids-limit", String(this.config.pidsLimit));
+    if (this.config.cpus) limitArgs.push("--cpus", this.config.cpus);
+    if (this.config.capDrop) {
+      limitArgs.push("--cap-drop", "ALL");
+      for (const cap of SANDBOX_ENTRYPOINT_CAPS) limitArgs.push("--cap-add", cap);
+      limitArgs.push("--security-opt", "no-new-privileges");
+    }
+
     // The entrypoint runs as root to fix permissions, then drops to agent via gosu.
     // No --user flag needed.
     const args = [
@@ -279,6 +331,7 @@ export class DockerSandbox {
       ...dnsArgs,
       ...envFlags,
       ...dockerArgs,
+      ...limitArgs,
       "-w", WORKSPACE_DIR,
       this.config.imageName,
     ];
