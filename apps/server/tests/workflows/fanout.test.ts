@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { AgentWorkflowSchema, PhaseRef } from "lastlight-workflow-engine";
 import type {
@@ -1063,5 +1064,41 @@ describe("fanout — the schema's `branches_from` rules", () => {
   });
   it("refuses `branches_from` on a phase that is not a fanout", () => {
     expect(parse({ name: "s", type: "agent", prompt: "p.md", branches_from: from }).success).toBe(false);
+  });
+});
+
+// ── Planted symlinks — the harness never reads a host file through one ───────
+
+/** Seeds like {@link SeedingSandbox}, then replaces `rel` with a symlink to a host file outside the workspace. */
+class LinkingSandbox extends SeedingSandbox {
+  readonly outside = mkdtempSync(join(tmpdir(), "fanout-outside-"));
+  constructor(private readonly linked: string, private readonly targetBody: string, seeds: Record<string, string> = {}) {
+    super(seeds);
+  }
+  override async provision(pre?: PrePopulateSpec): Promise<ProvisionResult> {
+    const prov = await super.provision(pre);
+    const target = join(this.outside, "host-file");
+    writeFileSync(target, this.targetBody);
+    const abs = join(prov.hostAgentCwd, this.linked);
+    mkdirSync(dirname(abs), { recursive: true });
+    symlinkSync(target, abs);
+    return prov;
+  }
+}
+
+describe("fanout — a symlinked workspace file is treated as missing", () => {
+  it("context_file: the host file never reaches the prompt", async () => {
+    const sandbox = new LinkingSandbox(OBLIGATIONS, "HOST SECRET");
+    await runFanout(seededPhase(OBLIGATIONS), sandbox);
+    expect(sandbox.agentPrompts[0]).toContain("NOT AVAILABLE");
+    expect(sandbox.agentPrompts[0]).not.toContain("HOST SECRET");
+  });
+
+  it("branches_from: a manifest symlink fails the phase before any branch runs", async () => {
+    const sandbox = new LinkingSandbox(MANIFEST, manifest([{ id: "a" }]));
+    const { outcome } = await runFanout(dynamicPhase(), sandbox, "none");
+    expect(outcome.status).toBe("failed");
+    expect(outcome.results[0].error).toMatch(/branches\.json/);
+    expect(sandbox.agentPrompts).toHaveLength(0);
   });
 });
