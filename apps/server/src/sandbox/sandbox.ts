@@ -414,6 +414,7 @@ class DockerSandbox implements Sandbox {
 
   stageSkills(phaseKey: string, skillPaths: string[] | undefined): string[] | undefined {
     if (!this.sbx) throw new Error("DockerSandbox.stageSkills before provision");
+    if (skillPaths?.length) this.sbx.sandbox.assertWorkspaceFree(this.opts.taskId);
     // Copy (not symlink): the agent's tools run inside the container and host
     // symlink targets wouldn't resolve there. Map host dests → in-container paths.
     const staged = stageSkillBundle(this.sbx.workDir, phaseKey, skillPaths, "copy");
@@ -852,6 +853,8 @@ export interface FakeBehavior {
   commandResult?: RawCommandResult;
   /** Throw from `runCommand`. */
   throwOnRunCommand?: Error | string;
+  /** Throw from `stageSkills`. */
+  throwOnStageSkills?: Error | string;
   /** Throw from `provision` — e.g. a k8s ResourceQuota rejection at pod-create
    *  time, which happens during provisioning, outside `runAgent`/`runCommand`. */
   throwOnProvision?: Error | string;
@@ -925,6 +928,7 @@ export class FakeSandbox implements Sandbox {
   }
 
   stageSkills(phaseKey: string, skillPaths: string[] | undefined): string[] | undefined {
+    if (this.behavior.throwOnStageSkills) throw asError(this.behavior.throwOnStageSkills);
     this.stagedSkillDirs = stageSkillBundle(this.hostWorkspaceDir, phaseKey, skillPaths, "symlink");
     return this.stagedSkillDirs;
   }

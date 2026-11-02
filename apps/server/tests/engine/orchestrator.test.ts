@@ -15,6 +15,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { executeAgent, executeCommand } from "#src/engine/agent-executor.js";
 import { FakeSandbox, type SandboxEvent } from "#src/sandbox/sandbox.js";
 import { QuotaExceededError } from "#src/sandbox/k8s/quota.js";
+import { WorkspaceHeldError } from "#src/sandbox/docker.js";
 import { configureWorkflowAssets } from "#src/workflows/loader.js";
 
 /** Poll a predicate for up to `timeoutMs` — the agent-path shim flushes its
@@ -207,6 +208,31 @@ describe("Sandbox orchestrator (FakeSandbox)", () => {
     expect(result.error).toContain("kaboom in the sandbox");
     // Even on failure the workspace is disposed (the bracket's finally).
     expect(fake.disposed).toBe(true);
+  });
+
+  it("fails the phase when skills cannot be staged because a sibling run holds the workspace", async () => {
+    // Rootless docker: a fanout branch started while another holds the workspace
+    // cannot write its skill bundle. Running it without skills would be silent.
+    const fake = new FakeSandbox({ events: successEvents(), throwOnStageSkills: new WorkspaceHeldError("t1") });
+    const result = await executeAgent(
+      "do the thing",
+      { sandbox: "none", stateDir, sessionsDir, skillPaths: ["/skills/pr-review"] },
+      { sandboxFactory: fake.asFactory() },
+    ).catch((err: unknown) => ({ success: false, error: String(err) }));
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/held/);
+    expect(fake.receivedAgentOpts).toBeUndefined();
+  });
+
+  it("still runs the agent when skill staging fails for any other reason", async () => {
+    const fake = new FakeSandbox({ events: successEvents(), throwOnStageSkills: new Error("disk full") });
+    const result = await executeAgent(
+      "do the thing",
+      { sandbox: "none", stateDir, sessionsDir, skillPaths: ["/skills/pr-review"] },
+      { sandboxFactory: fake.asFactory() },
+    );
+    expect(fake.receivedAgentOpts).toBeDefined();
+    expect(result.success).toBe(true);
   });
 
   it("maps a QuotaExceededError to stopReason error_quota on the agent path", async () => {

@@ -50,14 +50,18 @@ function lockedWorkspace(stateDir: string, taskId: string): { dir: string; locke
 }
 
 let prevRootless: string | undefined;
+let prevDataVolume: string | undefined;
 beforeEach(() => {
   vi.clearAllMocks();
   mockExec.mockReturnValue("");
   prevRootless = process.env.SANDBOX_ROOTLESS;
+  prevDataVolume = process.env.SANDBOX_DATA_VOLUME;
 });
 afterEach(() => {
   if (prevRootless === undefined) delete process.env.SANDBOX_ROOTLESS;
   else process.env.SANDBOX_ROOTLESS = prevRootless;
+  if (prevDataVolume === undefined) delete process.env.SANDBOX_DATA_VOLUME;
+  else process.env.SANDBOX_DATA_VOLUME = prevDataVolume;
   for (const d of lockedDirs.splice(0)) {
     try { chmodSync(d, 0o700); } catch { /* already removed */ }
   }
@@ -66,7 +70,7 @@ afterEach(() => {
 
 describe("reclaimWorkspaceDir", () => {
   it("chowns the tree back to container root from a capped, offline container", () => {
-    reclaimWorkspaceDir("/state/sandboxes/t1", "lastlight-sandbox:latest");
+    reclaimWorkspaceDir({ type: "bind", hostPath: "/state/sandboxes/t1" }, "lastlight-sandbox:latest");
     expect(mockExec).toHaveBeenCalledWith(
       "docker",
       [
@@ -83,7 +87,17 @@ describe("reclaimWorkspaceDir", () => {
 
   it("throws when the container fails", () => {
     mockExec.mockImplementation(() => { throw new Error("no such image"); });
-    expect(() => reclaimWorkspaceDir("/x", "img")).toThrow(/no such image/);
+    expect(() => reclaimWorkspaceDir({ type: "bind", hostPath: "/x" }, "img")).toThrow(/no such image/);
+  });
+
+  it("mounts the same volume subpath the sandbox used when the data dir is a named volume", () => {
+    reclaimWorkspaceDir({ type: "volume-subpath", volume: "lastlight_agent-data", subpath: "sandboxes/t1" }, "img");
+    const argv = mockExec.mock.calls[0][1] as string[];
+    expect(argv).toContain("--mount");
+    expect(argv[argv.indexOf("--mount") + 1]).toBe(
+      "type=volume,source=lastlight_agent-data,target=/w,volume-subpath=sandboxes/t1",
+    );
+    expect(argv).not.toContain("-v");
   });
 });
 
@@ -101,6 +115,7 @@ describe("reapSandboxWorkspace on rootless docker", () => {
   it("uses the sandbox image by default when SANDBOX_ROOTLESS=1", () => {
     process.env.SANDBOX_ROOTLESS = "1";
     const stateDir = tmp("reclaim-state-");
+    process.env.SANDBOX_DATA_VOLUME = stateDir; // path mode → bind mount
     const { dir, locked } = lockedWorkspace(stateDir, "acme-2-build");
     mockExec.mockImplementation(((cmd: string, args: string[]) => {
       if (cmd === "docker" && args[0] === "run") chmodSync(locked, 0o700);
@@ -144,6 +159,13 @@ describe("ensureWorkspaceDir", () => {
     const reclaim = vi.fn();
     ensureWorkspaceDir(dir, reclaim);
     expect(existsSync(dir)).toBe(true);
+    expect(reclaim).not.toHaveBeenCalled();
+  });
+
+  it("leaves a workspace alone while another live run's container owns it", () => {
+    const dir = tmp("ws-");
+    const reclaim = vi.fn();
+    ensureWorkspaceDir(dir, reclaim, () => true);
     expect(reclaim).not.toHaveBeenCalled();
   });
 
