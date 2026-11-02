@@ -2,7 +2,7 @@ import { execFileSync } from "child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "path";
 import { DockerSandbox, parseSandboxLimits, type WorkspaceMount } from "./docker.js";
-import { defaultReclaim, hasLiveContainer } from "./reap.js";
+import { defaultReclaim, hasLiveSandboxFor } from "./reap.js";
 import { resolveWorkspaceMount } from "./workspace-mount.js";
 import { SANDBOX_IMAGE, isSandboxAvailable } from "./images.js";
 import { githubBasicAuthB64, githubExtraheaderArgs } from "./git-http-auth.js";
@@ -163,7 +163,7 @@ export async function createTaskSandbox(opts: {
     throw new Error(`Invalid taskId path escape attempt: ${opts.taskId}`);
   }
 
-  ensureWorkspaceDir(workDir, defaultReclaim(opts.stateDir), () => hasLiveContainer(opts.taskId));
+  ensureWorkspaceDir(workDir, defaultReclaim(opts.stateDir), () => hasLiveSandboxFor(opts.taskId));
 
   if (opts.prePopulate) {
     prePopulateWorkspace(workDir, opts.prePopulate);
@@ -784,11 +784,15 @@ function refreshExistingClone(
 export function ensureWorkspaceDir(
   workDir: string,
   reclaim?: (dir: string) => void,
-  /** A live container still owns this workspace: leave it for the busy check below to refuse. */
+  /** Another live sandbox container still owns this workspace (checked only when `reclaim` is given). */
   isBusy?: () => boolean,
 ): void {
   if (existsSync(workDir)) {
-    if (reclaim && !isBusy?.()) reclaim(workDir);
+    if (!reclaim) return;
+    // On rootless docker a second sandbox on a held workspace would fight the
+    // first over ownership; refuse this run rather than break the live one.
+    if (isBusy?.()) throw new WorkspaceBusyError(workDir, "a live sandbox container");
+    reclaim(workDir);
     return;
   }
   mkdirSync(workDir, { recursive: true });

@@ -59,6 +59,26 @@ export function hasLiveContainer(taskId: string): boolean {
 }
 
 /**
+ * Exact variant of {@link hasLiveContainer} for decisions where an over-match
+ * is NOT safe (refusing a run): only `lastlight-sandbox-<taskId>-<8 hex>`
+ * counts, so task `acme-1` is never mistaken for `acme-12`. Docker absent →
+ * false.
+ */
+export function hasLiveSandboxFor(taskId: string): boolean {
+  const own = new RegExp(`^lastlight-sandbox-${taskId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-[0-9a-f]{8}$`);
+  try {
+    const out = execFileSync(
+      "docker",
+      ["ps", "--filter", `name=lastlight-sandbox-${taskId}-`, "--format", "{{.Names}}"],
+      { encoding: "utf-8", timeout: 5000 },
+    );
+    return out.split("\n").some((name) => own.test(name.trim()));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Remove any dependency-service container left behind for `taskId`, found BY LABEL.
  *
  * By label because that is the only handle that survives a harness restart — the
