@@ -535,6 +535,47 @@ describe("post-review action (runPostReview)", () => {
       expect(outcome.status).not.toBe("failed");
     });
 
+    // Host git on a checkout the agent wrote to: its `.git/config` must not get
+    // to run a program, and a `.git` naming another repository is refused.
+    it("never runs a diff program the agent configured in the checkout", async () => {
+      withReviewConfig({ trigger: "after-checks" });
+      const taskId = "widget-42-ext-diff";
+      seedCheckoutAt(taskId, 0);
+      const dir = join(stateDir, "sandboxes", taskId, "widget");
+      const git = (...args: string[]) =>
+        execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim();
+      writeFileSync(join(dir, "src.ts"), "changed");
+      git("add", "-A");
+      git("commit", "-qm", "pr change");
+      const marker = join(stateDir, "EXT-DIFF-RAN");
+      const evil = join(stateDir, "evil.sh");
+      writeFileSync(evil, `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
+      git("config", "diff.external", evil);
+      const sha = git("rev-parse", "HEAD");
+      seedFindings(taskId, "widget", { summary: "ok", event: "APPROVE", findings: [] });
+
+      const { executor } = makeExecutor(taskId, { baseBranch: "main", headSha: sha });
+      await executor.execute(NODE, {});
+
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    it("FAILS rather than review a checkout whose .git points at another repository", async () => {
+      withReviewConfig({ trigger: "after-checks" });
+      const taskId = "widget-42-gitfile";
+      const dir = join(stateDir, "sandboxes", taskId, "widget");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, ".git"), `gitdir: ${join(stateDir, "elsewhere")}\n`);
+      seedFindings(taskId, "widget", { summary: "ok", event: "APPROVE", findings: [] });
+
+      const { executor } = makeExecutor(taskId, { baseBranch: "main", headSha: HEAD_SHA });
+      const outcome = await executor.execute(NODE, {});
+
+      expect(outcome.status).toBe("failed");
+      expect(reviews).toHaveLength(0);
+      expect(String(outcome.results[0]!.error ?? outcome.results[0]!.output)).toMatch(/Refusing to run git/);
+    });
+
     it("POSTS when the compare read fails — a degraded read never drops a review", async () => {
       withReviewConfig({ trigger: "eager" });
       setCompareFiles([]); // an empty file list proves nothing material changed

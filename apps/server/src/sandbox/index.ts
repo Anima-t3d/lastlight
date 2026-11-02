@@ -1,5 +1,5 @@
 import { execFileSync } from "child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "path";
 import { DockerSandbox, parseSandboxLimits, type WorkspaceMount } from "./docker.js";
 import { defaultReclaim, hasLiveSandboxFor } from "./reap.js";
@@ -8,6 +8,7 @@ import { SANDBOX_IMAGE, isSandboxAvailable } from "./images.js";
 import { githubBasicAuthB64, githubExtraheaderArgs } from "./git-http-auth.js";
 import { resetPrNotesJournal, resetVerifyScript } from "../engine/executors/shared.js";
 import { readWorkspaceFile, writeWorkspaceFile } from "../engine/workspace-fs.js";
+import { HOST_GIT_GUARD, UnsafeCheckoutError, hostGit, sanitizeCheckout } from "../engine/host-git.js";
 import { logger } from "../logging/logger.js";
 import { isRunLive } from "../workflows/live-runs.js";
 
@@ -303,11 +304,32 @@ export function prePopulateWorkspace(
       : "";
   // Repo dir might already exist — from a later phase of the same run, or a
   // *different* run reusing a stable per-target workspace (issue #107).
-  if (existsSync(join(repoDir, ".git"))) {
+  if (existsSync(join(repoDir, ".git")) || isSymlink(repoDir)) {
     const lastRun = readMarker(markerPath);
+    const sameRun = !pre.runId || lastRun === pre.runId;
+    // Another run's workspace, and that run is STILL EXECUTING here. Resetting
+    // it (`git clean -fdx`, or the rebuild below) would delete the
+    // `.lastlight/` artifacts it is midway through writing — two concurrent
+    // reviews of nearform/skillspro#2008 destroyed each other exactly so. The
+    // run lock should have kept this run out; if it did not, fail THIS run
+    // rather than both.
+    if (!sameRun && lastRun && isRunLive(lastRun)) {
+      throw new WorkspaceBusyError(workDir, lastRun);
+    }
+    // The agent has had this checkout: make its `.git` safe for the host git
+    // below, or learn that it points git somewhere else entirely.
+    let unsafe: UnsafeCheckoutError | undefined;
+    try {
+      sanitizeCheckout(workDir, repoDir, url);
+    } catch (err) {
+      if (!(err instanceof UnsafeCheckoutError)) throw err;
+      unsafe = err;
+    }
     // Same run (or a caller that doesn't track runs): preserve the workspace
     // exactly — earlier phases may have written uncommitted scratch here.
-    if (!pre.runId || lastRun === pre.runId) {
+    // A tampered checkout cannot be preserved, and is this run's own doing.
+    if (sameRun) {
+      if (unsafe) throw unsafe;
       // Preserve the checkout — but NOT the base ref. `origin/<base>` was
       // fetched when this run's FIRST phase provisioned, and the fix phase
       // merges it minutes later; on a repo taking several dependency bumps a
@@ -324,24 +346,18 @@ export function prePopulateWorkspace(
       });
       return;
     }
-    // Another run's workspace, and that run is STILL EXECUTING here. Resetting
-    // it (`git clean -fdx`, or the rebuild below) would delete the
-    // `.lastlight/` artifacts it is midway through writing — two concurrent
-    // reviews of nearform/skillspro#2008 destroyed each other exactly so. The
-    // run lock should have kept this run out; if it did not, fail THIS run
-    // rather than both.
-    if (lastRun && isRunLive(lastRun)) {
-      throw new WorkspaceBusyError(workDir, lastRun);
-    }
-    if (pre.recreateFromBase) {
+    if (pre.recreateFromBase || unsafe) {
       // build (#153): a prior incomplete run left a checkout on a possibly
       // stale feature branch. Discard it and re-clone from the default branch
       // (below) so the re-triggered build starts again off current `main`.
+      // A tampered checkout from an earlier run is discarded the same way and
+      // re-cloned fresh; `rmSync` removes a symlinked checkout dir, not its target.
       try {
         rmSync(repoDir, { recursive: true, force: true });
-        log.info("Recreating from the default branch (discarded stale workspace)", {
+        log.info(unsafe ? "Discarded a tampered workspace — cloning fresh" : "Recreating from the default branch (discarded stale workspace)", {
           repoDir,
           lastRun: lastRun ?? "unknown",
+          ...(unsafe ? { reason: unsafe.message } : {}),
         });
       } catch (err) {
         log.warn("Failed to remove stale workspace — attempting a fresh clone anyway", {
@@ -382,7 +398,7 @@ export function prePopulateWorkspace(
   try {
     execFileSync(
       "git",
-      [...authArgs, "clone", "--branch", pre.branch, "--depth", depth, ...shallowArgs, url, repoDir],
+      [...HOST_GIT_GUARD, ...authArgs, "clone", "--branch", pre.branch, "--depth", depth, ...shallowArgs, url, repoDir],
       { stdio: "pipe", timeout: 120_000 },
     );
     normalizeOrigin(repoDir, pre);
@@ -461,17 +477,13 @@ function cloneFromFetchRef(
   try {
     execFileSync(
       "git",
-      [...authArgs, "clone", "--depth", depth, ...shallowArgs, url, repoDir],
+      [...HOST_GIT_GUARD, ...authArgs, "clone", "--depth", depth, ...shallowArgs, url, repoDir],
       { stdio: "pipe", timeout: 120_000 },
     );
-    execFileSync(
-      "git",
-      ["-C", repoDir, ...authArgs, "fetch", "--depth", depth, url, pre.headFetchRef!],
+    hostGit(repoDir, [...authArgs, "fetch", "--depth", depth, url, pre.headFetchRef!],
       { stdio: "pipe", timeout: 120_000 },
     );
-    execFileSync(
-      "git",
-      ["-C", repoDir, "checkout", "-B", pre.branch, "FETCH_HEAD"],
+    hostGit(repoDir, ["checkout", "-B", pre.branch, "FETCH_HEAD"],
       { stdio: "pipe", timeout: 30_000 },
     );
     normalizeOrigin(repoDir, pre);
@@ -525,12 +537,10 @@ function cloneDefaultAndCreateBranch(
   try {
     execFileSync(
       "git",
-      [...authArgs, "clone", "--depth", depth, ...shallowArgs, url, repoDir],
+      [...HOST_GIT_GUARD, ...authArgs, "clone", "--depth", depth, ...shallowArgs, url, repoDir],
       { stdio: "pipe", timeout: 120_000 },
     );
-    execFileSync(
-      "git",
-      ["-C", repoDir, "checkout", "-B", pre.branch],
+    hostGit(repoDir, ["checkout", "-B", pre.branch],
       { stdio: "pipe", timeout: 30_000 },
     );
     normalizeOrigin(repoDir, pre);
@@ -587,7 +597,7 @@ function ensureBaseAvailable(
   if (!base || base === pre.branch || pre.recreateFromBase) return;
   const dest = `+refs/heads/${base}:refs/remotes/origin/${base}`;
   const run = (args: string[], timeout = 120_000): void => {
-    execFileSync("git", ["-C", repoDir, ...args], { stdio: "pipe", timeout });
+    hostGit(repoDir, [...args], { stdio: "pipe", timeout });
   };
   const hasMergeBase = (): boolean => {
     try {
@@ -615,9 +625,7 @@ function ensureBaseAvailable(
   // defence, not the mechanism.
   const configuredRefspecs = (): string[] => {
     try {
-      return String(execFileSync(
-        "git",
-        ["-C", repoDir, "config", "--get-all", "remote.origin.fetch"],
+      return String(hostGit(repoDir, ["config", "--get-all", "remote.origin.fetch"],
         { stdio: ["ignore", "pipe", "ignore"], timeout: 15_000 },
       )).split("\n").map((l) => l.trim()).filter(Boolean);
     } catch {
@@ -651,6 +659,14 @@ function ensureBaseAvailable(
   }
 }
 
+function isSymlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 // The marker sits at a fixed path in a workspace the agent controlled: read and
 // write it without following a symlink (one could point at the database).
 function readMarker(markerPath: string): string | null {
@@ -681,9 +697,7 @@ function normalizeOrigin(
 ): void {
   const url = `https://github.com/${pre.owner}/${pre.repo}.git`;
   try {
-    execFileSync(
-      "git",
-      ["-C", repoDir, "remote", "set-url", "origin", url],
+    hostGit(repoDir, ["remote", "set-url", "origin", url],
       { stdio: "pipe", timeout: 15_000 },
     );
   } catch (err) {
@@ -722,27 +736,19 @@ function refreshExistingClone(
     // Fetch the branch from the plain URL directly (auth via the one-shot `-c`
     // extraheader) so we don't depend on the stored remote — and never persist
     // any credential into .git/config.
-    execFileSync(
-      "git",
-      ["-C", repoDir, ...authArgs, "fetch", ...depth, url, pre.headFetchRef ?? pre.branch],
+    hostGit(repoDir, [...authArgs, "fetch", ...depth, url, pre.headFetchRef ?? pre.branch],
       { stdio: "pipe", timeout: 120_000 },
     );
-    execFileSync(
-      "git",
-      ["-C", repoDir, "checkout", "-B", pre.branch, "FETCH_HEAD"],
+    hostGit(repoDir, ["checkout", "-B", pre.branch, "FETCH_HEAD"],
       { stdio: "pipe", timeout: 30_000 },
     );
-    execFileSync(
-      "git",
-      ["-C", repoDir, "reset", "--hard", "FETCH_HEAD"],
+    hostGit(repoDir, ["reset", "--hard", "FETCH_HEAD"],
       { stdio: "pipe", timeout: 30_000 },
     );
     // -x removes ignored files (stale dist/, .turbo, coverage, …); -e keeps the
     // dependency trees warm so install is incremental. `node_modules` with no
     // leading slash matches at any depth (monorepos / workspaces).
-    execFileSync(
-      "git",
-      ["-C", repoDir, "clean", "-fdx", "-e", "node_modules"],
+    hostGit(repoDir, ["clean", "-fdx", "-e", "node_modules"],
       { stdio: "pipe", timeout: 60_000 },
     );
     normalizeOrigin(repoDir, pre);

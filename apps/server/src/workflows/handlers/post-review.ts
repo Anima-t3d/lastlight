@@ -1,11 +1,10 @@
-import { execFileSync } from "node:child_process";
 import {
   readdirSync,
   readFileSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { GitHubClient } from "../../engine/github/github.js";
 import {
   anchorFindings,
@@ -51,6 +50,7 @@ import {
   type ReviewLedger,
 } from "../../engine/review-ledger.js";
 import { resolveHostRepoDir } from "./host-repo-dir.js";
+import { hostGit, sanitizeCheckout } from "../../engine/host-git.js";
 
 const log = logger("post-review");
 import type { ExecutorConfig } from "lastlight-workflow-engine";
@@ -636,6 +636,15 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
     // returns a SHA on host-checkout backends (docker/none/gondolin) and
     // undefined on k8s, where the workspace lives in a sandbox PVC and only the
     // harvested `.lastlight/` reaches the harness.
+    //
+    // The agent has had this checkout, and git runs on it here as the server's
+    // user: make its `.git` inert first, and never review one that points git
+    // at another repository.
+    try {
+      sanitizeCheckout(dirname(hostRepoDir), hostRepoDir, `https://github.com/${owner}/${repo}.git`);
+    } catch (err) {
+      return fail(`post-review: ${err instanceof Error ? err.message : String(err)}`);
+    }
     const localHeadSha = this.gitHeadSha(hostRepoDir);
     // The checkout must BE the PR. A pull request always has at least one
     // commit beyond its base, so a HEAD with none is the base branch — the
@@ -1358,7 +1367,7 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
       // Also the "is there a local checkout?" probe (undefined on k8s), so it
       // runs on every run — silence stderr ("fatal: not a git repository") that
       // execFileSync otherwise inherits to the console.
-      return execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD"], {
+      return hostGit(repoDir, ["rev-parse", "HEAD"], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
       }).trim();
@@ -1370,9 +1379,9 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
   /** Commits on HEAD not on `origin/<baseRef>`, or undefined if git can't say. */
   private gitCommitsAhead(repoDir: string, baseRef: string): number | undefined {
     try {
-      const out = execFileSync(
-        "git",
-        ["-C", repoDir, "rev-list", "--count", `origin/${baseRef}..HEAD`],
+      const out = hostGit(
+        repoDir,
+        ["rev-list", "--count", `origin/${baseRef}..HEAD`],
         { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
       ).trim();
       const n = Number(out);
@@ -1385,13 +1394,13 @@ export class GitHubPostReviewHandler implements PhaseTypeHandler {
   /** Compute the base…head diff locally and parse it into per-file hunks. */
   private gitDiffFiles(repoDir: string, baseRef: string): DiffFile[] | null {
     const git = (...args: string[]): string =>
-      execFileSync("git", ["-C", repoDir, ...args], {
+      hostGit(repoDir, args, {
         encoding: "utf8",
         maxBuffer: 64 * 1024 * 1024,
       });
     const tryGit = (...args: string[]): void => {
       try {
-        execFileSync("git", ["-C", repoDir, ...args], { stdio: "ignore" });
+        hostGit(repoDir, args, { stdio: "ignore" });
       } catch {
         /* offline / already complete / already present — best-effort */
       }
