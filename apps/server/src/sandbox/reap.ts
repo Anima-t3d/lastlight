@@ -4,6 +4,8 @@ import { join, resolve, sep } from "path";
 import { logger } from "../logging/logger.js";
 import { SERVICE_LABEL_SELECTOR } from "./service-containers-docker.js";
 import { SANDBOX_IMAGE } from "./images.js";
+import type { WorkspaceMount } from "./docker.js";
+import { resolveWorkspaceMount } from "./workspace-mount.js";
 
 const log = logger("reap");
 
@@ -101,20 +103,26 @@ export interface ReapResult {
  * ownership caps and no network re-owns it. `-h -P`: planted symlinks are
  * re-owned, never followed. Throws on failure.
  */
-export function reclaimWorkspaceDir(hostDir: string, imageName: string): void {
+export function reclaimWorkspaceDir(mount: WorkspaceMount, imageName: string): void {
+  // The same mount the sandbox got: a host path, or a subpath of the named data volume.
+  const mountArgs = mount.type === "bind"
+    ? ["-v", `${mount.hostPath}:/w`]
+    : ["--mount", `type=volume,source=${mount.volume},target=/w,volume-subpath=${mount.subpath}`];
   execFileSync("docker", [
     "run", "--rm", "--network", "none",
     "--cap-drop", "ALL", "--cap-add", "CHOWN", "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
     "--entrypoint", "chown",
-    "-v", `${hostDir}:/w`,
+    ...mountArgs,
     imageName,
     "-R", "-h", "-P", "0:0", "/w",
   ], { stdio: "pipe", timeout: 120_000 });
 }
 
 /** The reclaim reap and reuse use by default: only on rootless docker. */
-export function defaultReclaim(): ((dir: string) => void) | undefined {
-  return process.env.SANDBOX_ROOTLESS === "1" ? (dir) => reclaimWorkspaceDir(dir, SANDBOX_IMAGE) : undefined;
+export function defaultReclaim(stateDir: string): ((dir: string) => void) | undefined {
+  return process.env.SANDBOX_ROOTLESS === "1"
+    ? (dir) => reclaimWorkspaceDir(resolveWorkspaceMount(stateDir, dir), SANDBOX_IMAGE)
+    : undefined;
 }
 
 /**
@@ -152,7 +160,7 @@ export function reapSandboxWorkspace(opts: {
     // collect them. This is the backstop for that; the happy path is
     // `DockerSandbox.destroy`. Kubernetes needs no equivalent (the pod is the boundary).
     reapServiceContainers(opts.taskId);
-    removeWorkspace(workDir, opts.reclaim ?? defaultReclaim());
+    removeWorkspace(workDir, opts.reclaim ?? defaultReclaim(opts.stateDir));
     log.info("Removed workspace", { taskId: opts.taskId });
     return { removed: true };
   } catch (err) {

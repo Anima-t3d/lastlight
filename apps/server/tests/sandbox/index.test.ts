@@ -29,10 +29,12 @@ beforeEach(() => {
 import { execFileSync } from "child_process";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "fs";
 import { tmpdir } from "os";
@@ -235,6 +237,38 @@ describe("prePopulateWorkspace clone depth + per-PR reuse (issue #107)", () => {
       owner: "cliftonc", repo: REPO, branch: "main", token: TOKEN,
     });
     expect(mockExec).not.toHaveBeenCalled();
+  });
+
+  it("never writes the run marker through a symlink the agent planted", () => {
+    mkdirSync(join(workDir, REPO, ".git"), { recursive: true });
+    const hostFile = join(tmpdir(), `ll-marker-target-${process.pid}-${Date.now()}`);
+    writeFileSync(hostFile, "HOST DATABASE");
+    symlinkSync(hostFile, join(workDir, ".lastlight-run"));
+    try {
+      prePopulateWorkspace(workDir, {
+        owner: "cliftonc", repo: REPO, branch: "pr-head", token: TOKEN, runId: "new-run",
+      });
+      expect(readFileSync(hostFile, "utf-8")).toBe("HOST DATABASE");
+      expect(lstatSync(join(workDir, ".lastlight-run")).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(workDir, ".lastlight-run"), "utf-8")).toBe("new-run");
+    } finally {
+      rmSync(hostFile, { force: true });
+    }
+  });
+
+  it("does not trust a symlinked run marker as this run's own (refreshes instead of preserving)", () => {
+    mkdirSync(join(workDir, REPO, ".git"), { recursive: true });
+    const hostFile = join(tmpdir(), `ll-marker-src-${process.pid}-${Date.now()}`);
+    writeFileSync(hostFile, "run-7");
+    symlinkSync(hostFile, join(workDir, ".lastlight-run"));
+    try {
+      prePopulateWorkspace(workDir, {
+        owner: "cliftonc", repo: REPO, branch: "pr-head", token: TOKEN, runId: "run-7",
+      });
+      expect(gitVerbs()).toContain("fetch");
+    } finally {
+      rmSync(hostFile, { force: true });
+    }
   });
 
   it("refreshes (fetch+reset+clean) when a DIFFERENT run reuses the PR dir", () => {
