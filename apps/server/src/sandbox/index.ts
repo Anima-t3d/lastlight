@@ -1,7 +1,7 @@
 import { execFileSync } from "child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { isAbsolute, join, relative, resolve, sep } from "path";
-import { DockerSandbox, type WorkspaceMount } from "./docker.js";
+import { DockerSandbox, parseSandboxLimits, type WorkspaceMount } from "./docker.js";
 import { defaultReclaim } from "./reap.js";
 import { SANDBOX_IMAGE, isSandboxAvailable } from "./images.js";
 import { githubBasicAuthB64, githubExtraheaderArgs } from "./git-http-auth.js";
@@ -171,7 +171,7 @@ export async function createTaskSandbox(opts: {
     imageName: opts.imageName || SANDBOX_IMAGE,
     env: opts.env || {},
     memoryLimit: process.env.SANDBOX_MEMORY_LIMIT || undefined,
-    rootless: process.env.SANDBOX_ROOTLESS === "1",
+    ...parseSandboxLimits(process.env),
     dnsIp: opts.dnsIp,
   });
 
