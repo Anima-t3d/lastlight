@@ -4,7 +4,7 @@ import {
   type ExecFileSyncOptionsWithStringEncoding,
 } from "child_process";
 import { lstatSync, unlinkSync } from "fs";
-import { join } from "path";
+import { join, resolve } from "path";
 import {
   isContainedRealPath,
   readWorkspaceFile,
@@ -27,11 +27,16 @@ import {
  */
 export const HOST_GIT_GUARD = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
 
-/** `git -C <repoDir>` with {@link HOST_GIT_GUARD}. */
+/**
+ * `git -C <repoDir>` with {@link HOST_GIT_GUARD}, pinned to `<repoDir>/.git`:
+ * with no `.git` there git fails rather than search the directories above,
+ * where the workspace root is the agent's to plant a repository in.
+ */
 export function hostGit(repoDir: string, args: string[], opts: ExecFileSyncOptionsWithStringEncoding): string;
 export function hostGit(repoDir: string, args: string[], opts?: ExecFileSyncOptions): string | Buffer;
 export function hostGit(repoDir: string, args: string[], opts: ExecFileSyncOptions = { stdio: "pipe" }): string | Buffer {
-  return execFileSync("git", ["-C", repoDir, ...HOST_GIT_GUARD, ...args], opts);
+  const env = { ...(opts.env ?? process.env), GIT_DIR: resolve(repoDir, ".git"), GIT_WORK_TREE: resolve(repoDir) };
+  return execFileSync("git", ["-C", repoDir, ...HOST_GIT_GUARD, ...args], { ...opts, env });
 }
 
 /** The checkout is shaped so that host git would act on something outside it. */
