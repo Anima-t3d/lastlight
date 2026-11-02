@@ -1,5 +1,5 @@
 import { basename, join } from "path";
-import { existsSync, mkdirSync, writeFileSync } from "fs";
+import { existsSync } from "fs";
 import { resolveAuthFile } from "../oauth.js";
 import { randomUUID } from "crypto";
 import {
@@ -57,7 +57,9 @@ import {
   serverArtifacts,
   skillBundleKey,
   stageArtifactsIn,
+  stageScriptFile,
 } from "./shared.js";
+import { writeWorkspaceFile } from "../workspace-fs.js";
 
 const log = logger("executor");
 
@@ -284,11 +286,20 @@ function deliverAgentContext(sandbox: Sandbox, ctx: SandboxRunContext, prov: Pro
       provideAgentContext(sandbox, md);
       return;
     }
-    if (md) writeFileSync(join(prov.hostWorkspaceDir, "AGENTS.md"), md);
+    if (md) writeAgentContext(prov.hostWorkspaceDir, md);
   } catch (err: unknown) {
     log.warn("Could not deliver AGENTS.md", { err });
   }
 }
+
+/**
+ * The persona lands at a fixed path in a workspace the agent controlled a
+ * moment ago; replace a symlink planted there instead of writing through it.
+ */
+function writeAgentContext(hostWorkspaceDir: string, md: string): void {
+  writeWorkspaceFile(hostWorkspaceDir, "AGENTS.md", md);
+}
+export { writeAgentContext as __writeAgentContextForTest };
 
 /**
  * Host path the server-mode artifact seam stages into / harvests from.
@@ -766,8 +777,7 @@ export async function runCommandIn(
         toolInput = { command: spec.command };
       } else {
         const { fileName, run } = scriptInvocation(spec);
-        mkdirSync(join(prov.hostWorkspaceDir, scriptDir), { recursive: true });
-        writeFileSync(join(prov.hostWorkspaceDir, scriptDir, fileName), spec.script);
+        stageScriptFile(prov.hostWorkspaceDir, scriptDir, fileName, spec.script);
         command = run(sandbox.sandboxPathFor(`${scriptDir}/${fileName}`));
         toolInput = { command, runtime: spec.runtime };
       }
