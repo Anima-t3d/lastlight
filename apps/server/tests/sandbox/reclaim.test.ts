@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
@@ -25,7 +25,7 @@ vi.mock("#src/logging/logger.js", () => {
 });
 
 import { execFileSync } from "child_process";
-import { hasLiveSandboxFor, reapSandboxWorkspace, reclaimWorkspaceDir, sandboxRoot } from "#src/sandbox/reap.js";
+import { hasLiveSandboxFor, reapSandboxWorkspace, reclaimWorkspaceDir, sandboxRoot, treeOwnedBy } from "#src/sandbox/reap.js";
 import { ensureWorkspaceDir, WorkspaceBusyError } from "#src/sandbox/index.js";
 
 const mockExec = vi.mocked(execFileSync);
@@ -147,11 +147,20 @@ describe("reapSandboxWorkspace on rootless docker", () => {
 });
 
 describe("ensureWorkspaceDir", () => {
-  it("reclaims an existing workspace before the host reuses it", () => {
+  it("reclaims an existing workspace the host does not fully own before reusing it", () => {
     const dir = tmp("ws-");
     const reclaim = vi.fn();
-    ensureWorkspaceDir(dir, reclaim);
+    ensureWorkspaceDir(dir, reclaim, undefined, () => false);
     expect(reclaim).toHaveBeenCalledWith(dir);
+  });
+
+  it("skips the reclaim container when the host already owns the whole tree", () => {
+    const dir = tmp("ws-");
+    mkdirSync(join(dir, "repo", "src"), { recursive: true });
+    writeFileSync(join(dir, "repo", "src", "a.ts"), "x");
+    const reclaim = vi.fn();
+    ensureWorkspaceDir(dir, reclaim);
+    expect(reclaim).not.toHaveBeenCalled();
   });
 
   it("creates a fresh workspace without reclaiming", () => {
@@ -192,5 +201,33 @@ describe("hasLiveSandboxFor", () => {
   it("treats an unreachable docker as no live sandbox", () => {
     mockExec.mockImplementation(() => { throw new Error("no daemon"); });
     expect(hasLiveSandboxFor("acme-1")).toBe(false);
+  });
+});
+
+describe("treeOwnedBy", () => {
+  const uid = process.getuid!();
+
+  it("is true when every entry belongs to the uid, without following symlinks", () => {
+    const dir = tmp("own-");
+    mkdirSync(join(dir, "a", "b"), { recursive: true });
+    writeFileSync(join(dir, "a", "b", "f"), "x");
+    symlinkSync("/", join(dir, "a", "root-link"));
+    expect(treeOwnedBy(dir, uid)).toBe(true);
+  });
+
+  it("is false when any entry belongs to another uid", () => {
+    const dir = tmp("own-");
+    mkdirSync(join(dir, "a"));
+    writeFileSync(join(dir, "a", "f"), "x");
+    expect(treeOwnedBy(dir, uid + 1)).toBe(false);
+  });
+
+  it("is false when a directory cannot be read", () => {
+    const dir = tmp("own-");
+    const locked = join(dir, "locked");
+    mkdirSync(locked);
+    chmodSync(locked, 0o000);
+    lockedDirs.push(locked);
+    expect(treeOwnedBy(dir, uid)).toBe(false);
   });
 });
