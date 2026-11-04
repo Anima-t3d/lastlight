@@ -4,7 +4,7 @@ import { join, resolve, sep } from "path";
 import { logger } from "../logging/logger.js";
 import { SERVICE_LABEL_SELECTOR } from "./service-containers-docker.js";
 import { SANDBOX_IMAGE } from "./images.js";
-import type { WorkspaceMount } from "./docker.js";
+import { parseSandboxLimits, type WorkspaceMount } from "./docker.js";
 import { resolveWorkspaceMount } from "./workspace-mount.js";
 
 const log = logger("reap");
@@ -139,8 +139,11 @@ export function reclaimWorkspaceDir(mount: WorkspaceMount, imageName: string): v
 }
 
 /** The reclaim reap and reuse use by default: only on rootless docker. */
-export function defaultReclaim(stateDir: string): ((dir: string) => void) | undefined {
-  return process.env.SANDBOX_ROOTLESS === "1"
+export function defaultReclaim(
+  stateDir: string,
+  rootless: boolean = parseSandboxLimits(process.env).rootless,
+): ((dir: string) => void) | undefined {
+  return rootless
     ? (dir) => reclaimWorkspaceDir(resolveWorkspaceMount(stateDir, dir), SANDBOX_IMAGE)
     : undefined;
 }

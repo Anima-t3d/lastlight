@@ -155,6 +155,8 @@ export async function createTaskSandbox(opts: {
   imageName?: string;
 }): Promise<{ sandbox: DockerSandbox; workDir: string; cleanup: () => Promise<void> } | null> {
   if (!sandboxAvailable()) return null;
+  // Before any work: a malformed limit must fail the run, not a finished clone.
+  const limits = parseSandboxLimits(process.env);
 
   const sandboxBase = resolve(opts.sandboxDir || join(opts.stateDir, "sandboxes"));
   mkdirSync(sandboxBase, { recursive: true });
@@ -164,7 +166,7 @@ export async function createTaskSandbox(opts: {
     throw new Error(`Invalid taskId path escape attempt: ${opts.taskId}`);
   }
 
-  ensureWorkspaceDir(workDir, defaultReclaim(opts.stateDir), () => hasLiveSandboxFor(opts.taskId));
+  ensureWorkspaceDir(workDir, defaultReclaim(opts.stateDir, limits.rootless), () => hasLiveSandboxFor(opts.taskId));
 
   if (opts.prePopulate) {
     prePopulateWorkspace(workDir, opts.prePopulate);
@@ -174,7 +176,7 @@ export async function createTaskSandbox(opts: {
     imageName: opts.imageName || SANDBOX_IMAGE,
     env: opts.env || {},
     memoryLimit: process.env.SANDBOX_MEMORY_LIMIT || undefined,
-    ...parseSandboxLimits(process.env),
+    ...limits,
     dnsIp: opts.dnsIp,
   });
 
