@@ -454,8 +454,13 @@ describe("parseSandboxLimits", () => {
     expect(() => parseSandboxLimits({ SANDBOX_CPUS: "-1" })).toThrow(/SANDBOX_CPUS/);
   });
 
-  it("only the literal 1 switches cap-drop and rootless on", () => {
-    expect(parseSandboxLimits({ SANDBOX_CAP_DROP: "true", SANDBOX_ROOTLESS: "yes" }))
+  it("reads 0 as off for cap-drop and rootless", () => {
+    expect(parseSandboxLimits({ SANDBOX_CAP_DROP: "0", SANDBOX_ROOTLESS: " 0 " }))
       .toMatchObject({ capDrop: false, rootless: false });
+  });
+
+  it("refuses a cap-drop or rootless value other than 0 or 1, naming the variable", () => {
+    expect(() => parseSandboxLimits({ SANDBOX_CAP_DROP: "true" })).toThrow(/SANDBOX_CAP_DROP must be 0 or 1, got "true"/);
+    expect(() => parseSandboxLimits({ SANDBOX_ROOTLESS: "yes" })).toThrow(/SANDBOX_ROOTLESS must be 0 or 1, got "yes"/);
   });
 });

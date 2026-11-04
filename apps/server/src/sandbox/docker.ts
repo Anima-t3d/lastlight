@@ -149,9 +149,17 @@ export function parseSandboxLimits(env: NodeJS.ProcessEnv): {
   return {
     pidsLimit: pidsRaw === undefined ? undefined : Number(pidsRaw),
     cpus,
-    capDrop: env.SANDBOX_CAP_DROP === "1",
-    rootless: env.SANDBOX_ROOTLESS === "1",
+    capDrop: parseFlag(env, "SANDBOX_CAP_DROP"),
+    rootless: parseFlag(env, "SANDBOX_ROOTLESS"),
   };
+}
+
+/** `1` on, `0` / empty / unset off; anything else throws naming the variable. */
+function parseFlag(env: NodeJS.ProcessEnv, name: string): boolean {
+  const raw = env[name]?.trim() || undefined;
+  if (raw === undefined || raw === "0") return false;
+  if (raw === "1") return true;
+  throw new Error(`${name} must be 0 or 1, got "${raw}"`);
 }
 
 export interface SandboxInfo {
