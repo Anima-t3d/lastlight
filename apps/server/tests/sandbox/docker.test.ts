@@ -331,6 +331,7 @@ describe("DockerSandbox.create — opt-in hardening flags", () => {
       "run", "-d", "--name", "<name>", "--memory", "8g", "--memory-swap", "8g",
       "--network", "lastlight_sandbox-egress",
       "-v", "lastlight_agent-data:/data",
+      "--mount", "type=tmpfs,destination=/data/proxy,tmpfs-size=4096,tmpfs-mode=0500",
       "-v", "/tmp/work:/home/agent/workspace",
       "-v", "lastlight_pkg-cache:/cache",
       "-e", "npm_config_cache=/cache/npm",
@@ -369,5 +370,29 @@ describe("parseSandboxLimits", () => {
   it("only the literal 1 switches cap-drop and rootless on", () => {
     expect(parseSandboxLimits({ SANDBOX_CAP_DROP: "true", SANDBOX_ROOTLESS: "yes" }))
       .toMatchObject({ capDrop: false, rootless: false });
+  });
+});
+
+describe("DockerSandbox.create — /data/proxy is masked (model gateway key)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockExecFileSync.mockReturnValue("container-xyz\n");
+  });
+
+  it("covers /data/proxy with an empty root-only tmpfs after the /data mount", async () => {
+    // /data is the shared agent-data volume by default; its proxy/ dir holds
+    // the generated firewall configs and the model gateway's key file (owned
+    // by the same UID as the sandbox agent). The sandbox must see neither.
+    const manager = new DockerSandbox({ imageName: "img", env: {} });
+    await manager.create({
+      taskId: "t",
+      worktreePath: "/tmp/work",
+      workspaceMount: { type: "bind", hostPath: "/tmp/work" },
+    });
+    const call = mockExecFileSync.mock.calls.find((c) => Array.isArray(c[1]) && (c[1] as string[])[0] === "run");
+    const argv = (call?.[1] as string[]) ?? [];
+    const mask = "type=tmpfs,destination=/data/proxy,tmpfs-size=4096,tmpfs-mode=0500";
+    expect(argv).toContain(mask);
+    expect(argv.indexOf(mask)).toBeGreaterThan(argv.findIndex((a) => a.endsWith(":/data")));
   });
 });
