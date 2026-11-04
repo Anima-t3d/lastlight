@@ -39,7 +39,7 @@ import {
 } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { __prePopulateWorkspaceForTest as prePopulateWorkspace, WorkspaceBusyError } from "#src/sandbox/index.js";
+import { __prePopulateWorkspaceForTest as prePopulateWorkspace, createTaskSandbox, WorkspaceBusyError } from "#src/sandbox/index.js";
 import { markRunLive, __resetLiveRunsForTest } from "#src/workflows/live-runs.js";
 import { HOST_GIT_GUARD, UnsafeCheckoutError } from "#src/engine/host-git.js";
 
@@ -637,5 +637,31 @@ describe("prePopulateWorkspace recreate-from-base (build, issue #153)", () => {
     // Same run → no git ops, no delete (the architect's plan.md must survive).
     expect(mockExec).not.toHaveBeenCalled();
     expect(existsSync(join(workDir, REPO, ".git"))).toBe(true);
+  });
+});
+
+describe("createTaskSandbox reads the sandbox limits before any work", () => {
+  let stateDir: string;
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "ll-limits-"));
+    // docker is up and the sandbox image exists; everything else succeeds quietly.
+    mockExec.mockImplementation(((_cmd: string, args: string[]) =>
+      args[0] === "images" ? "sha256:abc\n" : Buffer.from("")) as unknown as typeof execFileSync);
+    vi.stubEnv("SANDBOX_PIDS_LIMIT", "abc");
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    mockExec.mockReset();
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it("refuses a malformed limit before the workspace is made or cloned", async () => {
+    await expect(createTaskSandbox({
+      taskId: "t-limits",
+      stateDir,
+      prePopulate: { owner: "o", repo: "r", branch: "b", token: TOKEN },
+    })).rejects.toThrow(/SANDBOX_PIDS_LIMIT/);
+    expect(gitVerbs()).not.toContain("clone");
+    expect(existsSync(join(stateDir, "sandboxes", "t-limits"))).toBe(false);
   });
 });
