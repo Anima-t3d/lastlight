@@ -2,7 +2,7 @@ import { execFileSync } from "child_process";
 import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "path";
 import { DockerSandbox, parseSandboxLimits, type WorkspaceMount } from "./docker.js";
-import { defaultReclaim, hasLiveSandboxFor } from "./reap.js";
+import { defaultReclaim, hasLiveSandboxFor, treeOwnedBy } from "./reap.js";
 import { resolveWorkspaceMount } from "./workspace-mount.js";
 import { SANDBOX_IMAGE, isSandboxAvailable } from "./images.js";
 import { githubBasicAuthB64, githubExtraheaderArgs } from "./git-http-auth.js";
@@ -794,13 +794,16 @@ export function ensureWorkspaceDir(
   reclaim?: (dir: string) => void,
   /** Another live sandbox container still owns this workspace (checked only when `reclaim` is given). */
   isBusy?: () => boolean,
+  /** The host already owns the whole tree, so no reclaim container is needed (test seam). */
+  ownedByHost: (dir: string) => boolean = (dir) => treeOwnedBy(dir, process.getuid?.() ?? 0),
 ): void {
   if (existsSync(workDir)) {
     if (!reclaim) return;
     // On rootless docker a second sandbox on a held workspace would fight the
     // first over ownership; refuse this run rather than break the live one.
     if (isBusy?.()) throw new WorkspaceBusyError(workDir, "a live sandbox container");
-    reclaim(workDir);
+    // The normal case: the last hand-back already gave everything to the host.
+    if (!ownedByHost(workDir)) reclaim(workDir);
     return;
   }
   mkdirSync(workDir, { recursive: true });
