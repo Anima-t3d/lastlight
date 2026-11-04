@@ -81,7 +81,8 @@ export function writeWorkspaceFile(root: string, relPath: string, data: string):
   if (!planted && !isContainedRealPath(root, abs)) {
     throw new Error(`Refusing to write ${relPath}: not a plain path inside the workspace`);
   }
-  if (planted) unlinkSync(abs);
+  // A hardlink shares its inode with a file elsewhere: O_TRUNC would rewrite that one too.
+  if (planted || hardlinked(abs)) unlinkSync(abs);
   const fd = openSync(
     abs,
     constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW | constants.O_NONBLOCK,
@@ -128,25 +129,39 @@ export function mkdirWorkspaceDir(root: string, relPath: string): void {
  * symlink at the destination, and stores one found at the source).
  */
 export function removeSymlinksUnder(dir: string): number {
-  let removed = 0;
-  let entries;
   try {
     // A symlinked `dir` is the caller's to refuse (isContainedRealPath); never walk its target.
     if (lstatSync(dir).isSymbolicLink()) return 0;
-    entries = readdirSync(dir, { withFileTypes: true });
   } catch {
     return 0;
   }
-  for (const e of entries) {
-    const abs = join(dir, e.name);
-    if (e.isSymbolicLink()) {
-      unlinkSync(abs);
-      removed++;
-    } else if (e.isDirectory()) {
-      removed += removeSymlinksUnder(abs);
+  let removed = 0;
+  // Iterative: the agent decides how deep the tree is. A subdirectory that
+  // cannot be read throws — skipping it would leave its symlinks in place.
+  const stack = [dir];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    for (const e of readdirSync(cur, { withFileTypes: true })) {
+      const abs = join(cur, e.name);
+      if (e.isSymbolicLink()) {
+        unlinkSync(abs);
+        removed++;
+      } else if (e.isDirectory()) {
+        stack.push(abs);
+      }
     }
   }
   return removed;
+}
+
+/** A regular file whose inode has other names. */
+function hardlinked(abs: string): boolean {
+  try {
+    const st = lstatSync(abs);
+    return st.isFile() && st.nlink > 1;
+  } catch {
+    return false;
+  }
 }
 
 /**

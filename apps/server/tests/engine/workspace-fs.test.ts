@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { isContainedRealPath, mkdirWorkspaceDir, readWorkspaceFile, removeSymlinksUnder, writeWorkspaceFile } from "#src/engine/workspace-fs.js";
@@ -78,6 +78,14 @@ describe("writeWorkspaceFile", () => {
     expect(readFileSync(secret, "utf8")).toBe("TOP-SECRET");
     expect(existsSync(join(base, "evil.txt"))).toBe(false);
   });
+
+  it("replaces a hardlinked leaf instead of truncating the file it shares", () => {
+    linkSync(secret, join(root, "AGENTS.md"));
+    writeWorkspaceFile(root, "AGENTS.md", "context");
+    expect(readFileSync(join(root, "AGENTS.md"), "utf8")).toBe("context");
+    expect(readFileSync(secret, "utf8")).toBe("TOP-SECRET");
+    expect(lstatSync(join(root, "AGENTS.md")).nlink).toBe(1);
+  });
 });
 
 describe("mkdirWorkspaceDir", () => {
@@ -113,5 +121,26 @@ describe("removeSymlinksUnder", () => {
 
   it("is a no-op for an absent directory", () => {
     expect(removeSymlinksUnder(join(root, "absent"))).toBe(0);
+  });
+
+  it("refuses a tree with a directory it cannot read instead of skipping it", () => {
+    const locked = join(root, "d", "locked");
+    mkdirSync(locked, { recursive: true });
+    symlinkSync(secret, join(locked, "leak.md"));
+    chmodSync(locked, 0o000);
+    try {
+      expect(() => removeSymlinksUnder(join(root, "d"))).toThrow(/locked/);
+    } finally {
+      chmodSync(locked, 0o700);
+    }
+  });
+
+  it("clears symlinks at every level of a deep tree", () => {
+    let cur = join(root, "deep");
+    for (let i = 0; i < 200; i++) cur = join(cur, "d");
+    mkdirSync(cur, { recursive: true });
+    symlinkSync(secret, join(cur, "leak.md"));
+    expect(removeSymlinksUnder(join(root, "deep"))).toBe(1);
+    expect(existsSync(join(cur, "leak.md"))).toBe(false);
   });
 });
