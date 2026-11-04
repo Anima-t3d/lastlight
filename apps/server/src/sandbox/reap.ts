@@ -1,5 +1,5 @@
 import { execFileSync } from "child_process";
-import { rmSync } from "fs";
+import { lstatSync, readdirSync, rmSync } from "fs";
 import { join, resolve, sep } from "path";
 import { logger } from "../logging/logger.js";
 import { SERVICE_LABEL_SELECTOR } from "./service-containers-docker.js";
@@ -136,6 +136,27 @@ export function reclaimWorkspaceDir(mount: WorkspaceMount, imageName: string): v
     imageName,
     "-R", "-h", "-P", "0:0", "/w",
   ], { stdio: "pipe", timeout: 120_000 });
+}
+
+/**
+ * Every entry under `dir` (and `dir` itself) belongs to `uid`. Symlinks are
+ * checked, never followed; an unreadable directory counts as not owned. Stops
+ * at the first foreign entry. Iterative, so a deep tree cannot overflow the stack.
+ */
+export function treeOwnedBy(dir: string, uid: number): boolean {
+  const stack = [dir];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    try {
+      const st = lstatSync(cur);
+      if (st.uid !== uid) return false;
+      if (!st.isDirectory()) continue;
+      for (const name of readdirSync(cur)) stack.push(join(cur, name));
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** The reclaim reap and reuse use by default: only on rootless docker. */
