@@ -362,10 +362,12 @@ export class DockerSandbox {
       this.config.imageName,
     ];
 
+    let started = false;
     try {
       // The entrypoint handles all setup: AGENTS.md, opencode.json, app.pem
       // materialization, and git config. No docker exec calls needed.
       const containerId = execCmd("docker", args).trim();
+      started = true;
 
       const info: SandboxInfo = { containerId, containerName, worktreePath };
       this.activeContainers.set(opts.taskId, info);
@@ -379,7 +381,12 @@ export class DockerSandbox {
 
       return info;
     } catch (err: any) {
-      throw new Error(`Failed to create sandbox: ${err.message}`);
+      // The caller gets no sandbox to clean up, so never leave a started container behind.
+      if (started) {
+        execSafe("docker", ["rm", "-f", containerName]);
+        this.activeContainers.delete(opts.taskId);
+      }
+      throw new Error(`Failed to create sandbox: ${err.message}`, { cause: err });
     }
   }
 
@@ -433,9 +440,15 @@ export class DockerSandbox {
       hold = { count: 1, ready: pending.catch(() => undefined).then(() => this.setWorkspaceOwner(info, "agent")) };
       this.agentHolds.set(taskId, hold);
     }
+    let runErr: unknown;
+    let failed = false;
     try {
       await hold.ready;
       return await fn();
+    } catch (err) {
+      failed = true;
+      runErr = err;
+      throw err;
     } finally {
       hold.count -= 1;
       if (hold.count === 0) {
@@ -444,6 +457,10 @@ export class DockerSandbox {
         this.handBacks.set(taskId, back);
         try {
           await back;
+        } catch (backErr) {
+          // A stuck workspace is what the caller must see, but never lose why the run failed.
+          if (failed && backErr instanceof Error) backErr.cause = runErr;
+          throw backErr;
         } finally {
           if (this.handBacks.get(taskId) === back) this.handBacks.delete(taskId);
         }

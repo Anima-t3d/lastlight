@@ -36,11 +36,12 @@ vi.mock("#src/logging/logger.js", () => {
   return { logger: () => noopLogger };
 });
 
-import { spawn, execFile } from "child_process";
+import { spawn, execFile, execFileSync } from "child_process";
 import { DockerSandbox, WorkspaceHeldError } from "#src/sandbox/docker.js";
 
 const mockSpawn = vi.mocked(spawn);
 const mockExecFile = vi.mocked(execFile);
+const mockExecFileSync = vi.mocked(execFileSync);
 
 const TO_HOST = ["exec", "-u", "0", "test-container", "chown", "-R", "-h", "-P", "0:0", "/home/agent/workspace"];
 const TO_AGENT = ["exec", "-u", "0", "test-container", "chown", "-R", "-h", "-P", "agent:agent", "/home/agent/workspace"];
@@ -272,4 +273,39 @@ describe("DockerSandbox on rootless docker — workspace ownership", () => {
     children[0].emit("close", 0);
     await expect(run).rejects.toThrow(/test-container/);
   });
+
+  it("a failed hand-back after a failed run keeps the run's own error as the cause", async () => {
+    failHandBack();
+    const s = sandbox(true);
+    const run = s.runAgent("task-001", "hi", RUN);
+    await vi.waitFor(() => expect(children).toHaveLength(1));
+    children[0].emit("close", 3);
+    const err = await run.catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/test-container/);
+    expect(((err as Error).cause as Error | undefined)?.message).toMatch(/exit 3/);
+  });
+
+  it("a failed hand-back in create() removes the container it started", async () => {
+    failHandBack();
+    const s = new DockerSandbox({ imageName: "img", env: {}, rootless: true });
+    await expect(s.create({
+      taskId: "t",
+      worktreePath: "/tmp/work",
+      workspaceMount: { type: "bind", hostPath: "/tmp/work" },
+    })).rejects.toThrow(/Failed to create sandbox/);
+    const removed = mockExecFileSync.mock.calls
+      .map((c) => c[1] as string[])
+      .filter((a) => a[0] === "rm" && a[1] === "-f");
+    expect(removed).toHaveLength(1);
+    expect(removed[0][2]).toMatch(/^lastlight-sandbox-t-/);
+  });
 });
+
+/** Make every `chown … 0:0` (the hand-back to the host) fail. */
+function failHandBack(): void {
+  mockExecFile.mockImplementation(((_cmd: string, args: string[], opts: unknown, cb?: unknown) => {
+    const done = (typeof opts === "function" ? opts : cb) as (e: unknown, r: unknown) => void;
+    if (args.includes("0:0")) return done(new Error("chown: permission denied"), { stdout: "", stderr: "" });
+    done(null, { stdout: "", stderr: "" });
+  }) as unknown as typeof execFile);
+}
