@@ -169,6 +169,29 @@ describe("executeAgent on a claude-code model", () => {
     expect(sessionSpy).not.toHaveBeenCalled();
   });
 
+  it("runs the session while the port holds the workspace for the agent (rootless docker)", async () => {
+    const order: string[] = [];
+    (fakePort as { hold?: unknown }).hold = async <T,>(fn: () => Promise<T>) => {
+      order.push("hold");
+      const r = await fn();
+      order.push("release");
+      return r;
+    };
+    try {
+      emitsBasicSession();
+      const basic = sessionSpy.getMockImplementation()!;
+      sessionSpy.mockImplementation(async (...a: unknown[]) => {
+        order.push("session");
+        return basic(...a);
+      });
+      const { result } = await run();
+      expect(result.success).toBe(true);
+      expect(order).toEqual(["hold", "session", "release"]);
+    } finally {
+      delete (fakePort as { hold?: unknown }).hold;
+    }
+  });
+
   it("refuses a non-docker backend", async () => {
     const { result, fake } = await run({ backend: "none" });
     expect(result).toMatchObject({ success: false, error: "claude-code models need sandbox: docker" });

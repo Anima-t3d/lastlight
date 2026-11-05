@@ -107,6 +107,36 @@ describe("DockerSandbox on rootless docker — workspace ownership", () => {
     expect(last).toEqual(["exec", "-u", "0", info.containerName, "chown", "-R", "-h", "-P", "0:0", "/home/agent/workspace"]);
   });
 
+  it("claudeCodePort().hold() gives the workspace to agent for the Claude session and back after", async () => {
+    const s = sandbox(true);
+    const port = s.claudeCodePort("task-001");
+    const out = await port.hold!(async () => {
+      events.push("session");
+      return 7;
+    });
+    expect(out).toBe(7);
+    expect(events).toEqual(["chown:agent:agent", "session", "chown:0:0"]);
+  });
+
+  it("claudeCodePort().hold() hands the workspace back when the session throws", async () => {
+    const s = sandbox(true);
+    await expect(
+      s.claudeCodePort("task-001").hold!(async () => {
+        events.push("session");
+        throw new Error("boom");
+      }),
+    ).rejects.toThrow("boom");
+    expect(events).toEqual(["chown:agent:agent", "session", "chown:0:0"]);
+  });
+
+  it("claudeCodePort().hold() changes no ownership without rootless", async () => {
+    const s = sandbox(false);
+    await s.claudeCodePort("task-001").hold!(async () => {
+      events.push("session");
+    });
+    expect(events).toEqual(["session"]);
+  });
+
   it("runAgent() gives the workspace to agent before the exec and back after close", async () => {
     const s = sandbox(true);
     const run = s.runAgent("task-001", "hi", RUN);

@@ -757,6 +757,7 @@ export class DockerSandbox {
       return ["exec", "-i", "--user", "agent", ...(cwd ? ["-w", cwd] : []), info.containerName, ...argv];
     };
     return {
+      hold: (fn) => this.withAgentOwnership(taskId, info, fn),
       exec: (argv, opts) => {
         const args = argsFor(argv, opts?.cwd);
         return new Promise((resolvePromise, reject) => {

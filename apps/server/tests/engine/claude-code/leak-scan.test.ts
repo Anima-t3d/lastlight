@@ -92,6 +92,22 @@ describe("scanTreeForToken", () => {
 });
 
 describe("redactInSandbox", () => {
+  it("redacts while the port holds the workspace for the agent (rootless docker)", async () => {
+    const order: string[] = [];
+    const exec = vi.fn(async () => {
+      order.push("exec");
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const hold = vi.fn(async <T,>(fn: () => Promise<T>) => {
+      order.push("hold");
+      const r = await fn();
+      order.push("release");
+      return r;
+    });
+    await redactInSandbox({ exec, stream: vi.fn(), hold } as never, "/home/agent/workspace", ["repo/.env"]);
+    expect(order).toEqual(["hold", "exec", "release"]);
+  });
+
   it("overwrites the files from inside the sandbox, never through a host path", async () => {
     const exec = vi.fn(async () => ({ code: 0, stdout: "", stderr: "" }));
     await redactInSandbox({ exec, stream: vi.fn() } as never, "/home/agent/workspace", ["repo/.env", "-odd name"]);
