@@ -130,7 +130,10 @@ export async function redactInSandbox(port: ClaudeCodeExecPort, sandboxRoot: str
   if (paths.length === 0) return;
   const script = `for f; do [ -L "$f" ] || { [ -f "$f" ] && printf '%s' '${REDACTED.trimEnd()}' > "$f"; }; done; true`;
   try {
-    await port.exec(["sh", "-c", script, "sh", ...paths.map((p) => `./${p}`)], { cwd: sandboxRoot });
+    // On rootless docker the workspace is the host's again by now: hand it to
+    // the agent for the rewrite, and back after.
+    const redact = () => port.exec(["sh", "-c", script, "sh", ...paths.map((p) => `./${p}`)], { cwd: sandboxRoot });
+    await (port.hold ? port.hold(redact) : redact());
   } catch {
     // nothing to add: the phase is already failing on the leak
   }

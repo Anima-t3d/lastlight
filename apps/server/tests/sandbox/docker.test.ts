@@ -419,6 +419,8 @@ describe("DockerSandbox.create — opt-in hardening flags", () => {
       "run", "-d", "--name", "<name>", "--memory", "8g", "--memory-swap", "8g",
       "--network", "lastlight_sandbox-egress",
       "-v", "lastlight_agent-data:/data",
+      "--mount", "type=tmpfs,destination=/data/proxy,tmpfs-size=4096,tmpfs-mode=0500",
+      "--mount", "type=tmpfs,destination=/data/claude-code,tmpfs-size=4096,tmpfs-mode=0500",
       "-v", "/tmp/work:/home/agent/workspace",
       "-v", "lastlight_pkg-cache:/cache",
       "-e", "npm_config_cache=/cache/npm",

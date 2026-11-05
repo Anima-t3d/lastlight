@@ -186,6 +186,11 @@ export interface ClaudeCodeExecPort {
     opts?: { stdin?: string; timeoutMs?: number; cwd?: string },
   ): Promise<{ code: number; stdout: string; stderr: string }>;
   stream(argv: string[], onLine: (line: string) => void): { stop(): void; done: Promise<number> };
+  /**
+   * Run `fn` while the agent user owns the workspace (rootless docker hands
+   * it over only for a run); omitted where ownership never changes.
+   */
+  hold?<T>(fn: () => Promise<T>): Promise<T>;
 }
 
 export interface RunAgentOpts {

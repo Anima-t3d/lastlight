@@ -481,7 +481,8 @@ export async function runAgentIn(
         const port = sandbox.claudeCodePort!(ctx.taskId);
         let outcome: ClaudeCodeOutcome;
         try {
-          outcome = await runClaudeCodeSession(port, {
+          // On rootless docker the agent owns the workspace only while it runs.
+          const runSession = () => runClaudeCodeSession(port, {
           model: claudeCodeModelId(model),
           prompt: resume ? "continue" : prompt,
           ...(resume ? { resume } : {}),
@@ -497,6 +498,7 @@ export async function runAgentIn(
           },
           onRawLine: (line) => keep(token ? scrubToken(line, token) : line),
         });
+          outcome = await (port.hold ? port.hold(runSession) : runSession());
         } catch (err: unknown) {
           // Whatever the session got to write is checked on every way out.
           const leak = await claudeCodeLeaks(token, lastAnswerRaw, prov, port);
