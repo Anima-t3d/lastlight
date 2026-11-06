@@ -564,7 +564,7 @@ export class WorkflowRunStore {
    */
   async latestForTriggers(
     triggerIds: string[],
-    opts: { statuses?: string[] } = {},
+    opts: { statuses?: string[]; workflowNames?: string[] } = {},
   ): Promise<Map<string, WorkflowRun>> {
     const { workflowRuns } = this.t;
     const out = new Map<string, WorkflowRun>();
@@ -577,6 +577,9 @@ export class WorkflowRunStore {
       const where: SQL[] = [inArray(workflowRuns.triggerId, chunk)];
       if (opts.statuses && opts.statuses.length > 0) {
         where.push(inArray(workflowRuns.status, opts.statuses));
+      }
+      if (opts.workflowNames && opts.workflowNames.length > 0) {
+        where.push(inArray(workflowRuns.workflowName, opts.workflowNames));
       }
       const rows = await this.client
         .select({
