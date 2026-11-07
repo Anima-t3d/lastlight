@@ -26,6 +26,7 @@ import { installProviderOverrides } from "./provider-registry.js";
 import { HOST_READABLE_WORKSPACE } from "../workflows/handlers/host-repo-dir.js";
 import type { SandboxBackend, BuildAssetsLocation, OtelConfig } from "lastlight-workflow-engine";
 import { logger } from "../logging/logger.js";
+import type { UsageGateConfig } from "../engine/usage-gate.js";
 import {
   assertWebhookSecrets,
   displayWebhookUrl,
@@ -588,8 +589,12 @@ export interface AutonomyStageConfig {
 export interface AutonomyBudgetConfig {
   maxConcurrentBuilds: number;
   maxBuildsPerRepoPerDay: number;
-  dailyUsd: number;
-  repoDailyUsd: number;
+  /** Deployment-wide model spend per UTC day; `null` = no dollar cap. */
+  dailyUsd: number | null;
+  /** One repo's share of it; `null` = no dollar cap. */
+  repoDailyUsd: number | null;
+  /** Subscription usage windows as a dispatch input; `source: null` = off. */
+  usage: UsageGateConfig;
 }
 
 /**
@@ -750,7 +755,13 @@ function packagedAutonomy(): AutonomyConfig {
     return {
       repos: [],
       stages: {},
-      budget: { maxConcurrentBuilds: 0, maxBuildsPerRepoPerDay: 0, dailyUsd: 0, repoDailyUsd: 0 },
+      budget: {
+        maxConcurrentBuilds: 0,
+        maxBuildsPerRepoPerDay: 0,
+        dailyUsd: 0,
+        repoDailyUsd: 0,
+        usage: { ...USAGE_DEFAULTS, windows: [...USAGE_DEFAULTS.windows] },
+      },
     };
   }
   resolvingPackagedAutonomy = true;
@@ -831,9 +842,62 @@ function normalizeAutonomyBudget(raw: unknown): AutonomyBudgetConfig {
   return {
     maxConcurrentBuilds: nonNegativeNumber(b.maxConcurrentBuilds) ?? packaged().maxConcurrentBuilds,
     maxBuildsPerRepoPerDay: nonNegativeNumber(b.maxBuildsPerRepoPerDay) ?? packaged().maxBuildsPerRepoPerDay,
-    dailyUsd: nonNegativeNumber(b.dailyUsd) ?? packaged().dailyUsd,
-    repoDailyUsd: nonNegativeNumber(b.repoDailyUsd) ?? packaged().repoDailyUsd,
+    // An explicit `null` is a choice ("no dollar cap", e.g. a flat-rate
+    // subscription paced by `usage` instead); a negative or non-number is not
+    // a budget and falls back, as above.
+    dailyUsd: b.dailyUsd === null ? null : (nonNegativeNumber(b.dailyUsd) ?? packaged().dailyUsd),
+    repoDailyUsd: b.repoDailyUsd === null ? null : (nonNegativeNumber(b.repoDailyUsd) ?? packaged().repoDailyUsd),
+    usage: normalizeUsageGate(b.usage),
   };
+}
+
+/** The usage gate's packaged values: off until a source is configured. */
+const USAGE_DEFAULTS: UsageGateConfig = {
+  source: null,
+  maxPercent: 80,
+  windows: ["five_hour", "weekly"],
+  staleAfterSeconds: 600,
+  onUnavailable: "allow",
+  enabled: true,
+};
+
+/**
+ * `autonomy.budget.usage`. Lenient like the rest of the block: a malformed
+ * leaf falls back to its default and never throws. A malformed `source` leaves
+ * the gate off (and says so), since there is nothing it could read.
+ */
+function normalizeUsageGate(raw: unknown): UsageGateConfig {
+  const u = isPlainObject(raw) ? raw : {};
+  let source: UsageGateConfig["source"] = null;
+  if (u.source !== undefined && u.source !== null) {
+    const s = u.source;
+    if (isPlainObject(s) && typeof s.file === "string" && s.file.trim()) {
+      source = { file: s.file.trim() };
+    } else if (
+      isPlainObject(s) &&
+      Array.isArray(s.command) &&
+      s.command.length > 0 &&
+      s.command.every((a) => typeof a === "string" && a.length > 0)
+    ) {
+      source = { command: [...(s.command as string[])] };
+    } else {
+      log.warn("autonomy.budget.usage.source must be { file: <path> } or { command: [argv...] }; usage gate off");
+    }
+  }
+  const maxPercent =
+    typeof u.maxPercent === "number" && Number.isFinite(u.maxPercent) && u.maxPercent >= 1 && u.maxPercent <= 100
+      ? u.maxPercent
+      : USAGE_DEFAULTS.maxPercent;
+  const listed = nonEmptyStringList(u.windows);
+  // An empty list would make the gate silently never hold; fall back instead.
+  const windows = listed && listed.length > 0 ? listed : [...USAGE_DEFAULTS.windows];
+  const staleAfterSeconds =
+    typeof u.staleAfterSeconds === "number" && Number.isFinite(u.staleAfterSeconds) && u.staleAfterSeconds > 0
+      ? u.staleAfterSeconds
+      : USAGE_DEFAULTS.staleAfterSeconds;
+  const onUnavailable = u.onUnavailable === "hold" ? "hold" : "allow";
+  const enabled = u.enabled !== false;
+  return { source, maxPercent, windows, staleAfterSeconds, onUnavailable, enabled };
 }
 
 /** The packaged `gate:` block, from `config/default.yaml`. */

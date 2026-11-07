@@ -337,11 +337,13 @@ export function resolveBuildTrigger(
   // function, because this is the one skip with a terminal-for-today
   // consequence — a label and a comment — and a consequence gated on prose
   // stops firing the day somebody rewords the prose.
-  const harnessOverspent = inputs.spendTodayUsd >= budget.dailyUsd;
-  const repoOverspent = inputs.repoSpendTodayUsd >= budget.repoDailyUsd;
+  // `null` = no dollar cap (a subscription paced by usage windows instead).
+  const harnessOverspent = budget.dailyUsd !== null && inputs.spendTodayUsd >= budget.dailyUsd;
+  const repoOverspent = budget.repoDailyUsd !== null && inputs.repoSpendTodayUsd >= budget.repoDailyUsd;
   if (harnessOverspent || repoOverspent) {
     const scope = harnessOverspent ? "harness" : "repo";
-    const limitUsd = harnessOverspent ? budget.dailyUsd : budget.repoDailyUsd;
+    // Non-null: an overspent flag is only ever set against a numeric cap.
+    const limitUsd = (harnessOverspent ? budget.dailyUsd : budget.repoDailyUsd) as number;
     const spentUsd = harnessOverspent ? inputs.spendTodayUsd : inputs.repoSpendTodayUsd;
     const subject = harnessOverspent ? "this deployment" : inputs.repo;
     return {
