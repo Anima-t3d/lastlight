@@ -29,6 +29,14 @@ const BUDGET: AutonomyBudgetConfig = {
   maxBuildsPerRepoPerDay: 3,
   dailyUsd: 25,
   repoDailyUsd: 10,
+  usage: {
+    source: null,
+    maxPercent: 80,
+    windows: ["five_hour", "weekly"],
+    staleAfterSeconds: 600,
+    onUnavailable: "allow",
+    enabled: true,
+  },
 };
 
 /** `resolveBuildTrigger` with the packaged budget, unless a case varies it. */
@@ -319,6 +327,13 @@ describe("resolveBuildTrigger — the budget ceilings", () => {
     expect(at.reason).toContain("midnight UTC");
 
     expect(decide(inputs({ buildsForRepoToday: 2 })).decision).toBe("dispatch");
+  });
+
+  it("never refuses on spend when the dollar caps are null (no dollar cap)", () => {
+    const uncapped = { ...BUDGET, dailyUsd: null, repoDailyUsd: null };
+    const d = decide(inputs({ spendTodayUsd: 10_000, repoSpendTodayUsd: 10_000 }), uncapped);
+    expect(d.decision).toBe("dispatch");
+    expect(d.budgetExhausted).toBeUndefined();
   });
 
   it("refuses at the HARNESS spend ceiling, scoped `harness`", () => {
