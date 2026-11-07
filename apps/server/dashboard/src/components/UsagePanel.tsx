@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { api, type UsageView } from "../api";
-import { dataAge, parseMaxPercent, recentHoldRows, resetsIn, usageRows, usageState } from "../lib/usage-view";
+import { dataAge, parseMaxPercent, recentHoldRows, resetsIn, topUsedPct, usageRows, usageState } from "../lib/usage-view";
 
 /**
  * The usage gate (`autonomy.budget.usage`): one bar per window with the
@@ -14,6 +14,7 @@ export function UsagePanel({ compact = false }: { compact?: boolean }) {
   const [data, setData] = useState<UsageView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
+  const chipRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(async () => {
     try {
@@ -30,12 +31,35 @@ export function UsagePanel({ compact = false }: { compact?: boolean }) {
     return () => clearInterval(t);
   }, [load]);
 
+  // The chip's popover closes on Esc and on a click outside it.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    const onDown = (e: MouseEvent) => {
+      if (chipRef.current && !chipRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown);
+    };
+  }, [open]);
+
   if (compact) {
-    if (!data || !data.configured) return null;
+    if (!data) {
+      // A broken /usage must not vanish from the Board.
+      return error ? (
+        <button className="btn btn-xs btn-ghost font-mono text-error" title={`Usage gate: ${error}`} onClick={() => void load()}>
+          usage ?
+        </button>
+      ) : null;
+    }
+    if (!data.configured) return null;
     const state = usageState(data, new Date());
-    const top = usageRows(data).reduce((m, r) => Math.max(m, r.usedPct), 0);
+    const top = topUsedPct(data, new Date());
     return (
-      <div className="relative">
+      <div className="relative" ref={chipRef}>
         <button
           className={clsx(
             "btn btn-xs btn-ghost gap-1 font-mono",
@@ -78,7 +102,7 @@ export function UsagePanel({ compact = false }: { compact?: boolean }) {
 function UsageBody({ data, onChange, bare = false }: { data: UsageView; onChange: (u: UsageView) => void; bare?: boolean }) {
   const now = new Date();
   const state = usageState(data, now);
-  const rows = usageRows(data);
+  const rows = usageRows(data, now);
   const holds = recentHoldRows(data);
   const eff = data.settings.effective;
   const [draft, setDraft] = useState(String(eff.maxPercent));
@@ -144,14 +168,14 @@ function UsageBody({ data, onChange, bare = false }: { data: UsageView; onChange
                       {r.provider} · {r.window}
                     </span>
                     <span className="font-mono">
-                      {Math.round(r.usedPct)}%
-                      {r.resetsAt ? ` · ${resetsIn(r.resetsAt, now)}` : ""}
+                      {r.reset ? "reset" : `${Math.round(r.usedPct)}%`}
+                      {r.resetsAt && !r.reset ? ` · ${resetsIn(r.resetsAt, now)}` : ""}
                     </span>
                   </div>
                   <div className="relative h-1.5 w-full rounded bg-base-300">
                     <div
                       className={clsx("h-full rounded", r.over ? "bg-warning" : "bg-primary")}
-                      style={{ width: `${r.usedPct}%` }}
+                      style={{ width: `${r.reset ? 0 : r.usedPct}%` }}
                     />
                     <div
                       className="absolute -top-0.5 h-2.5 w-px bg-base-content"
