@@ -942,6 +942,41 @@ function handleUnauthorized() {
   for (const listener of unauthorizedListeners) listener();
 }
 
+/** One usage window, as `GET /usage` reports it (see `autonomy.budget.usage`). */
+export interface UsageWindowData {
+  provider: string;
+  id: string;
+  usedPct: number;
+  resetsAt: string | null;
+}
+
+export interface UsageSettingsData {
+  /** The source's kind only; the path or command never leaves the server. */
+  source: "file" | "command" | null;
+  enabled: boolean;
+  maxPercent: number;
+  windows: string[];
+  staleAfterSeconds: number;
+  onUnavailable: "allow" | "hold";
+}
+
+export interface UsageView {
+  configured: boolean;
+  snapshot: { updatedAt: string; windows: UsageWindowData[] } | null;
+  unavailableReason: string | null;
+  settings: {
+    effective: UsageSettingsData;
+    config: UsageSettingsData;
+    override: { enabled: boolean | null; maxPercent: number | null; updatedBy: string | null; updatedAt: string } | null;
+  };
+  verdict:
+    | { held: false; reason?: string }
+    | { held: true; window?: UsageWindowData; maxPercent: number; reason: string }
+    | null;
+  waiting: Array<{ repo: string; issueNumber: number; since: string }>;
+  recentHolds: Array<{ id: string; createdAt: string; targetId: string | null; detail: Record<string, unknown> | null }>;
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const token = auth.getToken();
   const headers: Record<string, string> = { ...(init?.headers as Record<string, string>) };
@@ -1567,6 +1602,15 @@ export const api = {
   config: () => req<ConfigBundle>("/config"),
   overrides: () => req<OverridesBundle>("/overrides"),
   managedRepos: () => req<ManagedRepos>("/managed-repos"),
+  // The usage gate (`autonomy.budget.usage`): windows, verdict, waiting issues.
+  usage: () => req<UsageView>("/usage"),
+  setUsageSettings: (patch: { enabled?: boolean; maxPercent?: number }) =>
+    req<UsageView>("/usage/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    }),
+  clearUsageOverride: () => req<UsageView>("/usage/override", { method: "DELETE" }),
   // Repos this user's GitHub teams can reach — the client-side declutter filter.
   meRepos: () => req<MeRepos>("/me/repos"),
   meReposResync: () => req<MeRepos>("/me/repos/resync", { method: "POST" }),
