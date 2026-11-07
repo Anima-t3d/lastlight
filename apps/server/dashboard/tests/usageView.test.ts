@@ -4,7 +4,7 @@
  */
 import { describe, it, expect } from "vitest";
 import type { UsageView } from "../src/api";
-import { dataAge, parseMaxPercent, resetsIn, usageRows, usageState } from "../src/lib/usage-view";
+import { dataAge, parseMaxPercent, recentHoldRows, resetsIn, usageRows, usageState } from "../src/lib/usage-view";
 
 const NOW = new Date("2026-11-07T10:00:00Z");
 
@@ -134,5 +134,26 @@ describe("resetsIn", () => {
     expect(resetsIn("2026-11-09T12:00:00Z", NOW)).toBe("resets in 2 d 2 h");
     expect(resetsIn("2026-11-07T09:00:00Z", NOW)).toBe("reset");
     expect(resetsIn(null, NOW)).toBe("");
+  });
+});
+
+describe("recentHoldRows", () => {
+  it("newest first, at most five, each naming the issue, window, usage and reset", () => {
+    const holds = Array.from({ length: 7 }, (_, i) => ({
+      id: `a${i}`,
+      createdAt: `2026-11-07T0${i}:00:00Z`,
+      targetId: `acme/a#${i}`,
+      detail: { case: "usage-held", provider: "example", window: "five_hour", usedPct: 80 + i, resetsAt: "2026-11-07T13:00:00Z" },
+    }));
+    const rows = recentHoldRows(view({ recentHolds: holds }));
+    expect(rows.map((r) => r.key)).toEqual(["a6", "a5", "a4", "a3", "a2"]);
+    expect(rows[0]).toEqual({ key: "a6", at: "2026-11-07T06:00:00Z", issue: "acme/a#6", what: "example five_hour at 86%" });
+  });
+
+  it("a hold on unavailable data has no window", () => {
+    const rows = recentHoldRows(
+      view({ recentHolds: [{ id: "x", createdAt: "2026-11-07T09:00:00Z", targetId: "acme/a#1", detail: { case: "usage-held", reason: "usage-held: usage data stale" } }] }),
+    );
+    expect(rows).toEqual([{ key: "x", at: "2026-11-07T09:00:00Z", issue: "acme/a#1", what: "usage data unavailable" }]);
   });
 });
