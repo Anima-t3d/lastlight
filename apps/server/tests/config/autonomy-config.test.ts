@@ -138,7 +138,8 @@ describe("loadConfig — the autonomy block", () => {
     const packaged = defaultAutonomyConfig().budget;
     expect(budget.dailyUsd).toBe(packaged.dailyUsd);
     expect(budget.maxConcurrentBuilds).toBe(packaged.maxConcurrentBuilds);
-    for (const value of Object.values(budget)) expect(value).toBeGreaterThanOrEqual(0);
+    // Every numeric ceiling stays a real budget (the `usage` block is not one).
+    for (const value of Object.values(budget)) if (typeof value === "number") expect(value).toBeGreaterThanOrEqual(0);
   });
 
   it("keeps an explicit 0 — 'refuse everything' is a real setting", () => {

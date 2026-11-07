@@ -846,8 +846,24 @@ autonomy:
   budget:
     maxConcurrentBuilds: 2      # across every repo, at any instant
     maxBuildsPerRepoPerDay: 3   # per repo, rolling day
-    dailyUsd: 25                # deployment-wide model spend per day
-    repoDailyUsd: 10            # one repo's share of it
+    dailyUsd: 25                # deployment-wide model spend per day; null = no dollar cap
+    repoDailyUsd: 10            # one repo's share of it; null = no dollar cap
+    # Subscription usage windows as a dispatch input. A flat-rate subscription
+    # is limited by rolling windows (e.g. 5-hour and weekly), not dollars: point
+    # `source` at something that reports them and autonomous builds are held
+    # while any listed window is at or above `maxPercent`, then picked up again
+    # by the sweep after the reset. Off until a source is set.
+    #   source: { file: /path/to/usage.json }      # or { command: [argv...] } (no shell, 5 s timeout)
+    # The source returns
+    #   {"updatedAt": ISO, "windows": [{"provider", "id", "usedPct", "resetsAt": ISO|null}]}
+    # Human-requested builds are never held. See spec/05-router.md.
+    usage:
+      source: null
+      maxPercent: 80            # hold at or above this percentage (1-100)
+      windows: [five_hour, weekly]   # window ids that count; others are ignored
+      staleAfterSeconds: 600    # older data counts as unavailable
+      onUnavailable: allow      # allow | hold, when data is missing or stale
+      enabled: true             # the dashboard can override this and maxPercent
 
 # Retry policy for every PR_FIX_SHAPED workflow — pr-fix and dependabot-ci-fix
 # (issue #251). The loop diagnoses a CI failure before it retries, and these are
