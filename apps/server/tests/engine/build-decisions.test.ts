@@ -329,6 +329,47 @@ describe("resolveBuildTrigger — the budget ceilings", () => {
     expect(decide(inputs({ buildsForRepoToday: 2 })).decision).toBe("dispatch");
   });
 
+  describe("usage windows", () => {
+    const held = {
+      held: true as const,
+      window: { provider: "commandcode", id: "five_hour", usedPct: 85, resetsAt: "2026-11-07T13:00:00Z" },
+      maxPercent: 80,
+      reason: "commandcode five_hour at 85% ≥ 80%, resets 2026-11-07T13:00:00Z",
+    };
+
+    it("skips on a held verdict, naming the window, and carries it typed", () => {
+      const d = decide(inputs({ usage: held }));
+      expect(d.decision).toBe("skip");
+      expect(d.reason).toBe("usage-held: commandcode five_hour at 85% ≥ 80%, resets 2026-11-07T13:00:00Z");
+      expect(d.usageHeld).toEqual({ window: held.window, maxPercent: 80 });
+      expect(d.inputs.usage).toEqual(held);
+    });
+
+    it("dispatches on a verdict that is not held, or with no verdict at all", () => {
+      expect(decide(inputs({ usage: { held: false } })).decision).toBe("dispatch");
+      expect(decide(inputs({ usage: { held: false, reason: "usage data stale" } })).decision).toBe("dispatch");
+      expect(decide(inputs()).decision).toBe("dispatch");
+    });
+
+    it("the hold label, not-autonomous, already-built and run-in-flight all outrank it", () => {
+      expect(decide(inputs({ usage: held, labels: ["ready-for-agent", "lastlight-ignore"] })).reason).toMatch(/^on-hold:/);
+      expect(decide(inputs({ usage: held, autonomyEnabled: false })).reason).toMatch(/^not-autonomous:/);
+      expect(decide(inputs({ usage: held, runInFlight: true })).reason).toMatch(/^run-in-flight:/);
+    });
+
+    it("concurrency outranks it; it outranks the day quota and spend", () => {
+      expect(decide(inputs({ usage: held, concurrentAutonomousBuilds: 2 })).reason).toMatch(/^concurrency-exhausted:/);
+      expect(decide(inputs({ usage: held, buildsForRepoToday: 3 })).reason).toMatch(/^usage-held:/);
+      expect(decide(inputs({ usage: held, spendTodayUsd: 25 })).reason).toMatch(/^usage-held:/);
+    });
+
+    it("a held-without-window verdict (unavailable data, onUnavailable: hold) still skips", () => {
+      const d = decide(inputs({ usage: { held: true, maxPercent: 80, reason: "usage data stale: updated 20 min ago" } }));
+      expect(d.reason).toBe("usage-held: usage data stale: updated 20 min ago");
+      expect(d.usageHeld).toEqual({ maxPercent: 80 });
+    });
+  });
+
   it("never refuses on spend when the dollar caps are null (no dollar cap)", () => {
     const uncapped = { ...BUDGET, dailyUsd: null, repoDailyUsd: null };
     const d = decide(inputs({ spendTodayUsd: 10_000, repoSpendTodayUsd: 10_000 }), uncapped);

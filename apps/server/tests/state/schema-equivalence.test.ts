@@ -34,7 +34,7 @@ const MIGRATIONS_FOLDER = fileURLToPath(new URL("../../drizzle/sqlite", import.m
  * that fails to record itself shows up here as a diff rather than agreeing with
  * whatever happened.
  */
-const MIGRATION_COUNT = 7;
+const MIGRATION_COUNT = 8;
 
 const LEGACY_SCHEMA = readFileSync(
   fileURLToPath(new URL("./fixtures/legacy-schema.sql", import.meta.url)),

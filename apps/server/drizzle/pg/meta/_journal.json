@@ -43,6 +43,13 @@
       "when": 1793968976850,
       "tag": "0005_easy_blazing_skull",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1794061748389,
+      "tag": "0006_curved_sphinx",
+      "breakpoints": true
     }
   ]
 }

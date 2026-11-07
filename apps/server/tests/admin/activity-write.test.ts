@@ -230,6 +230,8 @@ describe("activity log — the write side", () => {
       "POST /crons/:name/toggle",
       "POST /crons/:name/schedule",
       "DELETE /crons/:name/override",
+      "POST /usage/settings",
+      "DELETE /usage/override",
       "POST /crons/:name/trigger",
       "POST /prs/:owner/:repo/:number/retry",
       "POST /issues/:owner/:repo/:number/dispatch",

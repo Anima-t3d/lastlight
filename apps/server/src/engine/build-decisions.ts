@@ -28,6 +28,7 @@
 
 import type { AutonomyBudgetConfig } from "../config/config.js";
 import type { Decision } from "./pr-decisions.js";
+import type { UsageVerdict, UsageWindow } from "./usage-gate.js";
 
 /**
  * Run the gated build, or don't.
@@ -83,6 +84,11 @@ export interface BuildTriggerInputs {
   spendTodayUsd: number;
   /** This repo's share of that spend, in USD. */
   repoSpendTodayUsd: number;
+  /**
+   * The usage-window verdict (`autonomy.budget.usage`), resolved by the caller.
+   * Absent when no usage source is configured: the gate is then off.
+   */
+  usage?: UsageVerdict;
 }
 
 /**
@@ -111,7 +117,7 @@ export function issueTriggerId(repo: string, issueNumber: number): string {
 export function resolveBuildTrigger(
   inputs: BuildTriggerInputs,
   budget: AutonomyBudgetConfig,
-): Decision<BuildTriggerDecision> {
+): Decision<BuildTriggerDecision> & { usageHeld?: { window?: UsageWindow; maxPercent: number } } {
   // The full input record travels on EVERY returned decision — the same rule
   // `resolveReviewTrigger` follows. A decision whose justification you cannot
   // reconstruct is a decision you cannot debug six weeks later, and the panel
@@ -131,6 +137,7 @@ export function resolveBuildTrigger(
     buildsForRepoToday: inputs.buildsForRepoToday,
     spendTodayUsd: inputs.spendTodayUsd,
     repoSpendTodayUsd: inputs.repoSpendTodayUsd,
+    usage: inputs.usage ?? null,
     // The CEILINGS travel too, not just the readings. A panel showing "3 builds
     // today" cannot tell you whether that was refused without knowing the limit
     // it was measured against, and re-reading the config later answers a
@@ -305,6 +312,26 @@ export function resolveBuildTrigger(
       decision: "skip",
       reason: `concurrency-exhausted: ${inputs.concurrentAutonomousBuilds} autonomous build run(s) are already in flight, at the harness ceiling of ${budget.maxConcurrentBuilds}`,
       inputs: record,
+    };
+  }
+
+  // 5a'. USAGE WINDOWS — the subscription's own rolling limits.
+  //
+  // After concurrency (which clears in minutes) and before the day quota and
+  // spend: a window at its threshold clears only at its reset, and a build
+  // started now would run into the provider's own refusal mid-flight, which is
+  // worse than not starting. Transient: the sweep picks the issue up again
+  // after the reset. Autonomous dispatches only, like the rest of the budget —
+  // a human's `@bot build` never reaches this function.
+  if (inputs.usage?.held) {
+    return {
+      decision: "skip",
+      reason: `usage-held: ${inputs.usage.reason}`,
+      inputs: record,
+      usageHeld: {
+        ...(inputs.usage.window ? { window: inputs.usage.window } : {}),
+        maxPercent: inputs.usage.maxPercent,
+      },
     };
   }
 

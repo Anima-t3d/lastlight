@@ -28,6 +28,7 @@ import { runRepoRefSuite } from "./suites/repo-ref-suite.js";
 import { runSettingsSuite } from "./suites/settings-suite.js";
 import { runTeamsSuite } from "./suites/teams-suite.js";
 import { runUsersSuite } from "./suites/users-suite.js";
+import { runUsageOverrideSuite } from "./suites/usage-override-suite.js";
 import { runWorkflowRunsSuite } from "./suites/workflow-runs-suite.js";
 
 export type Dialect = "sqlite" | "postgres";
@@ -59,6 +60,7 @@ export function runStateDbSuite(makeDb: MakeDb, opts: SuiteOpts): void {
     runActivitySuite(makeDb, opts);
     runRepoRefSuite(makeDb, opts);
     runSettingsSuite(makeDb, opts);
+    runUsageOverrideSuite(makeDb, opts);
     runConcurrencySuite(makeDb, opts);
   });
 }
