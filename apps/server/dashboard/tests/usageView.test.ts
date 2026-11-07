@@ -4,7 +4,7 @@
  */
 import { describe, it, expect } from "vitest";
 import type { UsageView } from "../src/api";
-import { dataAge, parseMaxPercent, recentHoldRows, resetsIn, usageRows, usageState } from "../src/lib/usage-view";
+import { dataAge, parseMaxPercent, recentHoldRows, resetsIn, topUsedPct, usageRows, usageState } from "../src/lib/usage-view";
 
 const NOW = new Date("2026-11-07T10:00:00Z");
 
@@ -22,9 +22,9 @@ function view(over: Partial<UsageView> = {}): UsageView {
     snapshot: {
       updatedAt: "2026-11-07T09:58:00Z",
       windows: [
-        { provider: "commandcode", id: "five_hour", usedPct: 42, resetsAt: "2026-11-07T13:00:00Z" },
-        { provider: "commandcode", id: "weekly", usedPct: 12.5, resetsAt: null },
-        { provider: "commandcode", id: "monthly", usedPct: 99, resetsAt: null },
+        { provider: "example", id: "five_hour", usedPct: 42, resetsAt: "2026-11-07T13:00:00Z" },
+        { provider: "example", id: "weekly", usedPct: 12.5, resetsAt: null },
+        { provider: "example", id: "monthly", usedPct: 99, resetsAt: null },
       ],
     },
     unavailableReason: null,
@@ -57,8 +57,8 @@ describe("usageState", () => {
         verdict: {
           held: true,
           maxPercent: 80,
-          window: { provider: "commandcode", id: "five_hour", usedPct: 85.4, resetsAt: "2026-11-07T13:00:00Z" },
-          reason: "commandcode five_hour at 85% ≥ 80%, resets 2026-11-07T13:00:00Z",
+          window: { provider: "example", id: "five_hour", usedPct: 85.4, resetsAt: "2026-11-07T13:00:00Z" },
+          reason: "example five_hour at 85% ≥ 80%, resets 2026-11-07T13:00:00Z",
         },
         waiting: [
           { repo: "acme/a", issueNumber: 2, since: "2026-11-07T09:40:00Z" },
@@ -68,7 +68,7 @@ describe("usageState", () => {
       NOW,
     );
     // The bars show the reset; the line names the window and the numbers only.
-    expect(s).toEqual({ kind: "holding", since: "2026-11-07T09:30:00Z", reason: "commandcode five_hour at 85% (limit 80%)" });
+    expect(s).toEqual({ kind: "holding", since: "2026-11-07T09:30:00Z", reason: "example five_hour at 85% (limit 80%)" });
   });
 
   it("unavailable shows the reason, not empty bars", () => {
@@ -88,24 +88,35 @@ describe("usageState", () => {
 describe("usageRows", () => {
   it("one row per listed window, with the threshold marker and the over flag", () => {
     const rows = usageRows(view({ snapshot: { updatedAt: "2026-11-07T09:58:00Z", windows: [
-      { provider: "commandcode", id: "five_hour", usedPct: 85, resetsAt: "2026-11-07T13:00:00Z" },
+      { provider: "example", id: "five_hour", usedPct: 85, resetsAt: "2026-11-07T13:00:00Z" },
       { provider: "claude", id: "weekly", usedPct: 140, resetsAt: null },
-      { provider: "commandcode", id: "monthly", usedPct: 99, resetsAt: null },
-    ] } }));
+      { provider: "example", id: "monthly", usedPct: 99, resetsAt: null },
+    ] } }), NOW);
     expect(rows).toEqual([
-      { key: "commandcode/five_hour", provider: "commandcode", window: "five_hour", usedPct: 85, thresholdPct: 80, over: true, resetsAt: "2026-11-07T13:00:00Z" },
-      { key: "claude/weekly", provider: "claude", window: "weekly", usedPct: 100, thresholdPct: 80, over: true, resetsAt: null },
+      { key: "example/five_hour", provider: "example", window: "five_hour", usedPct: 85, thresholdPct: 80, over: true, reset: false, resetsAt: "2026-11-07T13:00:00Z" },
+      { key: "claude/weekly", provider: "claude", window: "weekly", usedPct: 100, thresholdPct: 80, over: true, reset: false, resetsAt: null },
     ]);
   });
 
   it("uses the effective (overridden) threshold", () => {
     const v = view();
     v.settings.effective = { ...v.settings.effective, maxPercent: 40 };
-    expect(usageRows(v)[0]).toMatchObject({ thresholdPct: 40, over: true });
+    expect(usageRows(v, NOW)[0]).toMatchObject({ thresholdPct: 40, over: true });
+  });
+
+  it("a window whose reset has passed is marked reset, never over, and leaves the chip's top figure", () => {
+    const v = view({ snapshot: { updatedAt: "2026-11-07T09:58:00Z", windows: [
+      { provider: "example", id: "five_hour", usedPct: 95, resetsAt: "2026-11-07T09:30:00Z" },
+      { provider: "example", id: "weekly", usedPct: 40, resetsAt: "2026-11-09T00:00:00Z" },
+    ] } });
+    const rows = usageRows(v, NOW);
+    expect(rows[0]).toMatchObject({ reset: true, over: false });
+    expect(rows[1]).toMatchObject({ reset: false, over: false });
+    expect(topUsedPct(v, NOW)).toBe(40);
   });
 
   it("no rows without a snapshot", () => {
-    expect(usageRows(view({ snapshot: null }))).toEqual([]);
+    expect(usageRows(view({ snapshot: null }), NOW)).toEqual([]);
   });
 });
 

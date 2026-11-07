@@ -50,28 +50,41 @@ export interface UsageRow {
   usedPct: number;
   /** Where the threshold marker sits: the effective `maxPercent`. */
   thresholdPct: number;
+  /** Never true for a window that has already reset (the gate skips it too). */
   over: boolean;
+  /** The reset time has passed: the figure is from before it. */
+  reset: boolean;
   resetsAt: string | null;
 }
 
 /** One row per window the gate counts, in snapshot order. */
-export function usageRows(u: UsageView): UsageRow[] {
+export function usageRows(u: UsageView, now: Date): UsageRow[] {
   if (!u.snapshot) return [];
   const { maxPercent, windows } = u.settings.effective;
   return u.snapshot.windows
     .filter((w) => windows.includes(w.id))
     .map((w) => {
       const usedPct = Math.min(100, Math.max(0, w.usedPct));
+      const t = w.resetsAt ? Date.parse(w.resetsAt) : NaN;
+      const reset = !Number.isNaN(t) && t <= now.getTime();
       return {
         key: `${w.provider}/${w.id}`,
         provider: w.provider,
         window: w.id,
         usedPct,
         thresholdPct: maxPercent,
-        over: usedPct >= maxPercent,
+        over: !reset && usedPct >= maxPercent,
+        reset,
         resetsAt: w.resetsAt,
       };
     });
+}
+
+/** The Board chip's figure: the fullest window that has not reset. */
+export function topUsedPct(u: UsageView, now: Date): number {
+  return usageRows(u, now)
+    .filter((r) => !r.reset)
+    .reduce((m, r) => Math.max(m, r.usedPct), 0);
 }
 
 /** The threshold field: an integer from 1 to 100, else null. */
