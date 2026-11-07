@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { UsagePanel } from "./UsagePanel";
 import {
   ResponsiveContainer,
   BarChart,
@@ -919,6 +920,7 @@ export function HomePage({ onSelectWorkflow }: { onSelectWorkflow: (id: string) 
           <ResourceUsageSection stats={stats} host={host} loaded={loaded} />
         </div>
         <div className="lg:col-span-3 space-y-4 min-w-0">
+          <UsagePanel />
           <StatsChartsSection />
         </div>
       </div>
