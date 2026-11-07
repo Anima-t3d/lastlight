@@ -1090,6 +1090,18 @@ export const TOKEN_COUNT_KEY_RE =
  * in its userinfo, the config slot holding it is called `url`, and a leaf-value
  * rule cannot be defeated by someone nesting or renaming the slot later.
  */
+/**
+ * `autonomy.budget.usage.source` reduced to its kind (`"file"` / `"command"`):
+ * a path or an argv may name a credential, and `GET /usage` shows only the kind.
+ */
+function withUsageSourceKind(autonomy: Record<string, unknown>): Record<string, unknown> {
+  const budget = autonomy.budget;
+  if (!isPlainObject(budget) || !isPlainObject(budget.usage) || !isPlainObject(budget.usage.source)) return autonomy;
+  const source = budget.usage.source;
+  const kind = "command" in source ? "command" : "file" in source ? "file" : "[redacted]";
+  return { ...autonomy, budget: { ...budget, usage: { ...budget.usage, source: kind } } };
+}
+
 export function redactPublic<T>(value: T): T {
   if (Array.isArray(value)) return value.map((v) => redactPublic(v)) as unknown as T;
   if (isPlainObject(value)) {
@@ -1101,6 +1113,10 @@ export function redactPublic<T>(value: T): T {
         out[k] = v.map((e) =>
           isPlainObject(e) && typeof e.url === "string" ? redactPublic({ ...e, url: displayWebhookUrl(e.url) }) : redactPublic(e),
         );
+        continue;
+      }
+      if (k === "autonomy" && isPlainObject(v)) {
+        out[k] = redactPublic(withUsageSourceKind(v));
         continue;
       }
       out[k] = SENSITIVE_KEY_RE.test(k) && !tokenCount ? "[redacted]" : redactPublic(v);
