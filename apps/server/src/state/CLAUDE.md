@@ -1,6 +1,6 @@
 # State layer — schema, migrations, and the two dialects
 
-This is the harness's own database: seventeen tables holding workflow runs,
+This is the harness's own database: eighteen tables holding workflow runs,
 executions, approvals, cron history, users, chat sessions, feedback signals,
 live operator settings and the activity log.
 It is written **once** and runs on **two dialects** — SQLite (via libsql) by

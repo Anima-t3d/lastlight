@@ -65,6 +65,7 @@ export const TABLE_ORDER: readonly TableSpec[] = [
   { key: "cronOverrides", orderBy: ["name"] },
   { key: "cronRuns", orderBy: ["id"] },
   { key: "workflowOverrides", orderBy: ["name"] },
+  { key: "usageGateOverrides", orderBy: ["name"] },
   { key: "users", orderBy: ["id"] },
   // No foreign key — `actor_login` is a SOFT join to `users.login` — but placed
   // after `users` to match how it reads.
@@ -147,7 +148,7 @@ export interface MigrateStateDataResult {
 /**
  * Copy every row from a SQLite state database into a Postgres one.
  *
- * Not transactional as a whole, and cannot be: 15 tables and potentially
+ * Not transactional as a whole, and cannot be: 18 tables and potentially
  * hundreds of thousands of rows in one Postgres transaction is a recipe for a
  * bloated WAL and a lock held for minutes. The design point that makes that
  * acceptable is the empty-target precondition — a failed run leaves a

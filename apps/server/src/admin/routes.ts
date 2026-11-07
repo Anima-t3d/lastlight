@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { currentUsage, listUsageWaiting } from "../engine/usage-runtime.js";
 import type { Context } from "hono";
 import path from "node:path";
 import { timingSafeEqual, randomBytes, randomUUID } from "node:crypto";
@@ -3166,6 +3167,85 @@ export function createAdminRoutes(
   // Persist a schedule override and apply it to the scheduler. Validates the
   // expression with croner before saving so a bad expression returns 400 and
   // the live cron isn't disturbed.
+  // ── Usage gate (`autonomy.budget.usage`) ──────────────────────────────────
+  //
+  // The dashboard Usage panel. GET is read-only; the two writes follow the
+  // cron-override pattern: config is the default, the override row wins,
+  // DELETE reverts. The source (a file path or a command) is never sent to the
+  // browser, only its kind.
+  async function usageView() {
+    const state = await currentUsage(db);
+    const view = (u: typeof state.settings.config) => ({
+      source: u.source ? ("file" in u.source ? "file" : "command") : null,
+      enabled: u.enabled,
+      maxPercent: u.maxPercent,
+      windows: u.windows,
+      staleAfterSeconds: u.staleAfterSeconds,
+      onUnavailable: u.onUnavailable,
+    });
+    const holds = await db.activity.list({ action: "autonomy.skip", limit: 50 });
+    return {
+      configured: state.settings.effective.source !== null,
+      snapshot: state.read?.ok ? state.read.snapshot : null,
+      unavailableReason: state.read && !state.read.ok ? state.read.reason : null,
+      settings: {
+        effective: view(state.settings.effective),
+        config: view(state.settings.config),
+        override: state.settings.override,
+      },
+      verdict: state.verdict,
+      waiting: listUsageWaiting(),
+      recentHolds: holds.activity
+        .filter((r) => (r.detail as { case?: unknown } | null)?.case === "usage-held")
+        .slice(0, 10),
+    };
+  }
+
+  app.get("/usage", async (c) => c.json(await usageView()));
+
+  app.post("/usage/settings", async (c) => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "body must be JSON" }, 400);
+    }
+    const b = (body ?? {}) as { enabled?: unknown; maxPercent?: unknown };
+    const patch: { enabled?: boolean; maxPercent?: number } = {};
+    if (b.enabled !== undefined) {
+      if (typeof b.enabled !== "boolean") return c.json({ error: "enabled must be true or false" }, 400);
+      patch.enabled = b.enabled;
+    }
+    if (b.maxPercent !== undefined) {
+      if (typeof b.maxPercent !== "number" || !Number.isInteger(b.maxPercent) || b.maxPercent < 1 || b.maxPercent > 100) {
+        return c.json({ error: "maxPercent must be an integer from 1 to 100" }, 400);
+      }
+      patch.maxPercent = b.maxPercent;
+    }
+    if (patch.enabled === undefined && patch.maxPercent === undefined) {
+      return c.json({ error: "nothing to change: send enabled and/or maxPercent" }, 400);
+    }
+    await db.setUsageOverride(patch, actorFromContext(c) ?? "admin");
+    await recordActivityFor(c, db, {
+      action: "config.edit",
+      targetType: "usage-gate",
+      targetId: "default",
+      detail: { ...patch },
+    });
+    return c.json(await usageView());
+  });
+
+  app.delete("/usage/override", async (c) => {
+    await db.clearUsageOverride();
+    await recordActivityFor(c, db, {
+      action: "config.edit",
+      targetType: "usage-gate",
+      targetId: "default",
+      detail: { cleared: true },
+    });
+    return c.json(await usageView());
+  });
+
   app.post("/crons/:name/schedule", async (c) => {
     if (!config.cronScheduler) {
       return c.json({ error: "cron scheduler not configured" }, 503);

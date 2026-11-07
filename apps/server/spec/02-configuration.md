@@ -217,8 +217,16 @@ interface AutonomyStageConfig {
 interface AutonomyBudgetConfig {          // three branches of the build dispatch gate; a configured 0 refuses everything
   maxConcurrentBuilds: number;            // across every repo, at any instant (2)
   maxBuildsPerRepoPerDay: number;         // per repo, rolling day (3)
-  dailyUsd: number;                       // deployment-wide model spend per day (25)
-  repoDailyUsd: number;                   // one repo's share of it (10)
+  dailyUsd: number | null;                // deployment-wide model spend per day (25); null = no dollar cap
+  repoDailyUsd: number | null;            // one repo's share of it (10); null = no dollar cap
+  usage: {                                // subscription usage windows as a dispatch input
+    source: { file: string } | { command: string[] } | null;  // null (default) = gate off
+    maxPercent: number;                   // hold at or above, 1-100 (80)
+    windows: string[];                    // window ids that count (["five_hour", "weekly"])
+    staleAfterSeconds: number;            // older data is unavailable (600)
+    onUnavailable: "allow" | "hold";      // missing/stale/malformed data ("allow")
+    enabled: boolean;                     // (true) — the dashboard can override this and maxPercent
+  };
 }
 
 interface FixConfig {                     // budgets for every PR_FIX_SHAPED workflow
@@ -433,6 +441,8 @@ with its operator.
 **The four stage labels are also the board's columns.** The dashboard's Board tab derives one column per stage label, in the `enter` / `running` / `on_success` / `on_failure` order declared above, with each heading derived from the label itself — so renaming a label renames the column instead of leaving a stale heading, and nothing in the UI branches on a stage id. A deployment with no `stages` configured gets `configured: false`, no columns and **no GitHub reads at all**: the tab costs nothing until somebody opts in. The board both shows where an issue has got to and MOVES it: dragging a card writes the stage label, and a drop on the `enter` or `running` column also crosses the build dispatch gate as the logged-in human, so the two columns that mean "work on this" start a build while the two terminal ones do not. See [Integrations](/spec/03-integrations#the-pipeline-board).
 
 `autonomy.budget` is **enforced**, at the dispatch gate, before any run starts — never mid-flight. Each of the four numbers is one branch of that gate: `maxConcurrentBuilds` counts autonomous runs of the stage's workflow in flight (`queued` or `running` — a run paused at an approval gate is waiting on a human and does not count) across every repo at this instant, plus dispatches the gate has approved whose run row does not exist yet, `maxBuildsPerRepoPerDay` counts runs *started* for this repo today in **every** status (a failed build still spent the repo's allowance), and `dailyUsd` / `repoDailyUsd` are read from the execution ledger's spend for today. All three day-scoped readings are measured from one resolved midnight-UTC boundary — the same bucket `dayBucket()` uses — so the numbers agree with the dashboard's stats page. Comparisons are `>=`, so a configured `0` means "refuse everything" and is the lever for stopping the pipeline dead without un-configuring it; normalisation keeps a `0` as a real setting and only falls back to the packaged default for a negative or non-numeric value. Every refusal is recorded rather than silent, proportionately to how terminal it is — see [Router](/spec/05-router#the-build-dispatch-gate).
+
+`autonomy.budget.usage` paces autonomous builds by a subscription's rolling windows instead of (or as well as) dollars. `source` is a file, or a command run as argv with no shell and a 5 s timeout, returning `{"updatedAt": ISO, "windows": [{"provider", "id", "usedPct", "resetsAt": ISO|null}]}` (at most 64 KiB). A malformed `source` leaves the gate off with a boot warning; a malformed `maxPercent`, `windows`, `staleAfterSeconds` or `onUnavailable` falls back to its default. The dashboard's Usage panel shows the windows and the waiting issues, and can override `enabled` and `maxPercent` at runtime (`POST /admin/api/usage/settings`, `DELETE /admin/api/usage/override`, stored in `usage_gate_overrides`); the config value is the default. `dailyUsd` / `repoDailyUsd: null` turn the dollar caps off for a deployment paced by usage alone.
 
 **`on_merge` decides what becomes of the pull request the stage opens**, and only one of its three values does anything today:
 

@@ -91,6 +91,14 @@ export interface StateDbOpenOptions {
   poolMax?: number;
 }
 
+/** The dashboard's override of the usage gate; a null field means "use config". */
+export interface UsageGateOverride {
+  enabled: boolean | null;
+  maxPercent: number | null;
+  updatedBy: string | null;
+  updatedAt: string;
+}
+
 export interface CronOverride {
   name: string;
   enabled: boolean;
@@ -276,6 +284,56 @@ export class StateDb {
 
   get dialect(): Dialect {
     return this._dialect;
+  }
+
+  // ── Usage gate override (single row `default`) ─────────────────
+
+  /** The dashboard's override of `autonomy.budget.usage`, or null if none. */
+  async getUsageOverride(): Promise<UsageGateOverride | null> {
+    const { usageGateOverrides } = this.t;
+    const [row] = await this._client
+      .select()
+      .from(usageGateOverrides)
+      .where(eq(usageGateOverrides.name, "default"))
+      .limit(1);
+    if (!row) return null;
+    return {
+      enabled: row.enabled ?? null,
+      maxPercent: row.maxPercent ?? null,
+      updatedBy: row.updatedBy ?? null,
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  /** Upsert the override. A field left out keeps its stored value (null = config). */
+  async setUsageOverride(patch: { enabled?: boolean; maxPercent?: number }, updatedBy?: string): Promise<void> {
+    const { usageGateOverrides } = this.t;
+    const existing = await this.getUsageOverride();
+    const values = {
+      name: "default",
+      enabled: patch.enabled ?? existing?.enabled ?? null,
+      maxPercent: patch.maxPercent ?? existing?.maxPercent ?? null,
+      updatedBy: updatedBy ?? null,
+      updatedAt: new Date().toISOString(),
+    };
+    await this._client
+      .insert(usageGateOverrides)
+      .values(values)
+      .onConflictDoUpdate({
+        target: usageGateOverrides.name,
+        set: {
+          enabled: values.enabled,
+          maxPercent: values.maxPercent,
+          updatedBy: values.updatedBy,
+          updatedAt: values.updatedAt,
+        },
+      });
+  }
+
+  /** Remove the override: the config values apply again. */
+  async clearUsageOverride(): Promise<void> {
+    const { usageGateOverrides } = this.t;
+    await this._client.delete(usageGateOverrides).where(eq(usageGateOverrides.name, "default"));
   }
 
   // ── Cron overrides ─────────────────────────────────────────────

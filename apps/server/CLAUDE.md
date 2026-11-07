@@ -370,7 +370,7 @@ src/
                         ships in the agent image — what `lastlight server db`
                         runs inside the container, since the CLI may never gain
                         an edge to core.
-    schema/sqlite.ts    Drizzle schema — the source of truth for all sixteen
+    schema/sqlite.ts    Drizzle schema — the source of truth for all eighteen
                         tables (executions, workflow_runs, workflow_approvals,
                         cron_runs, cron_overrides, workflow_overrides, users,
                         activity_log, messaging_*, feedback_*, github_team*).

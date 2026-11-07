@@ -5,7 +5,7 @@
  * thirteen state tables, their `CREATE TABLE IF NOT EXISTS` bodies AND every
  * historical `ALTER TABLE ADD COLUMN`) plus
  * `src/connectors/messaging/session-manager.ts` (the two messaging tables,
- * which self-migrated on a second schema owner). 15 tables, 25 named indexes.
+ * which self-migrated on a second schema owner). 17 tables, 25 named indexes.
  *
  * Three transcription rules, all load-bearing:
  *
@@ -208,6 +208,19 @@ export const workflowOverrides = sqliteTable("workflow_overrides", {
   enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
   updatedAt: text("updated_at").notNull(),
   updatedBy: text("updated_by"),
+});
+
+/**
+ * The dashboard's runtime override of the usage gate (`autonomy.budget.usage`):
+ * a single row named `default`. A null column means "use the config value".
+ * Deleting the row reverts to config, like `cron_overrides`.
+ */
+export const usageGateOverrides = sqliteTable("usage_gate_overrides", {
+  name: text("name").primaryKey(),
+  enabled: integer("enabled", { mode: "boolean" }),
+  maxPercent: integer("max_percent"),
+  updatedBy: text("updated_by"),
+  updatedAt: text("updated_at").notNull(),
 });
 
 /** Approval / reply gates a paused run is waiting on. */
@@ -511,7 +524,7 @@ export const messagingMessages = sqliteTable(
   {
     // The only AUTOINCREMENT in the schema; inserts never supply an id.
     id: integer("id").primaryKey({ autoIncrement: true }),
-    // The ONLY declared foreign key in the entire 15-table schema (no ON
+    // The ONLY declared foreign key in the entire 17-table schema (no ON
     // DELETE), and it is LIVE. Nothing sets `PRAGMA foreign_keys` explicitly,
     // which used to be read as "so it is declared-but-unenforced" — that was
     // wrong: better-sqlite3 and libsql BOTH default it on (verified on

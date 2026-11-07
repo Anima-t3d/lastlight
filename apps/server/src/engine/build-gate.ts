@@ -28,6 +28,7 @@ import type { AutonomyStageConfig } from "../config/config.js";
 import { issueTriggerId, resolveBuildTrigger } from "./build-decisions.js";
 import { advanceStage } from "./stage-advance.js";
 import { recordActivity } from "../activity.js";
+import { clearUsageWaiting, noteUsageHold, usageVerdictForDispatch } from "./usage-runtime.js";
 import { logger } from "../logging/logger.js";
 import type { StateDb } from "../state/db.js";
 import type { WorkflowRun } from "../state/workflow-run-store.js";
@@ -114,7 +115,7 @@ export async function applyBuildDispatchGate(
     // ONCE here. Two reads that each called "start of today" separately could
     // straddle midnight and answer about different days.
     const sinceIso = startOfUtcDayIso();
-    const [alreadyBuilt, inFlight, activeRuns, buildsForRepoToday, dailyStats, repoSpend] = await Promise.all([
+    const [alreadyBuilt, inFlight, activeRuns, buildsForRepoToday, dailyStats, repoSpend, usage] = await Promise.all([
       // GUARD 3 — the real lock. A fact in our own database, in ANY status, that
       // no GitHub outage can move.
       deps.db.runs.hasRunForTrigger(triggerId, workflow),
@@ -139,6 +140,8 @@ export async function applyBuildDispatchGate(
       // as "over budget" would refuse every build on a quiet morning.
       deps.db.executions.dailyStats(1),
       deps.db.executions.repoCostSince(owner ?? "", name ?? "", sinceIso),
+      // The usage-window verdict (`autonomy.budget.usage`); undefined = gate off.
+      usageVerdictForDispatch(deps.db),
     ]);
 
     // `queued` and `running` only. A `paused` run is waiting on a human at an
@@ -174,6 +177,7 @@ export async function applyBuildDispatchGate(
       buildsForRepoToday: buildsForRepoToday + pending.filter((r) => r.repo === args.repo).length,
       spendTodayUsd,
       repoSpendTodayUsd: repoSpend.costUsd,
+      usage,
     }, budget);
     if (decision.decision === "dispatch") reserve(deps.db, workflow, triggerId, args.repo);
     return decision;
@@ -193,9 +197,19 @@ export async function applyBuildDispatchGate(
   });
 
   if (decision.decision === "skip") {
+    if (decision.usageHeld && decision.inputs.usage) {
+      // Transient, like concurrency: no comment. One activity row and one
+      // `autonomy.held` per window and reset, however many ticks re-hit it.
+      await noteUsageHold(
+        deps.db,
+        { repo: args.repo, issueNumber: args.issueNumber, workflow },
+        decision.inputs.usage as Parameters<typeof noteUsageHold>[2],
+      );
+    }
     await applySkipConsequence(args, stage, decision, deps);
     return { decision: "skip", reason: decision.reason };
   }
+  clearUsageWaiting(args.repo, args.issueNumber);
 
   // ── 4. GUARD 2 — advance the label BEFORE the run starts ─────────────────
   //
