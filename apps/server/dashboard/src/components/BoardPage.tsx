@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { UsagePanel } from "./UsagePanel";
 import clsx from "clsx";
 import { TriangleAlert, RefreshCw, X } from "lucide-react";
 import { api, type BoardResponse, type BoardColumn as BoardColumnData, type RepoEntry } from "../api";
@@ -340,6 +341,7 @@ export function BoardPage() {
       {/* ── Toolbar ────────────────────────────────────────────────────── */}
       <div className="flex flex-wrap items-center gap-2 border-b border-hairline px-3 py-2">
         <h2 className="text-sm font-semibold text-strong">Board</h2>
+        <UsagePanel compact />
 
         <div className="flex flex-wrap items-center gap-1">
           {scopedRepos.length === 0 ? (
