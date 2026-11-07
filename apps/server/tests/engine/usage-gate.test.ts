@@ -74,6 +74,13 @@ describe("evaluateUsage", () => {
     expect(v.held && v.window).toBeUndefined();
   });
 
+  it("data dated more than a minute in the future is unavailable", () => {
+    const r = evaluateUsage(snap([{ provider: "example", id: "five_hour", usedPct: 10, resetsAt: null }], "2026-11-07T10:05:00Z"), settings, now);
+    expect(r).toEqual({ held: false, reason: "usage data unavailable: updatedAt is in the future" });
+    const ok = evaluateUsage(snap([{ provider: "example", id: "five_hour", usedPct: 10, resetsAt: null }], "2026-11-07T10:00:30Z"), settings, now);
+    expect(ok).toEqual({ held: false });
+  });
+
   it("a failed read is unavailable", () => {
     expect(evaluateUsage({ ok: false, reason: "no file" }, settings, now)).toEqual({
       held: false,

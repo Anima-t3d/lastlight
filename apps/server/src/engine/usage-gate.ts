@@ -150,6 +150,8 @@ export function evaluateUsage(result: UsageReadResult, settings: UsageSettings, 
 
   if (!result.ok) return unavailable(`usage data unavailable: ${result.reason}`);
   const ageMs = now.getTime() - Date.parse(result.snapshot.updatedAt);
+  // A clock-skewed or broken source must not be trusted forever.
+  if (ageMs < -60_000) return unavailable("usage data unavailable: updatedAt is in the future");
   if (ageMs > settings.staleAfterSeconds * 1000) {
     return unavailable(
       `usage data stale: updated ${Math.round(ageMs / 60000)} min ago (limit ${Math.round(settings.staleAfterSeconds / 60)} min)`,

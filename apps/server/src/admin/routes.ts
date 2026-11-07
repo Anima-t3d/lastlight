@@ -3164,9 +3164,6 @@ export function createAdminRoutes(
     return c.json({ name, enabled: nextEnabled });
   });
 
-  // Persist a schedule override and apply it to the scheduler. Validates the
-  // expression with croner before saving so a bad expression returns 400 and
-  // the live cron isn't disturbed.
   // ── Usage gate (`autonomy.budget.usage`) ──────────────────────────────────
   //
   // The dashboard Usage panel. GET is read-only; the two writes follow the
@@ -3183,7 +3180,9 @@ export function createAdminRoutes(
       staleAfterSeconds: u.staleAfterSeconds,
       onUnavailable: u.onUnavailable,
     });
-    const holds = await db.activity.list({ action: "autonomy.skip", limit: 50 });
+    // Holds are one row per window and reset, among many other skip rows (a
+    // busy quota day writes one per issue per tick): look well back.
+    const holds = await db.activity.list({ action: "autonomy.skip", limit: 500 });
     return {
       configured: state.settings.effective.source !== null,
       snapshot: state.read?.ok ? state.read.snapshot : null,
@@ -3246,6 +3245,9 @@ export function createAdminRoutes(
     return c.json(await usageView());
   });
 
+  // Persist a schedule override and apply it to the scheduler. Validates the
+  // expression with croner before saving so a bad expression returns 400 and
+  // the live cron isn't disturbed.
   app.post("/crons/:name/schedule", async (c) => {
     if (!config.cronScheduler) {
       return c.json({ error: "cron scheduler not configured" }, 503);
