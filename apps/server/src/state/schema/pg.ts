@@ -174,6 +174,15 @@ export const workflowOverrides = pgTable("workflow_overrides", {
   updatedBy: text("updated_by"),
 });
 
+/** @see sqlite.ts → `usageGateOverrides` */
+export const usageGateOverrides = pgTable("usage_gate_overrides", {
+  name: text("name").primaryKey(),
+  enabled: boolean("enabled"),
+  maxPercent: integer("max_percent"),
+  updatedBy: text("updated_by"),
+  updatedAt: text("updated_at").notNull(),
+});
+
 /** @see sqlite.ts → `workflowApprovals` */
 export const workflowApprovals = pgTable(
   "workflow_approvals",
@@ -399,7 +408,7 @@ export const messagingMessages = pgTable(
     // GENERATED ALWAYS is the faithful mirror — and will (correctly) error if
     // one ever does.
     id: integer("id").generatedAlwaysAsIdentity().primaryKey(),
-    // The ONLY declared foreign key in the 15-table schema, and it is enforced
+    // The ONLY declared foreign key in the 17-table schema, and it is enforced
     // on both legs.
     sessionId: text("session_id")
       .notNull()

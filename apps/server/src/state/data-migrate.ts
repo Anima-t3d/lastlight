@@ -26,7 +26,7 @@
  *   different schema versions is the failure this prevents.
  * - **FK order is load-bearing** for exactly one pair —
  *   `messaging_sessions` → `messaging_messages`, the only declared foreign key
- *   in the 15-table schema. {@link TABLE_ORDER} encodes it.
+ *   in the 17-table schema. {@link TABLE_ORDER} encodes it.
  * - **The target must be empty**, unless `truncate` is passed. Copying into a
  *   populated database would half-succeed on primary-key collisions and leave
  *   an interleaved mess that is worse than either input.
@@ -65,6 +65,7 @@ export const TABLE_ORDER: readonly TableSpec[] = [
   { key: "cronOverrides", orderBy: ["name"] },
   { key: "cronRuns", orderBy: ["id"] },
   { key: "workflowOverrides", orderBy: ["name"] },
+  { key: "usageGateOverrides", orderBy: ["name"] },
   { key: "users", orderBy: ["id"] },
   // No foreign key — `actor_login` is a SOFT join to `users.login` — but placed
   // after `users` to match how it reads.
@@ -146,7 +147,7 @@ export interface MigrateStateDataResult {
 /**
  * Copy every row from a SQLite state database into a Postgres one.
  *
- * Not transactional as a whole, and cannot be: 15 tables and potentially
+ * Not transactional as a whole, and cannot be: 17 tables and potentially
  * hundreds of thousands of rows in one Postgres transaction is a recipe for a
  * bloated WAL and a lock held for minutes. The design point that makes that
  * acceptable is the empty-target precondition — a failed run leaves a

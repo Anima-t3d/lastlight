@@ -27,7 +27,7 @@ into the resume state read by every dashboard query.
 ## State tables
 
 The schema is **declared in Drizzle**, not in DDL: `src/state/schema/sqlite.ts`
-is the source of truth for sixteen tables, with `src/state/schema/pg.ts` as its
+is the source of truth for seventeen tables, with `src/state/schema/pg.ts` as its
 name-parity Postgres mirror (see "Dialect posture" below). The per-table stores
 in `src/state/*-store.ts` operate on them; `src/state/db.ts` wires the stores
 together. All rows are append-only unless marked mutable. Migrations are
@@ -447,6 +447,23 @@ order within a same-timestamp tie is arbitrary but **stable**, which is all
 either read needs — and a tiebreak that is merely deterministic is not enough
 here, because dropping it entirely makes `recentFailures` report 0 for an
 always-failing cron.
+
+### `usage_gate_overrides`
+
+```sql
+CREATE TABLE IF NOT EXISTS usage_gate_overrides (
+  name TEXT PRIMARY KEY,        -- always 'default'
+  enabled INTEGER,              -- null = config's autonomy.budget.usage.enabled
+  max_percent INTEGER,          -- null = config's autonomy.budget.usage.maxPercent
+  updated_by TEXT,
+  updated_at TEXT NOT NULL
+);
+```
+
+The dashboard's runtime override of the usage gate (`POST /admin/api/usage/settings`,
+`DELETE /admin/api/usage/override`). At most one row. Absence = the config
+values apply. Read by the build gate on every autonomous dispatch. Mutable and
+deletable, like `cron_overrides`.
 
 ### `workflow_overrides`
 
@@ -1141,8 +1158,8 @@ precisely because of that.
 - **`session_id` is the join key between the two stores.** Every
   `executions` row that ran an agent has one; matching the JSONL
   filename joins them.
-- **Append-only by default.** Only `cron_overrides` and
-  `workflow_overrides` permit deletion; everything else accumulates.
+- **Append-only by default.** Only `cron_overrides`,
+  `workflow_overrides` and `usage_gate_overrides` permit deletion; everything else accumulates.
   Audit trail trumps disk usage.
 - **JSONL truncation is for display, not retention.** The raw output
   is still on disk somewhere (workspace, stdout). A re-implementation

@@ -79,6 +79,7 @@ import {
 } from "./engine/review-check.js";
 import { installStageObserver } from "./engine/stage-observer.js";
 import { installWebhooks } from "./notify/webhook/emitter.js";
+import { configureUsageGate } from "./engine/usage-runtime.js";
 import { invalidateBoard } from "./admin/board-cache.js";
 import { noteBoardRunChange } from "./admin/board-stream.js";
 import { runDashboardUrl } from "./notify/model.js";
@@ -393,6 +394,8 @@ async function main() {
   // store, so no dispatch path can be added without its event.
   const webhookEmitter = installWebhooks(db, config, process.env, logger("webhooks"));
   if (webhookEmitter) logger("webhooks").info("Outgoing webhooks enabled", { endpoints: config.webhooks.length });
+  // The usage gate announces a hold through the same emitter (`autonomy.held`).
+  configureUsageGate({ emitter: webhookEmitter, botName: config.botName, dashboardBase: config.publicUrl });
 
   // Feedback signals recorded while telemetry was off carry no export watermark
   // (issue #255), so enabling OTel later can still put them on the traces they
