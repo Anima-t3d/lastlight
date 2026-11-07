@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { defaultAutonomyConfig, loadConfig, resetRuntimeConfigForTests } from "#src/config/config.js";
+import { defaultAutonomyConfig, loadConfig, redactPublic, resetRuntimeConfigForTests } from "#src/config/config.js";
 
 vi.mock("#src/logging/logger.js", () => {
   const noopLogger = {
@@ -99,5 +99,23 @@ describe("loadConfig — autonomy.budget.usage", () => {
     const b = load("autonomy:\n  budget:\n    dailyUsd: null\n    repoDailyUsd: -1\n");
     expect(b.dailyUsd).toBeNull();
     expect(b.repoDailyUsd).toBe(10);
+  });
+});
+
+describe("redactPublic — autonomy.budget.usage.source", () => {
+  it("shows only the source kind, never a path or argv", () => {
+    const shown = redactPublic({
+      autonomy: { budget: { usage: { source: { command: ["usage-cli", "--key", "abc123"] }, maxPercent: 80 } } },
+      other: { usage: { source: { file: "/srv/usage.json" } } },
+    });
+    expect(shown.autonomy.budget.usage).toEqual({ source: "command", maxPercent: 80 });
+    expect(JSON.stringify(shown)).not.toContain("abc123");
+    expect(JSON.stringify(shown)).toContain("/srv/usage.json");
+  });
+
+  it("leaves a missing source as it is", () => {
+    expect(redactPublic({ autonomy: { budget: { usage: { source: null } } } })).toEqual({
+      autonomy: { budget: { usage: { source: null } } },
+    });
   });
 });
