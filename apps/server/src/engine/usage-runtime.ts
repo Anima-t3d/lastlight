@@ -46,6 +46,11 @@ let runtime: UsageRuntime = defaults();
 let cached: { key: string; at: number; result: Promise<UsageReadResult> } | null = null;
 /** Hold keys already announced; cleared when the gate next reads not-held. */
 const announced = new Set<string>();
+/**
+ * What the most recent dispatch read decided. A hold verdict noted after a
+ * later read found the gate open is stale and is not announced.
+ */
+let lastReadHeld = true;
 /** `owner/repo#N` → the issue held and since when. */
 const waiting = new Map<string, { repo: string; issueNumber: number; since: string }>();
 
@@ -57,6 +62,7 @@ export function configureUsageGate(patch: Partial<UsageRuntime>): void {
 export function resetUsageGateForTests(): void {
   runtime = defaults();
   cached = null;
+  lastReadHeld = true;
   announced.clear();
   waiting.clear();
 }
@@ -141,6 +147,7 @@ export async function currentUsage(db: StateDb): Promise<UsageState> {
 /** The verdict for one dispatch; `undefined` when the gate is off. */
 export async function usageVerdictForDispatch(db: StateDb): Promise<UsageVerdict | undefined> {
   const { verdict } = await currentUsage(db);
+  lastReadHeld = verdict?.held === true;
   // A not-held read ends the hold: the next one is announced afresh, and no
   // issue is waiting on it any more (the sweep will pick them up).
   if (verdict && !verdict.held) {
@@ -152,7 +159,10 @@ export async function usageVerdictForDispatch(db: StateDb): Promise<UsageVerdict
 
 function holdKey(verdict: Extract<UsageVerdict, { held: true }>): string {
   const w = verdict.window;
-  return w ? `${w.provider}|${w.id}|${w.resetsAt ?? "unknown"}` : `unavailable|${verdict.reason.split(":")[0]}`;
+  // To the minute: a source that recomputes the reset from "seconds left"
+  // must not turn one hold into one per refresh.
+  const reset = w?.resetsAt && !Number.isNaN(Date.parse(w.resetsAt)) ? new Date(w.resetsAt).toISOString().slice(0, 16) : "unknown";
+  return w ? `${w.provider}|${w.id}|${reset}` : `unavailable|${verdict.reason.split(":")[0]}`;
 }
 
 /**
@@ -165,6 +175,7 @@ export async function noteUsageHold(
   subject: { repo: string; issueNumber: number; workflow: string },
   verdict: Extract<UsageVerdict, { held: true }>,
 ): Promise<void> {
+  if (!lastReadHeld) return;
   const triggerId = `${subject.repo}#${subject.issueNumber}`;
   if (!waiting.has(triggerId)) {
     waiting.set(triggerId, { repo: subject.repo, issueNumber: subject.issueNumber, since: runtime.now().toISOString() });
