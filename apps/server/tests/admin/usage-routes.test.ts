@@ -76,7 +76,7 @@ describe("usage routes", () => {
         windows: [{ provider: "commandcode", id: "five_hour", usedPct: 85, resetsAt: "2026-11-07T13:00:00Z" }],
       }),
     );
-    configureUsageGate({ now: () => now });
+    configureUsageGate({ now: () => now, cacheMs: 0 });
   });
 
   afterEach(() => {

@@ -62,7 +62,7 @@ const defaultExec: Exec = (argv, timeoutMs) =>
     execFile(
       argv[0],
       argv.slice(1),
-      { timeout: timeoutMs, maxBuffer: MAX_BYTES, shell: false, windowsHide: true },
+      { timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: MAX_BYTES, shell: false, windowsHide: true },
       (err, stdout) => {
         if (err && typeof (err as NodeJS.ErrnoException & { code?: unknown }).code !== "number") {
           reject(err);
