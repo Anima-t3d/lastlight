@@ -105,6 +105,10 @@ export async function applyBuildDispatchGate(
   const workflow = stageWorkflow(stage);
   const budget = getAutonomyConfig().budget;
   const [owner, name] = args.repo.split("/");
+  // The usage-window verdict (`autonomy.budget.usage`; undefined = gate off),
+  // read BEFORE the lock: it touches no state the lock protects, and an
+  // external source must never make every other gate call wait on it.
+  const usage = await usageVerdictForDispatch(deps.db);
   // Read → decide → reserve under ONE in-process lock. The fan-out gates every
   // discovered issue in parallel, and a run row is only written later, inside
   // the dispatch — so without the lock and the reservation every gate in a
@@ -115,7 +119,7 @@ export async function applyBuildDispatchGate(
     // ONCE here. Two reads that each called "start of today" separately could
     // straddle midnight and answer about different days.
     const sinceIso = startOfUtcDayIso();
-    const [alreadyBuilt, inFlight, activeRuns, buildsForRepoToday, dailyStats, repoSpend, usage] = await Promise.all([
+    const [alreadyBuilt, inFlight, activeRuns, buildsForRepoToday, dailyStats, repoSpend] = await Promise.all([
       // GUARD 3 — the real lock. A fact in our own database, in ANY status, that
       // no GitHub outage can move.
       deps.db.runs.hasRunForTrigger(triggerId, workflow),
@@ -140,8 +144,6 @@ export async function applyBuildDispatchGate(
       // as "over budget" would refuse every build on a quiet morning.
       deps.db.executions.dailyStats(1),
       deps.db.executions.repoCostSince(owner ?? "", name ?? "", sinceIso),
-      // The usage-window verdict (`autonomy.budget.usage`); undefined = gate off.
-      usageVerdictForDispatch(deps.db),
     ]);
 
     // `queued` and `running` only. A `paused` run is waiting on a human at an

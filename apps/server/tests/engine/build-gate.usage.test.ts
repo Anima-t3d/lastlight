@@ -80,6 +80,8 @@ describe("applyBuildDispatchGate — usage windows", () => {
       emitter: { emit: (payload: WebhookPayload, repo?: string) => emitted.push({ payload, repo }) },
       now: () => now,
       botName: "last-light",
+      // Each test rewrites the usage file between calls; read it every time.
+      cacheMs: 0,
     });
   });
 
@@ -157,6 +159,13 @@ describe("applyBuildDispatchGate — usage windows", () => {
     expect((await applyBuildDispatchGate(args(2), { db, github: github() })).decision).toBe("skip");
     await db.setUsageOverride({ enabled: false }, "alice");
     expect((await applyBuildDispatchGate(args(3), { db, github: github() })).decision).toBe("dispatch");
+  });
+
+  it("a stuck usage source does not stall other gate calls", async () => {
+    configureUsageGate({ read: () => new Promise(() => {}), readTimeoutMs: 30 });
+    const gh = github();
+    const results = await Promise.all([1, 2, 3].map((n) => applyBuildDispatchGate(args(n), { db, github: gh })));
+    expect(results.map((r) => r.decision)).toEqual(["dispatch", "dispatch", "dispatch"]);
   });
 
   it("works without an emitter (no webhooks configured)", async () => {

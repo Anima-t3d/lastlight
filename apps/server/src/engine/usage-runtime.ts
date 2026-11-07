@@ -26,6 +26,10 @@ interface UsageRuntime {
   now: () => Date;
   botName: string;
   dashboardBase?: string;
+  /** Hard bound on one read; a source that has not answered by then is unavailable. */
+  readTimeoutMs: number;
+  /** How long one read serves every caller (capped at the data's stale limit). */
+  cacheMs: number;
 }
 
 const defaults = (): UsageRuntime => ({
@@ -33,9 +37,13 @@ const defaults = (): UsageRuntime => ({
   read: (source) => readUsageSnapshot(source),
   now: () => new Date(),
   botName: "last-light",
+  readTimeoutMs: 6000,
+  cacheMs: 30_000,
 });
 
 let runtime: UsageRuntime = defaults();
+/** The last read (or the one in flight), shared by the gate and the dashboard. */
+let cached: { key: string; at: number; result: Promise<UsageReadResult> } | null = null;
 /** Hold keys already announced; cleared when the gate next reads not-held. */
 const announced = new Set<string>();
 /** `owner/repo#N` → the issue held and since when. */
@@ -48,6 +56,7 @@ export function configureUsageGate(patch: Partial<UsageRuntime>): void {
 
 export function resetUsageGateForTests(): void {
   runtime = defaults();
+  cached = null;
   announced.clear();
   waiting.clear();
 }
@@ -91,14 +100,40 @@ export interface UsageState {
   verdict: UsageVerdict | null;
 }
 
-/** Read the source once and judge it. Never throws. */
+/** One read, bounded by `readTimeoutMs`. Never rejects. */
+function boundedRead(source: NonNullable<UsageGateConfig["source"]>): Promise<UsageReadResult> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<UsageReadResult>((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, reason: "usage source timed out" }), runtime.readTimeoutMs);
+    timer.unref?.();
+  });
+  const read = runtime.read(source).catch((): UsageReadResult => ({ ok: false, reason: "usage source unreadable" }));
+  return Promise.race([read, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** The shared read: reused for `cacheMs` (never longer than the stale limit). */
+function sharedRead(settings: UsageGateConfig): Promise<UsageReadResult> {
+  const source = settings.source!;
+  const key = JSON.stringify(source);
+  const now = runtime.now().getTime();
+  const ttl = Math.min(runtime.cacheMs, settings.staleAfterSeconds * 1000);
+  if (cached && cached.key === key && now - cached.at < ttl) return cached.result;
+  cached = { key, at: now, result: boundedRead(source) };
+  return cached.result;
+}
+
+/**
+ * Read the source (shared, time-boxed) and judge it. A gate switched off reads
+ * nothing. Never throws, never waits longer than `readTimeoutMs`.
+ */
 export async function currentUsage(db: StateDb): Promise<UsageState> {
   const settings = await resolveUsageSettings(db);
   if (!settings.effective.source) return { settings, read: null, verdict: null };
-  const read = await runtime.read(settings.effective.source).catch(
-    (): UsageReadResult => ({ ok: false, reason: "usage source unreadable" }),
-  );
   const { source: _source, ...judged } = settings.effective;
+  if (!settings.effective.enabled) {
+    return { settings, read: null, verdict: evaluateUsage({ ok: false, reason: "not read" }, judged, runtime.now()) };
+  }
+  const read = await sharedRead(settings.effective);
   const verdict = evaluateUsage(read, judged satisfies UsageSettings, runtime.now());
   return { settings, read, verdict };
 }
