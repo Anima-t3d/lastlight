@@ -22,6 +22,7 @@ vi.mock("#src/sandbox/k8s/client.js", () => ({ makeK8sApis: vi.fn(() => ({}) as 
 const { createAdminRoutes } = await import("#src/admin/routes.js");
 const { loadConfig, resetRuntimeConfigForTests } = await import("#src/config/config.js");
 const { configureUsageGate, noteUsageHold, resetUsageGateForTests } = await import("#src/engine/usage-runtime.js");
+const { recordActivity } = await import("#src/activity.js");
 
 /**
  * `GET /usage`, `POST /usage/settings`, `DELETE /usage/override` — the
@@ -104,6 +105,27 @@ describe("usage routes", () => {
     expect(body.waiting).toEqual([{ repo: "acme/widgets", issueNumber: 4, since: now.toISOString() }]);
     expect(body.recentHolds).toHaveLength(1);
     expect(body.recentHolds[0]).toMatchObject({ targetId: "acme/widgets#4" });
+  });
+
+  it("finds recent holds behind many other skipped builds", async () => {
+    await noteUsageHold(db, { repo: "acme/widgets", issueNumber: 4, workflow: "build" }, {
+      held: true,
+      window: { provider: "example", id: "five_hour", usedPct: 85, resetsAt: "2026-11-07T13:00:00Z" },
+      maxPercent: 80,
+      reason: "example five_hour at 85% ≥ 80%",
+    });
+    for (let i = 0; i < 60; i++) {
+      await recordActivity(db, {
+        action: "autonomy.skip",
+        actorType: "system",
+        targetType: "issue",
+        targetId: `acme/widgets#${100 + i}`,
+        outcome: "denied",
+        detail: { case: "repo-quota", reason: "quota" },
+      });
+    }
+    const { body } = await get();
+    expect(body.recentHolds.map((h: { targetId: string }) => h.targetId)).toEqual(["acme/widgets#4"]);
   });
 
   it("never exposes the source path or command", async () => {
