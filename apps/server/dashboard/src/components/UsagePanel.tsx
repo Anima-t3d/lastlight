@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import clsx from "clsx";
 import { api, type UsageView } from "../api";
-import { dataAge, parseMaxPercent, resetsIn, usageRows, usageState } from "../lib/usage-view";
+import { dataAge, parseMaxPercent, recentHoldRows, resetsIn, usageRows, usageState } from "../lib/usage-view";
 
 /**
  * The usage gate (`autonomy.budget.usage`): one bar per window with the
@@ -79,6 +79,7 @@ function UsageBody({ data, onChange, bare = false }: { data: UsageView; onChange
   const now = new Date();
   const state = usageState(data, now);
   const rows = usageRows(data);
+  const holds = recentHoldRows(data);
   const eff = data.settings.effective;
   const [draft, setDraft] = useState(String(eff.maxPercent));
   const [busy, setBusy] = useState(false);
@@ -178,6 +179,21 @@ function UsageBody({ data, onChange, bare = false }: { data: UsageView; onChange
                     >
                       {w.repo}#{w.issueNumber}
                     </a>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {holds.length > 0 && (
+            <div>
+              <div className="text-2xs text-muted mb-0.5">Recent holds</div>
+              <ul className="space-y-0.5">
+                {holds.map((h) => (
+                  <li key={h.key} className="flex flex-wrap gap-x-2 font-mono text-2xs">
+                    <span className="text-faint">{new Date(h.at).toLocaleString()}</span>
+                    <span className="break-all">{h.issue}</span>
+                    <span className="text-muted">{h.what}</span>
                   </li>
                 ))}
               </ul>

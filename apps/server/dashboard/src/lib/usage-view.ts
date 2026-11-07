@@ -95,3 +95,29 @@ export function resetsIn(resetsAt: string | null, now: Date): string {
   const d = Math.floor(h / 24);
   return `resets in ${d} d${h % 24 ? ` ${h % 24} h` : ""}`;
 }
+
+export interface RecentHoldRow {
+  key: string;
+  at: string;
+  issue: string;
+  what: string;
+}
+
+/**
+ * The last `autonomy.held` records (activity `autonomy.skip`, case
+ * `usage-held`), newest first: the trace that builds were held once the hold
+ * is over and the waiting list is empty.
+ */
+export function recentHoldRows(u: UsageView, limit = 5): RecentHoldRow[] {
+  return [...u.recentHolds]
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .slice(0, limit)
+    .map((h) => {
+      const d = h.detail ?? {};
+      const what =
+        typeof d.provider === "string" && typeof d.window === "string"
+          ? `${d.provider} ${d.window}${typeof d.usedPct === "number" ? ` at ${Math.round(d.usedPct)}%` : ""}`
+          : "usage data unavailable";
+      return { key: h.id, at: h.createdAt, issue: h.targetId ?? "", what };
+    });
+}
