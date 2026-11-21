@@ -55,6 +55,14 @@ const PhaseLoopSchema = z.object({
   /** Gate to pause at before running the fix (optional) */
   approval_gate: z.string().optional(),
   /**
+   * Fail instead of continuing when the reviewer still rejects. Templated
+   * (e.g. `"{{autonomyMerge.gate}}"`); truthy after rendering (`"true"` / `true`)
+   * makes a loop that ends at `max_cycles` with REQUEST_CHANGES, or whose fix
+   * cycle fails, fail the phase and the run with failure class `review-rejected`
+   * rather than letting the next phase (the PR) run. Absent/falsy: unchanged.
+   */
+  fail_on_reject: z.union([z.string(), z.boolean()]).optional(),
+  /**
    * Artifact (handoff doc) filename this gate is asking the reviewer to
    * approve, e.g. `reviewer-verdict.md`. Surfaced by the focused approval
    * view so the reviewer reads/edits the right doc before approving.

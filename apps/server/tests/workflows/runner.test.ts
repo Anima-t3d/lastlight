@@ -562,6 +562,69 @@ describe("runWorkflow — reviewer loop", () => {
     expect(result.prNumber).toBe(9);
   });
 
+  describe("reviewer loop fail_on_reject", () => {
+    const withFlag = (flag: string | boolean | undefined): AgentWorkflowDefinition => ({
+      ...WORKFLOW_WITH_REVIEWER_LOOP,
+      phases: WORKFLOW_WITH_REVIEWER_LOOP.phases.map((p) =>
+        p.name === "reviewer" ? { ...p, loop: { ...p.loop!, fail_on_reject: flag } } : p,
+      ),
+    });
+
+    // Queued `Once` values the prior test left unconsumed must not leak in.
+    beforeEach(() => { mockExecuteAgent.mockReset(); });
+
+    it("fails the run at max_cycles (class review-rejected) and never runs pr", async () => {
+      mockExecuteAgent
+        .mockResolvedValueOnce(makeSuccessResult("executor done"))
+        .mockResolvedValueOnce(makeSuccessResult("VERDICT: REQUEST_CHANGES"))
+        .mockResolvedValueOnce(makeSuccessResult("fixed 1"))
+        .mockResolvedValueOnce(makeSuccessResult("VERDICT: REQUEST_CHANGES"))
+        .mockResolvedValueOnce(makeSuccessResult("fixed 2"))
+        .mockResolvedValueOnce(makeSuccessResult("VERDICT: REQUEST_CHANGES"))
+        .mockResolvedValueOnce(makeSuccessResult("PR #9 created"));
+      const phases: string[] = [];
+      const result = await runWorkflow(withFlag("{{autonomyMerge.gate}}"), { ...BASE_CTX, autonomyMerge: { gate: true } } as never, {} as never, {
+        onPhaseStart: async (p) => { phases.push(p); },
+      });
+      expect(result.success).toBe(false);
+      expect(phases).not.toContain("pr");
+      expect(result.prNumber).toBeUndefined();
+      expect(mockExecuteAgent).toHaveBeenCalledTimes(6);
+      expect(result.phases.find((p) => !p.success)?.error).toMatch(/^review-rejected: /);
+    });
+
+    it("fails the run when a fix cycle fails and never runs pr", async () => {
+      mockExecuteAgent
+        .mockResolvedValueOnce(makeSuccessResult("executor done"))
+        .mockResolvedValueOnce(makeSuccessResult("VERDICT: REQUEST_CHANGES"))
+        .mockResolvedValueOnce({ success: false, output: "", error: "fix blew up", turns: 1, durationMs: 1 })
+        .mockResolvedValueOnce(makeSuccessResult("PR #9 created"));
+      const phases: string[] = [];
+      const result = await runWorkflow(withFlag(true), BASE_CTX, {} as never, {
+        onPhaseStart: async (p) => { phases.push(p); },
+      });
+      expect(result.success).toBe(false);
+      expect(phases).not.toContain("pr");
+      expect(result.phases.find((p) => !p.success)?.error).toMatch(/^review-rejected: fix cycle 1 failed: fix blew up/);
+    });
+
+    it.each([["{{autonomyMerge.gate}}"], ["false"], [false], [undefined]])(
+      "falsy flag %s keeps today's behaviour: opens the PR with remaining issues",
+      async (flag) => {
+        mockExecuteAgent
+          .mockResolvedValueOnce(makeSuccessResult("executor done"))
+          .mockResolvedValueOnce(makeSuccessResult("VERDICT: REQUEST_CHANGES"))
+          .mockResolvedValueOnce(makeSuccessResult("fixed 1"))
+          .mockResolvedValueOnce(makeSuccessResult("VERDICT: REQUEST_CHANGES"))
+          .mockResolvedValueOnce(makeSuccessResult("fixed 2"))
+          .mockResolvedValueOnce(makeSuccessResult("VERDICT: REQUEST_CHANGES"))
+          .mockResolvedValueOnce(makeSuccessResult("PR #9 created"));
+        const result = await runWorkflow(withFlag(flag), { ...BASE_CTX, autonomyMerge: { gate: false } } as never, {} as never, {});
+        expect(result.prNumber).toBe(9);
+      },
+    );
+  });
+
   it("uses fallback verdict detection when VERDICT: marker is missing", async () => {
     mockExecuteAgent
       .mockResolvedValueOnce(makeSuccessResult("executor done"))

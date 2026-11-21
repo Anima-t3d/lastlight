@@ -205,6 +205,9 @@ phases:
         fix_model: "{{models.fix}}"
         fix_variant: "{{variants.fix}}"
         re_review_prompt: prompts/re-reviewer.md
+      # Merge gate on: a build the reviewer still rejects (max cycles, or a fix
+      # cycle that fails) fails the run (`review-rejected`) instead of opening a PR.
+      fail_on_reject: "{{autonomyMerge.gate}}"
       approval_gate: post_reviewer
       approval_artifact: reviewer-verdict.md
       messages:

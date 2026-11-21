@@ -179,3 +179,14 @@ describe("build.yaml guardrails_gate — rendered command verdicts", () => {
     expect(r.stdout).toMatch(/^BLOCKED — full test suite failed \(exit 5\)/);
   });
 });
+
+describe("build.yaml reviewer loop — fail_on_reject follows the merge gate", () => {
+  const loop = def.phases.find((p) => p.name === "reviewer")!.loop!;
+  it("is templated from autonomyMerge.gate", () => {
+    expect(loop.fail_on_reject).toBe("{{autonomyMerge.gate}}");
+  });
+  it.each([[true, "true"], [false, "false"]])("renders gate=%s as %s", (gate, out) => {
+    const ctx = { autonomyMerge: { gate } } as unknown as TemplateContext;
+    expect(renderTemplate(String(loop.fail_on_reject), ctx)).toBe(out);
+  });
+});

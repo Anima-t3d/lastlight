@@ -228,6 +228,9 @@ export function isSoftOutcome(
   return r.stopReason === "unknown" || r.stopReason === "error_truncated";
 }
 
+/** Machine-readable failure class of a reviewer loop that `fail_on_reject` failed. */
+export const REVIEW_REJECTED_FAILURE_CLASS = "review-rejected";
+
 function pickResult(r: ExecutionResult): Pick<ExecutionResult, "success" | "output" | "error" | "stopReason"> {
   return { success: r.success, output: r.output, error: r.error, stopReason: r.stopReason };
 }
@@ -1114,6 +1117,13 @@ export class PhaseExecutor {
     const results: PhaseResult[] = [];
     let approved = false;
     let fixCycles = 0;
+    let rejection: { label: string; why: string } | undefined;
+    const failOnReject = (() => {
+      const raw = loop.fail_on_reject;
+      if (raw === undefined) return false;
+      const v = typeof raw === "boolean" ? raw : renderTemplate(raw, this.run.ctx).trim().toLowerCase();
+      return v === true || v === "true";
+    })();
 
     // Loop resume state. When the loop pauses at `loop.approval_gate` after a
     // REQUEST_CHANGES verdict, we persist the cycle we paused at so that on
@@ -1285,11 +1295,19 @@ export class PhaseExecutor {
 
           if (!fr.result.success) {
             if (!isTerminated(fr.result.error)) {
-              await this.reporter.step(fixLabel, "failed", loop.messages?.on_fix_failed, {
-                cycle: fixCycles,
-                maxCycles: MAX_CYCLES,
-              });
+              await this.reporter.step(
+                fixLabel,
+                "failed",
+                failOnReject
+                  ? `Fix cycle ${fixCycles} failed — the reviewer's changes were not applied, so no PR is opened.`
+                  : loop.messages?.on_fix_failed,
+                { cycle: fixCycles, maxCycles: MAX_CYCLES },
+              );
             }
+            rejection = {
+              label: fixLabel,
+              why: `fix cycle ${fixCycles} failed${fr.result.error ? `: ${fr.result.error}` : ""}`,
+            };
             break;
           }
           await this.reporter.persistPhase(fixLabel);
@@ -1297,16 +1315,38 @@ export class PhaseExecutor {
         }
       } else {
         await this.reporter.persistPhase(reviewLabel, "REQUEST_CHANGES — max cycles reached");
-        await this.reporter.step(reviewLabel, "blocked", loop.messages?.on_max_cycles, {
-          cycle: fixCycles,
-          maxCycles: MAX_CYCLES,
-        }, { alsoNote: true });
+        await this.reporter.step(
+          reviewLabel,
+          "blocked",
+          failOnReject
+            ? `**Review: REQUEST_CHANGES** after ${MAX_CYCLES} fix cycles — the reviewer still rejects this build, so no PR is opened.`
+            : loop.messages?.on_max_cycles,
+          { cycle: fixCycles, maxCycles: MAX_CYCLES },
+          { alsoNote: true },
+        );
+        rejection = { label: reviewLabel, why: `reviewer still requests changes after ${MAX_CYCLES} fix cycles` };
         break;
       }
     }
 
     const outputVars: Record<string, unknown> = {};
     if (phase.output_var) outputVars[phase.output_var] = { approved, cycles: fixCycles };
+
+    // `fail_on_reject`: a build the reviewer still rejects must not reach the PR
+    // phase. Fail the phase with the machine-readable class as the error prefix,
+    // stamped on the ledger row too so the run's failure reason carries it.
+    if (failOnReject && !approved && rejection) {
+      const error = `${REVIEW_REJECTED_FAILURE_CLASS}: ${rejection.why}`;
+      await db?.executions.markLatestAsFailed(`${wf}:${rejection.label}`, triggerId, error, workflowId);
+      const last = results[results.length - 1];
+      if (last && last.phase === rejection.label && !last.success) {
+        results[results.length - 1] = { ...last, error };
+      } else {
+        results.push({ phase: phaseName, success: false, output: "", error });
+      }
+      return { results, status: "failed", outputVars };
+    }
+
     // The loop node itself succeeds as a scheduling unit — even at max cycles
     // the linear runner continued to the next phase. Individual review/fix
     // results carry their own success flags for the run-level rollup.
