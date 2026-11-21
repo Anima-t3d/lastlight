@@ -377,7 +377,7 @@ export async function runWorkflow(
   // a parameter with a default doesn't count toward it. Existing callers are
   // unaffected — omitting it reproduces today's behaviour exactly.
   repoConfig: RunRepoConfig | undefined = undefined,
-): Promise<WorkflowResult & { backpressure?: boolean; notBefore?: string }> {
+): Promise<WorkflowResult & { backpressure?: boolean; notBefore?: string; review?: unknown }> {
   // Every route into the runner crosses here, so this is where a run becomes
   // "live in this process" (`./live-runs.ts`) — for the whole execution, not
   // just while its row says `running`.
@@ -402,7 +402,7 @@ async function runWorkflowBody(
   workflowId: string | undefined,
   variants: VariantConfig | undefined,
   repoConfig: RunRepoConfig | undefined,
-): Promise<WorkflowResult & { backpressure?: boolean; notBefore?: string }> {
+): Promise<WorkflowResult & { backpressure?: boolean; notBefore?: string; review?: unknown }> {
   const outputs: Record<string, unknown> = {};
   const { taskId } = ctx;
   // Slack-originated runs carry an explicit `slack:` trigger id — everything
@@ -799,7 +799,11 @@ async function runWorkflowBody(
       reporterActive: !!reporter,
       capabilities: { qaImageAvailable, qaImageName: SANDBOX_IMAGE_QA },
     }, outputs);
-    return quota.hit ? { ...result, backpressure: true, ...(quota.notBefore ? { notBefore: quota.notBefore } : {}) } : result;
+    // `review` is the reviewer loop's `{ approved, cycles }` output var, surfaced
+    // so the caller that owns the GitHub client can record the build review
+    // (`engine/build-review.ts`). Absent for every workflow without one.
+    const withReview = outputs.review ? { ...result, review: outputs.review } : result;
+    return quota.hit ? { ...withReview, backpressure: true, ...(quota.notBefore ? { notBefore: quota.notBefore } : {}) } : withReview;
   } catch (err) {
     // A hard phase failure — notably a single-phase workflow (e.g. issue-triage)
     // whose only phase fails — throws OUT of the engine, bypassing the quota.hit

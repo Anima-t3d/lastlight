@@ -28,6 +28,8 @@ import {
 } from "../config/config.js";
 import type { ConfigSource } from "../config/config-resolve.js";
 import type { GitHubClient } from "../engine/github/github.js";
+import { finalizeBuildReviewForRun } from "../engine/build-review.js";
+import { resolveReviewGitHubClient } from "./handlers/post-review.js";
 import {
   fetchRepoLayer,
   getCachedRepoLayer,
@@ -1674,6 +1676,18 @@ async function runSimpleWorkflowBody(
 
     if (result.success && !result.paused) {
       await db.runs.finishRun(workflowId, "succeeded");
+      // Build runs only: pin the reviewer's verdict to the PR head the `pr`
+      // phase pushed and post `last-light/review` there. Never fails the run.
+      await finalizeBuildReviewForRun(
+        {
+          workflowName,
+          result,
+          ctx,
+          runId: workflowId,
+          runUrl: runDashboardUrl(callbacks.publicUrl, workflowId, workflowName),
+        },
+        { db, github: () => resolveReviewGitHubClient(config) },
+      );
       reapOnSuccess(workflowName, taskId, config);
     } else if (result.backpressure) {
       // k8s ResourceQuota rejected a pod-create: requeue, don't fail. The

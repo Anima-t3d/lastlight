@@ -2,6 +2,7 @@ import { isOwnedRun, type StateDb, type WorkflowRun } from "../state/db.js";
 import type { ExecutorConfig } from "../engine/github/profiles.js";
 import type { GitHubClient } from "../engine/github/github.js";
 import type { ModelConfig, VariantConfig } from "../config/config.js";
+import { finalizeBuildReviewForRun } from "../engine/build-review.js";
 import { runWorkflow, type ApprovalGateConfig, type RunnerCallbacks } from "./runner.js";
 import { getWorkflow } from "./loader.js";
 import {
@@ -520,6 +521,18 @@ export async function resumeSimpleRun(run: WorkflowRun, opts: ResumeOptions): Pr
       log.info("Paused", { workflowName: run.workflowName, runId: run.id });
     } else if (result.success) {
       await opts.db.runs.finishRun(run.id, "succeeded");
+      // Same build-review hook as the fresh-dispatch twin in simple.ts.
+      const github = opts.github;
+      await finalizeBuildReviewForRun(
+        {
+          workflowName: run.workflowName,
+          result,
+          ctx,
+          runId: run.id,
+          runUrl: runDashboardUrl(opts.publicUrl, run.id, run.workflowName),
+        },
+        { db: opts.db, github: () => github },
+      );
     } else if (result.backpressure) {
       // Same backpressure requeue as the fresh-dispatch path: a promoted run
       // that re-hits the quota goes back to `queued` for the next admission tick.
