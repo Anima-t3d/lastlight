@@ -608,6 +608,36 @@ describe("runWorkflow — reviewer loop", () => {
       expect(result.phases.find((p) => !p.success)?.error).toMatch(/^review-rejected: fix cycle 1 failed: fix blew up/);
     });
 
+    it("a terminated fix cycle fails the run without the review-rejected class", async () => {
+      mockExecuteAgent
+        .mockResolvedValueOnce(makeSuccessResult("executor done"))
+        .mockResolvedValueOnce(makeSuccessResult("VERDICT: REQUEST_CHANGES"))
+        .mockResolvedValueOnce({ success: false, output: "", error: "container was killed (OOM)", turns: 1, durationMs: 1 })
+        .mockResolvedValueOnce(makeSuccessResult("PR #9 created"));
+      const phases: string[] = [];
+      const result = await runWorkflow(withFlag(true), BASE_CTX, {} as never, {
+        onPhaseStart: async (p) => { phases.push(p); },
+      });
+      expect(result.success).toBe(false);
+      expect(phases).not.toContain("pr");
+      const err = result.phases.find((p) => !p.success)?.error;
+      expect(err).toBe("container was killed (OOM)");
+      expect(err).not.toMatch(/^review-rejected:/);
+    });
+
+    it("no autonomyMerge in the context (older/resumed run): flag is off and the PR phase runs", async () => {
+      mockExecuteAgent
+        .mockResolvedValueOnce(makeSuccessResult("executor done"))
+        .mockResolvedValueOnce(makeSuccessResult("VERDICT: REQUEST_CHANGES"))
+        .mockResolvedValueOnce(makeSuccessResult("fixed 1"))
+        .mockResolvedValueOnce(makeSuccessResult("VERDICT: REQUEST_CHANGES"))
+        .mockResolvedValueOnce(makeSuccessResult("fixed 2"))
+        .mockResolvedValueOnce(makeSuccessResult("VERDICT: REQUEST_CHANGES"))
+        .mockResolvedValueOnce(makeSuccessResult("PR #9 created"));
+      const result = await runWorkflow(withFlag("{{autonomyMerge.gate}}"), BASE_CTX, {} as never, {});
+      expect(result.prNumber).toBe(9);
+    });
+
     it.each([["{{autonomyMerge.gate}}"], ["false"], [false], [undefined]])(
       "falsy flag %s keeps today's behaviour: opens the PR with remaining issues",
       async (flag) => {

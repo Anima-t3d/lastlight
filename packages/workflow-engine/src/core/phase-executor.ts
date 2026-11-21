@@ -1118,6 +1118,7 @@ export class PhaseExecutor {
     let approved = false;
     let fixCycles = 0;
     let rejection: { label: string; why: string } | undefined;
+    let fixTerminated = false;
     const failOnReject = (() => {
       const raw = loop.fail_on_reject;
       if (raw === undefined) return false;
@@ -1304,10 +1305,15 @@ export class PhaseExecutor {
                 { cycle: fixCycles, maxCycles: MAX_CYCLES },
               );
             }
-            rejection = {
-              label: fixLabel,
-              why: `fix cycle ${fixCycles} failed${fr.result.error ? `: ${fr.result.error}` : ""}`,
-            };
+            // A terminated fix (cancel, kill, OOM, container gone) is not a
+            // reviewer rejection: keep its own error, no review-rejected class.
+            if (isTerminated(fr.result.error)) fixTerminated = true;
+            else {
+              rejection = {
+                label: fixLabel,
+                why: `fix cycle ${fixCycles} failed${fr.result.error ? `: ${fr.result.error}` : ""}`,
+              };
+            }
             break;
           }
           await this.reporter.persistPhase(fixLabel);
@@ -1335,6 +1341,11 @@ export class PhaseExecutor {
     // `fail_on_reject`: a build the reviewer still rejects must not reach the PR
     // phase. Fail the phase with the machine-readable class as the error prefix,
     // stamped on the ledger row too so the run's failure reason carries it.
+    // Terminated fix with the flag on: still fail (never open the PR), keeping
+    // the fix result's own error as the failure reason.
+    if (failOnReject && !approved && fixTerminated) {
+      return { results, status: "failed", outputVars };
+    }
     if (failOnReject && !approved && rejection) {
       const error = `${REVIEW_REJECTED_FAILURE_CLASS}: ${rejection.why}`;
       await db?.executions.markLatestAsFailed(`${wf}:${rejection.label}`, triggerId, error, workflowId);
