@@ -18,6 +18,7 @@ import type { StateDb } from "../state/db.js";
 import type { GitHubClient } from "./github/github.js";
 import { isDependencyPr } from "../cron/dependabot-discovery.js";
 import { holdReply } from "./pr-decisions.js";
+import { BUILD_MERGE_HANDLER } from "./build-merge.js";
 import { logger } from "../logging/logger.js";
 
 const log = logger("router");
@@ -603,6 +604,25 @@ export async function routeEvent(
     }
 
     case "pr.checks_passed": {
+      // A green settle on one of OUR OWN build PRs in a repo on both the Merges
+      // and autonomy lists — the connector emits it with `isDependencyPr:
+      // false` only then. It goes to the in-process merge gate, which re-reads
+      // everything itself; the envelope is only a nudge. Strictly `false`:
+      // an envelope that says nothing keeps the dependency route below, which
+      // is what every `pr.checks_passed` meant before this case existed.
+      if (envelope.isDependencyPr === false) {
+        log.info("Green build PR routed to the merge gate", { repo: envelope.repo, prNumber: envelope.prNumber });
+        return {
+          action: "handler",
+          handler: BUILD_MERGE_HANDLER,
+          context: {
+            repo: envelope.repo,
+            prNumber: envelope.prNumber,
+            headSha: envelope.headSha,
+            trigger: "checks-settled",
+          },
+        };
+      }
       // A dependency-update PR (Dependabot / Renovate) has gone green — the
       // connector already filtered to that case. Route deterministically to
       // whichever workflow claims the `dependabot-pr-merge` intent (no

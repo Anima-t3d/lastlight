@@ -8,6 +8,8 @@ import {
   resolveModel,
   resolveVariant,
   resolveGithubAuth,
+  isMergeRepo,
+  isAutonomousRepo,
 } from "./config/config.js";
 import { ConnectorRegistry, GitHubWebhookConnector, SlackConnector, SessionManager, recordThreadMessageForThread } from "./connectors/index.js";
 import {
@@ -1472,6 +1474,14 @@ async function main() {
       // and a repo that opts itself into `after-checks` under an `eager`
       // operator is covered by the 30-minute `check-prs-awaiting-review` sweep.
       reviewTrigger: () => config.review.trigger,
+      // The merge gate's real-time trigger: a green settle on a PR our bot
+      // opened, in a repo on BOTH the Merges and autonomy lists (read live, so
+      // the dashboard toggle takes effect at once). The author lookup is spent
+      // only on a green head we pushed in such a repo.
+      isMergeGateRepo: (repo) => isMergeRepo(repo) && isAutonomousRepo(repo),
+      getPullRequestAuthor: github
+        ? async (owner, repo, prNumber) => (await github.getPullRequest(owner, repo, prNumber)).user?.login ?? ""
+        : undefined,
       // The harness client memoizes an Octokit per installation; drop it when
       // the App is uninstalled so a re-install can't be served by a dead one.
       onInstallationRemoved: (installationId) => github?.forgetInstallation(installationId),

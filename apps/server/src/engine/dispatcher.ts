@@ -45,6 +45,7 @@ import {
 } from "./pr-escalation.js";
 import { logger } from "../logging/logger.js";
 import { recordActivity } from "../activity.js";
+import { BUILD_MERGE_HANDLER, evaluateBuildMerge } from "./build-merge.js";
 
 const eventLog = logger("event");
 const dispatchLog = logger("dispatch");
@@ -55,7 +56,7 @@ const approvalLog = logger("approval");
  *
  * Everything else the router can name — `pr-review`, `issue-triage`, a fork
  * named in `routes.github.*` — is a workflow definition, and is therefore
- * subject to the admin kill switch below. These five are in-process branches of
+ * subject to the admin kill switch below. These six are in-process branches of
  * `dispatch` itself: they have no YAML, no `workflow_runs` row, and no
  * definition for `getWorkflow` to resolve, so the admin toggle route already
  * refuses to persist an override for them (it validates the name first). Naming
@@ -69,6 +70,9 @@ const IN_PROCESS_HANDLERS = new Set([
   "status-report",
   "explore-reply",
   "approval-response",
+  // The merge gate. Its off switch is the per-repo Merges toggle, which the
+  // executor reads on every evaluation, not the workflow kill switch.
+  BUILD_MERGE_HANDLER,
 ]);
 
 /**
@@ -287,6 +291,13 @@ export async function dispatch(
     return { kind: "handled", handler };
   }
 
+  // The merge gate: a green settle on one of our own build PRs. In process and
+  // awaited, but it never throws into the dispatch — a failed evaluation merges
+  // nothing, and the 20-minute sweep evaluates the PR again.
+  if (handler === BUILD_MERGE_HANDLER) {
+    return handleBuildMerge(context, deps);
+  }
+
   // ── The PR state machine (09-state-machine.md) ────────────────────────────
   //
   // Everything past this point is a workflow dispatch, so this is where the
@@ -468,6 +479,31 @@ export async function dispatch(
 
   // Webhook-triggered workflows (the remaining default path).
   return handleWebhookDispatch(handler, workflowContext, deps);
+}
+
+/** The `build-merge` route: evaluate (and maybe merge) one build PR. */
+async function handleBuildMerge(
+  context: Record<string, unknown>,
+  deps: DispatchDeps,
+): Promise<DispatchOutcome> {
+  const repo = typeof context.repo === "string" ? context.repo : "";
+  const prNumber = typeof context.prNumber === "number" ? context.prNumber : 0;
+  const botLogin = getRuntimeConfig()?.botLogin ?? "";
+  if (!deps.github || !repo || !prNumber || !botLogin) {
+    return { kind: "skipped", reason: "build-merge: no GitHub client, PR or bot identity" };
+  }
+  try {
+    const res = await evaluateBuildMerge(
+      { github: deps.github, db: deps.db, botLogin },
+      repo,
+      prNumber,
+      "checks-settled",
+    );
+    dispatchLog.info("Merge gate evaluated", { repo, prNumber, ...res });
+  } catch (err: unknown) {
+    dispatchLog.warn("Merge gate evaluation failed", { repo, prNumber, err });
+  }
+  return { kind: "handled", handler: BUILD_MERGE_HANDLER };
 }
 
 /**

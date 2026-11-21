@@ -75,6 +75,23 @@ export interface GitHubWebhookConfig {
    */
   reviewTrigger?: () => "eager" | "after-checks" | "on-request";
   /**
+   * Is this repo (`owner/repo`) on BOTH the Merges and autonomy lists, read
+   * live (`isMergeRepo(r) && isAutonomousRepo(r)`)?
+   *
+   * Together with {@link getPullRequestAuthor} it decides the one new emit the
+   * merge gate needs: a green settle on a PR OUR BOT opened in such a repo
+   * becomes `pr.checks_passed` with `isDependencyPr: false`. Unset (standalone
+   * unit tests) reads as "not listed", so every PR behaves as before.
+   */
+  isMergeGateRepo?: (repo: string) => boolean;
+  /**
+   * The PR's author login (delegates to `GitHubClient.getPullRequest`). Asked
+   * only for a green settle on a head commit WE pushed in a merge-gate repo,
+   * because the `check_suite` payload does not carry the PR author. A failed
+   * lookup falls back to today's behaviour; the merge sweep is the backstop.
+   */
+  getPullRequestAuthor?: (owner: string, repo: string, prNumber: number) => Promise<string>;
+  /**
    * Called when the App is uninstalled from an account, with that installation
    * id. Lets the harness drop any client memoized against it, so a later
    * re-install (which mints a NEW installation id) can't reuse a dead one.
@@ -599,6 +616,26 @@ export class GitHubWebhookConnector extends EventEmitter implements Connector {
   }
 
   /**
+   * Is `prNumber` a PR our bot opened in a merge-gate repo? Called only for a
+   * green settle on a head we pushed that is not a dependency PR, so the
+   * author lookup is spent on nothing else. Never throws: any failure (or an
+   * unwired seam) answers false, which is today's behaviour.
+   */
+  private async isOwnMergeGatePr(repoFullName: string | undefined, prNumber: number): Promise<boolean> {
+    if (!repoFullName || !this.config.botLogin) return false;
+    if (!this.config.isMergeGateRepo || !this.config.getPullRequestAuthor) return false;
+    try {
+      if (!this.config.isMergeGateRepo(repoFullName)) return false;
+      const [owner, repo] = repoFullName.split("/");
+      const author = await this.config.getPullRequestAuthor(owner, repo, prNumber);
+      return author === this.config.botLogin;
+    } catch (err) {
+      log.warn("Merge-gate author lookup failed", { repoFullName, prNumber, err });
+      return false;
+    }
+  }
+
+  /**
    * Is the operator running `review.trigger: after-checks`? Only then does a
    * settled check suite on a PR neither check-outcome route claimed become a
    * `pr.checks_settled` event; every other mode has no consumer for it.
@@ -902,6 +939,23 @@ export class GitHubWebhookConnector extends EventEmitter implements Connector {
                 title = title0 || title;
                 issueAuthor = commitAuthor || issueAuthor;
                 isDependencyPr = true;
+              } else if (
+                settled === "passing" &&
+                isOurOwnPush &&
+                (await this.isOwnMergeGatePr(repoFullName, suitePr))
+              ) {
+                // A green settle on a PR OUR BOT opened, in a repo on both the
+                // Merges and autonomy lists: the merge gate's real-time trigger.
+                // Every other PR falls through exactly as before. It outranks
+                // the review settle below only for our own PRs, and a review of
+                // our own PR is skipped anyway (GitHub refuses the event).
+                prNumber = suitePr;
+                issueNumber = prNumber;
+                headSha = sha;
+                type = "pr.checks_passed";
+                title = title0 || title;
+                issueAuthor = commitAuthor || issueAuthor;
+                isDependencyPr = false;
               } else if ((settled === "failing" || settled === "passing") && this.afterChecks()) {
                 // Whatever the fix family did not claim, under `after-checks`,
                 // is the canonical review settle: nothing is going to change

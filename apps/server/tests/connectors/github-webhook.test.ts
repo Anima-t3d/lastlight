@@ -769,6 +769,145 @@ describe("GitHubWebhookConnector — settle-aware emit gate", () => {
   });
 });
 
+describe("GitHubWebhookConnector — green settle on our own build PR (merge gate)", () => {
+  beforeEach(() => {
+    setRuntimeConfig({ managedRepos: [REPO] } as unknown as LastLightConfig);
+  });
+  afterEach(() => resetRuntimeConfigForTests());
+
+  /**
+   * A connector with the merge-gate seams wired: `listed` answers the
+   * Merges-and-autonomy check, `author` is the PR author the lookup returns.
+   */
+  function gateConnector(opts: {
+    conclusion?: "passing" | "failing" | "pending" | "none";
+    trigger?: "eager" | "after-checks" | "on-request";
+    listed?: boolean;
+    author?: string | Error;
+  }): { conn: GitHubWebhookConnector; authorCalls: Array<[string, string, number]> } {
+    const authorCalls: Array<[string, string, number]> = [];
+    const conn = new GitHubWebhookConnector({
+      port: 0,
+      webhookSecret: SECRET,
+      botLogin: BOT_LOGIN,
+      getChecksConclusion: async () => opts.conclusion ?? "passing",
+      reviewTrigger: () => opts.trigger ?? "eager",
+      isMergeGateRepo: () => opts.listed ?? true,
+      getPullRequestAuthor: async (owner, repo, n) => {
+        authorCalls.push([owner, repo, n]);
+        if (opts.author instanceof Error) throw opts.author;
+        return opts.author ?? BOT_LOGIN;
+      },
+    });
+    return { conn, authorCalls };
+  }
+
+  const ownPush = {
+    conclusion: "success",
+    prNumber: 31,
+    commitAuthor: BOT_LOGIN,
+    commitMessage: "feat: widgets (#3)",
+    headBranch: "lastlight/3-widgets",
+    headSha: "b0b0b0",
+  };
+
+  it("emits pr.checks_passed with isDependencyPr:false for our own PR in a merge-listed repo", async () => {
+    const { conn, authorCalls } = gateConnector({});
+    const { emitted } = await postCheckSuiteCompleted(conn, ownPush);
+    expect(emitted?.type).toBe("pr.checks_passed");
+    expect(emitted.isDependencyPr).toBe(false);
+    expect(emitted.prNumber).toBe(31);
+    expect(emitted.headSha).toBe("b0b0b0");
+    expect(authorCalls).toEqual([["acme", "widgets", 31]]);
+  });
+
+  it("outranks the after-checks review settle for that PR (a review of our own PR is skipped anyway)", async () => {
+    const { conn } = gateConnector({ trigger: "after-checks" });
+    const { emitted } = await postCheckSuiteCompleted(conn, ownPush);
+    expect(emitted?.type).toBe("pr.checks_passed");
+    expect(emitted.isDependencyPr).toBe(false);
+  });
+
+  it("a human's green PR emits nothing new, and costs no author lookup", async () => {
+    const { conn, authorCalls } = gateConnector({});
+    const { json, emitted } = await postCheckSuiteCompleted(conn, {
+      conclusion: "success",
+      prNumber: 7,
+      commitAuthor: "Ada Lovelace",
+      commitMessage: "feat: something human",
+      headBranch: "feature/whatever",
+    });
+    expect(json.filtered).toBe(true);
+    expect(emitted).toBeNull();
+    expect(authorCalls).toEqual([]);
+  });
+
+  it("a human's green PR under after-checks still gets today's review settle", async () => {
+    const { conn } = gateConnector({ trigger: "after-checks" });
+    const { emitted } = await postCheckSuiteCompleted(conn, {
+      conclusion: "success",
+      prNumber: 7,
+      commitAuthor: "Ada Lovelace",
+      commitMessage: "feat: something human",
+      headBranch: "feature/whatever",
+    });
+    expect(emitted?.type).toBe("pr.checks_settled");
+  });
+
+  it("our commit on a HUMAN's PR is not the merge route — behaves as today", async () => {
+    const eager = gateConnector({ author: "ada" });
+    const a = await postCheckSuiteCompleted(eager.conn, ownPush);
+    expect(a.emitted).toBeNull();
+
+    const settled = gateConnector({ author: "ada", trigger: "after-checks" });
+    const b = await postCheckSuiteCompleted(settled.conn, ownPush);
+    expect(b.emitted?.type).toBe("pr.checks_settled");
+  });
+
+  it("a repo not on the Merges and autonomy lists behaves as today, with no author lookup", async () => {
+    const { conn, authorCalls } = gateConnector({ listed: false });
+    const { emitted } = await postCheckSuiteCompleted(conn, ownPush);
+    expect(emitted).toBeNull();
+    expect(authorCalls).toEqual([]);
+  });
+
+  it("a failed author lookup falls back to today's behaviour", async () => {
+    const { conn } = gateConnector({ author: new Error("502"), trigger: "after-checks" });
+    const { emitted } = await postCheckSuiteCompleted(conn, ownPush);
+    expect(emitted?.type).toBe("pr.checks_settled");
+  });
+
+  it("a red aggregate on our own PR still goes to the fix path", async () => {
+    const { conn, authorCalls } = gateConnector({ conclusion: "failing" });
+    const { emitted } = await postCheckSuiteCompleted(conn, ownPush);
+    expect(emitted?.type).toBe("pr.checks_failed");
+    expect(authorCalls).toEqual([]);
+  });
+
+  it("a green dependency PR keeps isDependencyPr:true", async () => {
+    const { conn, authorCalls } = gateConnector({});
+    const { emitted } = await postCheckSuiteCompleted(conn, {
+      conclusion: "success",
+      prNumber: 190,
+      commitAuthor: "dependabot[bot]",
+    });
+    expect(emitted?.type).toBe("pr.checks_passed");
+    expect(emitted.isDependencyPr).toBe(true);
+    expect(authorCalls).toEqual([]);
+  });
+
+  it("without the seams wired (standalone), our own green PR behaves as today", async () => {
+    const conn = new GitHubWebhookConnector({
+      port: 0,
+      webhookSecret: SECRET,
+      botLogin: BOT_LOGIN,
+      getChecksConclusion: async () => "passing" as const,
+    });
+    const { emitted } = await postCheckSuiteCompleted(conn, ownPush);
+    expect(emitted).toBeNull();
+  });
+});
+
 /** POST a signed `issue_comment` webhook; capture any emitted envelope. */
 async function postIssueComment(
   conn: GitHubWebhookConnector,

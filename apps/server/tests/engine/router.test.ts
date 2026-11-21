@@ -379,6 +379,30 @@ describe('routeEvent — pr.checks_passed', () => {
     );
     expect(result.action).toBe('ignore');
   });
+
+  it('routes a NON-dependency green PR (our own build PR) to the in-process merge gate', async () => {
+    mockClassifyComment.mockClear();
+    mockGetWorkflowByIntent.mockClear();
+    mockGetWorkflowByIntent.mockReturnValue({ name: 'dependabot-pr-merge' } as any);
+    const result = await routeEvent(
+      makeEnvelope({ type: 'pr.checks_passed', prNumber: 31, headSha: 'b0b0', isDependencyPr: false }),
+    );
+    expect(mockClassifyComment).not.toHaveBeenCalled();
+    expect(mockGetWorkflowByIntent).not.toHaveBeenCalled();
+    expect(result.action).toBe('handler');
+    if (result.action === 'handler') {
+      expect(result.handler).toBe('build-merge');
+      expect(result.context).toMatchObject({ prNumber: 31, headSha: 'b0b0', trigger: 'checks-settled' });
+    }
+  });
+
+  it('a dependency green PR keeps its dependabot-pr-merge route', async () => {
+    mockGetWorkflowByIntent.mockReturnValue({ name: 'dependabot-pr-merge' } as any);
+    const result = await routeEvent(
+      makeEnvelope({ type: 'pr.checks_passed', prNumber: 681, isDependencyPr: true }),
+    );
+    expect(result.action === 'handler' && result.handler).toBe('dependabot-pr-merge');
+  });
 });
 
 describe('routeEvent — comment.created', () => {
