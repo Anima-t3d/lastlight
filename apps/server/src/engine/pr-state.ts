@@ -601,29 +601,18 @@ function appSlug(deps: PrStateDeps): string | undefined {
 type PersistedPrState = Partial<PrState>;
 
 /**
- * Resolve the whole snapshot. Called ONCE per dispatch, at the
- * `dispatchWorkflow` choke point every route crosses.
+ * A snapshot with every field at its "not read" value — the starting point
+ * {@link resolvePrState} fills in.
  *
- * Never throws. Every live read is independently best-effort; a failure records
- * a line in {@link PrState.readErrors} and leaves the field at a value that
- * cannot itself cause a skip.
+ * Exported for a caller that needs only a FEW live fields and must not pay for
+ * the rest: the autonomous merge executor (`./build-merge.ts`) fills the PR and
+ * check fields itself and hands the result to a pure decision, which reads no
+ * derived field. The defaults are the inert ones, so a field it leaves alone
+ * cannot cause an action.
  */
-export async function resolvePrState(
-  owner: string,
-  repo: string,
-  prNumber: number,
-  deps: PrStateDeps,
-): Promise<PrState> {
-  const full = `${owner}/${repo}`;
-  const readErrors: string[] = [];
-  const note = (what: string, err: unknown) => {
-    const msg = err instanceof Error ? err.message : String(err);
-    readErrors.push(`${what}: ${msg}`);
-    log.warn("Read failed", { repo: full, prNumber, what, err });
-  };
-
-  const state: PrState = {
-    repo: full,
+export function emptyPrState(repo: string, prNumber: number): PrState {
+  return {
+    repo,
     prNumber,
     headSha: "",
     headAuthor: "",
@@ -665,7 +654,31 @@ export async function resolvePrState(
     costBaselineUsd: 0,
     assessedHeadShaByWorkflow: {},
     runInFlight: null,
-    readErrors,
+    readErrors: [],
+  };
+}
+
+/**
+ * Resolve the whole snapshot. Called ONCE per dispatch, at the
+ * `dispatchWorkflow` choke point every route crosses.
+ *
+ * Never throws. Every live read is independently best-effort; a failure records
+ * a line in {@link PrState.readErrors} and leaves the field at a value that
+ * cannot itself cause a skip.
+ */
+export async function resolvePrState(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  deps: PrStateDeps,
+): Promise<PrState> {
+  const full = `${owner}/${repo}`;
+  const state = emptyPrState(full, prNumber);
+  const readErrors = state.readErrors;
+  const note = (what: string, err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    readErrors.push(`${what}: ${msg}`);
+    log.warn("Read failed", { repo: full, prNumber, what, err });
   };
 
   const github = deps.github;

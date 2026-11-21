@@ -666,7 +666,7 @@ The freshest the board gets is a function of the TTL, and the highest-value leve
 ## 6. Outgoing webhooks
 
 Operator-configured endpoints (`webhooks:`, see `02-configuration.md`) receive
-a signed JSON POST on four discrete events. Nothing is sent per phase.
+a signed JSON POST on five discrete events. Nothing is sent per phase.
 
 | Event | When | Source |
 |---|---|---|
@@ -674,6 +674,7 @@ a signed JSON POST on four discrete events. Nothing is sent per phase.
 | `run.approval_requested` | A run pauses on an `approve` gate. Reply gates (the explore loop) are not sent. | approval observer, after `pauseForApproval` commits |
 | `run.finished` | Every terminal status: `succeeded`, `failed`, `cancelled`. A run restarted from the dashboard keeps its id and is not started again, so a receiver can see `failed` and later `succeeded` for one run with no `run.started` between. Sent once per run, status, retry and phases run: the store fires its terminal observers on each finish write, and a run is written finished twice (when its last phase ends, then by the workflow wrapper). | terminal observer |
 | `autonomy.held` | An autonomous dispatch was held by the usage check; once per (provider, window, reset). | build gate |
+| `run.merged` | The merge gate squash-merged a build run's PR (`autonomy.stages.*.on_merge: gate`). Carries the build run and `merge`. Sent once per merge; a receiver that does not know the type can ignore it. | merge gate (`engine/build-merge.ts`) |
 
 **Payload** (`src/notify/webhook/types.ts`):
 
@@ -687,7 +688,8 @@ a signed JSON POST on four discrete events. Nothing is sent per phase.
   "approval": { "gate", "summary", "approveCommand", "rejectCommand" },
   "result": { "status", "prUrl", "error" },
   "hold": { "provider", "window", "usedPct", "maxPercent", "resetsAt" },
-  "subject": { "repo", "issueNumber", "issueUrl" }
+  "subject": { "repo", "issueNumber", "issueUrl" },
+  "merge": { "prNumber", "prUrl", "sha" }
 }
 ```
 

@@ -47,6 +47,18 @@ describe("buildRunPayload", () => {
     expect(p.text).toContain("#42");
   });
 
+  it("run.merged carries the PR, the squash SHA and a fixed one-line text", () => {
+    const p = buildRunPayload("run.merged", run({ status: "succeeded" }), { merge: { prNumber: 12, sha: "abcdef1234567890" } }, ctx);
+    expect(p.type).toBe("run.merged");
+    expect(p.run).toMatchObject({ id: "run-1", workflow: "build", repo: "acme/widgets" });
+    expect(p.merge).toEqual({
+      prNumber: 12,
+      prUrl: "https://github.com/acme/widgets/pull/12",
+      sha: "abcdef1234567890",
+    });
+    expect(p.text).toBe("[run.merged] build run on acme/widgets#42 merged PR #12 as abcdef1.");
+  });
+
   it("gives each payload its own delivery id", () => {
     expect(buildRunPayload("run.started", run(), {}, ctx).deliveryId).not.toBe(
       buildRunPayload("run.started", run(), {}, ctx).deliveryId,

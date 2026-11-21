@@ -193,7 +193,8 @@ export async function finalizeBuildReviewForRun(
   if (!review || typeof review.approved !== "boolean") return null;
   try {
     const artifact = renderTemplate("{{artifactUrl reviewer-verdict.md}}", args.ctx).trim();
-    return await finalizeBuildReview(
+    const github = deps.github();
+    const rec = await finalizeBuildReview(
       {
         runId: args.runId,
         owner: args.ctx.owner,
@@ -204,12 +205,45 @@ export async function finalizeBuildReviewForRun(
         branch: typeof args.ctx.branch === "string" ? args.ctx.branch : "",
         reviewedHeadSha: typeof review.headSha === "string" && review.headSha ? review.headSha : undefined,
       },
-      { db: deps.db, github: deps.github(), botLogin: deps.botLogin },
+      { db: deps.db, github, botLogin: deps.botLogin },
     );
+    if (rec?.verdict === "APPROVED" && github && deps.botLogin) {
+      triggerMergeEvaluation(
+        { github, db: deps.db, botLogin: deps.botLogin },
+        `${args.ctx.owner}/${args.ctx.repo}`,
+        rec.prNumber,
+        args.runId,
+      );
+    }
+    return rec;
   } catch (err: unknown) {
     log.warn("Build review hook failed", { runId: args.runId, err });
     return null;
   }
+}
+
+/**
+ * The `build-finished` merge trigger: the record this hook just wrote is what
+ * the merge gate reads, so this is the first moment the gate can say yes.
+ * (A terminal-run observer would fire before the record exists.)
+ *
+ * Fire-and-forget: the run is already `succeeded`, and nothing the gate does
+ * may change that. A failure is logged; the 20-minute sweep is the retry.
+ */
+function triggerMergeEvaluation(
+  deps: { github: GitHubClient; db: StateDb; botLogin: string },
+  repo: string,
+  prNumber: number,
+  runId: string,
+): void {
+  // Imported lazily: the executor reaches the PR state machine and, through it,
+  // the sandbox modules — an edge this module (which the runner loads) must not
+  // grow, and one that would also close a cycle back to `readBuildReview`.
+  void import("./build-merge.js")
+    .then(({ evaluateBuildMerge }) => evaluateBuildMerge(deps, repo, prNumber, "build-finished"))
+    .catch((err: unknown) => {
+      log.warn("Merge evaluation after the build failed", { runId, repo, prNumber, err });
+    });
 }
 
 /**

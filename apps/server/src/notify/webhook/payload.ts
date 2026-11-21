@@ -58,6 +58,8 @@ export interface PayloadExtra {
   /** `autonomy.held` only: the issue that was held (there is no run yet). */
   repo?: string;
   issueNumber?: number;
+  /** `run.merged` only: the PR the merge gate merged and the squash commit SHA. */
+  merge?: { prNumber: number; sha: string };
 }
 
 export interface PayloadContext {
@@ -136,6 +138,21 @@ export function buildRunPayload(
         ...(extra.result?.error ? { error: extra.result.error } : {}),
       };
       payload.text = `[run.finished] ${workflow}run${where} ${status}.${payload.result.prUrl ? ` PR: ${payload.result.prUrl}` : ""}`;
+      break;
+    }
+    case "run.merged": {
+      const m = extra.merge;
+      const repo = payload.run?.repo;
+      if (m) {
+        payload.merge = {
+          prNumber: m.prNumber,
+          ...(repo && repo.includes("/") ? { prUrl: `https://github.com/${repo}/pull/${m.prNumber}` } : {}),
+          sha: m.sha,
+        };
+      }
+      payload.text = m
+        ? `[run.merged] ${workflow}run${where} merged PR #${m.prNumber} as ${m.sha.slice(0, 7)}.`
+        : `[run.merged] ${workflow}run${where} merged its PR.`;
       break;
     }
     case "autonomy.held": {

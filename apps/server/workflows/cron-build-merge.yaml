@@ -1,0 +1,16 @@
+kind: cron
+name: build-merge
+schedule: "*/20 * * * *"
+handler: build-merge
+
+# The merge gate's backstop. Host-side code, no agent: for every repo on BOTH
+# the Merges and autonomy lists it evaluates each open PR our bot opened, one
+# at a time, and merges only what `mayMergeBuild` approves (squash, pinned to
+# the reviewed head SHA).
+#
+# Deliberately NO `condition:` — it runs with webhooks enabled too. The two
+# real-time triggers (the green-settle webhook and the build's own finish hook)
+# can both be missed: a dropped delivery, a restart mid-run, or a
+# `mergeable_state` GitHub had not computed yet. Re-evaluating is safe: a PR
+# that changed nothing records nothing, posts nothing, and an already-merged PR
+# is closed and skipped. See `src/engine/build-merge.ts`.

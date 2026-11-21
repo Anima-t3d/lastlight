@@ -3,7 +3,12 @@ import { resolve } from "path";
 import { randomUUID } from "crypto";
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
-import { loadConfig, resolveModel, resolveVariant, resolveGithubAuth } from "./config/config.js";
+import {
+  loadConfig,
+  resolveModel,
+  resolveVariant,
+  resolveGithubAuth,
+} from "./config/config.js";
 import { ConnectorRegistry, GitHubWebhookConnector, SlackConnector, SessionManager, recordThreadMessageForThread } from "./connectors/index.js";
 import {
   dispatch,
@@ -86,6 +91,7 @@ import {
 import { installStageObserver } from "./engine/stage-observer.js";
 import { installWebhooks } from "./notify/webhook/emitter.js";
 import { configureUsageGate } from "./engine/usage-runtime.js";
+import { configureBuildMerge } from "./engine/build-merge.js";
 import { invalidateBoard } from "./admin/board-cache.js";
 import { refreshAutonomyRepos } from "./autonomy-repos.js";
 import { refreshMergeRepos } from "./merge-repos.js";
@@ -432,6 +438,8 @@ async function main() {
   if (webhookEmitter) logger("webhooks").info("Outgoing webhooks enabled", { endpoints: config.webhooks.length });
   // The usage gate announces a hold through the same emitter (`autonomy.held`).
   configureUsageGate({ emitter: webhookEmitter, botName: config.botName, dashboardBase: config.publicUrl });
+  // The merge gate announces a merge through the same emitter (`run.merged`).
+  configureBuildMerge({ emitter: webhookEmitter, botName: config.botName, dashboardBase: config.publicUrl });
 
   // Feedback signals recorded while telemetry was off carry no export watermark
   // (issue #255), so enabling OTel later can still put them on the traces they
@@ -1580,6 +1588,8 @@ async function main() {
   // nothing is exactly the failure mode this feature replaced.
   const cronHandlers = buildCronHandlers({
     db,
+    // The merge gate's 20-minute backstop (`cron-build-merge.yaml`).
+    buildMerge: github ? { github, botLogin: config.botLogin } : undefined,
     digest:
       github && slackConnector
         ? {

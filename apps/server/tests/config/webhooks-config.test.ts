@@ -51,7 +51,7 @@ describe("loadConfig — webhooks", () => {
     expect(loadConfig().webhooks).toEqual([
       { url: "http://127.0.0.1:8650/webhooks/x", secretEnv: "HOOK_SECRET", events: [...WEBHOOK_EVENT_TYPES], repos: [] },
     ]);
-    expect(WEBHOOK_EVENT_TYPES).toEqual(["run.started", "run.approval_requested", "run.finished", "autonomy.held"]);
+    expect(WEBHOOK_EVENT_TYPES).toEqual(["run.started", "run.approval_requested", "run.finished", "autonomy.held", "run.merged"]);
   });
 
   it("keeps a listed subset of events and repos", () => {

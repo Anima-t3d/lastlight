@@ -311,7 +311,7 @@ approval: {}
 # webhooks:
 #   - url: https://hooks.example.com/lastlight
 #     secretEnv: LASTLIGHT_WEBHOOK_SECRET   # env var holding the HMAC key (required, never inline)
-#     events: [run.started, run.approval_requested, run.finished, autonomy.held]   # default: all
+#     events: [run.started, run.approval_requested, run.finished, autonomy.held, run.merged]   # default: all
 #     repos: []                             # owner/repo filter; default: all repos
 #
 # Each POST carries X-Hub-Signature-256: sha256=<HMAC-SHA256(key, raw body)>,

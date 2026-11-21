@@ -43,7 +43,11 @@
  */
 
 import type { StateDb } from "../state/db.js";
+import type { GitHubClient } from "../engine/github/github.js";
 import { runRepoDigest, type RepoDigestDeps } from "./repo-digest.js";
+import { resolveCronRepos, CRON_GLOBALLY_ENABLED_KEY, CRON_NAME_KEY } from "./repo-crons.js";
+import { evaluateBuildMerge } from "../engine/build-merge.js";
+import { getMergeRepos, isAutonomousRepo } from "../config/config.js";
 import { logger } from "../logging/logger.js";
 import { recordActivity } from "../activity.js";
 import { isTriggerActorType } from "../state/db.js";
@@ -67,6 +71,11 @@ export interface CronHandlerDeps {
    * stayed broken.
    */
   digest?: RepoDigestDeps;
+  /**
+   * The merge gate's backstop sweep. `undefined` without a GitHub client
+   * (chat-only mode), in which case the cron is dropped with a warning.
+   */
+  buildMerge?: { github: GitHubClient; botLogin: string };
 }
 
 export function buildCronHandlers(deps: CronHandlerDeps): CronHandlerRegistry {
@@ -77,7 +86,86 @@ export function buildCronHandlers(deps: CronHandlerDeps): CronHandlerRegistry {
       runRepoDigest(digestDeps, context),
     );
   }
+  if (deps.buildMerge) {
+    const { github, botLogin } = deps.buildMerge;
+    registry[BUILD_MERGE_CRON] = withLedger(deps.db, BUILD_MERGE_CRON, (context) =>
+      runBuildMergeSweep({ github, db: deps.db, botLogin }, context),
+    );
+  }
   return registry;
+}
+
+// ── The merge gate's sweep ───────────────────────────────────────────────────
+
+/** The cron (and handler) name: `workflows/cron-build-merge.yaml`. */
+export const BUILD_MERGE_CRON = "build-merge";
+
+export interface BuildMergeSweepDeps {
+  github: GitHubClient;
+  db: StateDb;
+  botLogin: string;
+  /** Injectable for tests; defaults to the real executor. */
+  evaluate?: typeof evaluateBuildMerge;
+}
+
+/**
+ * One tick of the merge gate's backstop: every open PR our bot opened, in every
+ * repo on BOTH the Merges and autonomy lists, evaluated with trigger `sweep`.
+ *
+ * The repo list is the Merges list itself (GitHub's spelling, which is what the
+ * gate matches on), not the managed-repo list the tick carries; a repo's
+ * `crons.disable: [build-merge]` is still honoured. PRs are evaluated one at a
+ * time so a sweep never fans out a burst of merges, and each one's failure is
+ * caught so it cannot stop the rest. The tick fails AFTER the others are
+ * served if any repo or PR failed, so the cron ledger records it.
+ */
+export async function runBuildMergeSweep(
+  deps: BuildMergeSweepDeps,
+  context: Record<string, unknown>,
+): Promise<void> {
+  const evaluate = deps.evaluate ?? evaluateBuildMerge;
+  let repos = getMergeRepos().filter((r) => isAutonomousRepo(r));
+  const cron = typeof context[CRON_NAME_KEY] === "string" ? (context[CRON_NAME_KEY] as string) : undefined;
+  if (cron && repos.length > 0) {
+    repos = (
+      await resolveCronRepos({ cron, repos, globallyEnabled: context[CRON_GLOBALLY_ENABLED_KEY] !== false })
+    ).repos;
+  }
+  if (repos.length === 0) {
+    log.debug("No repo is on both the Merges and autonomy lists", { cron });
+    return;
+  }
+
+  let considered = 0;
+  const failed: string[] = [];
+  for (const repo of repos) {
+    const [owner, name] = repo.split("/");
+    let prs: Awaited<ReturnType<GitHubClient["listOpenPullRequests"]>>;
+    try {
+      prs = await deps.github.listOpenPullRequests(owner, name);
+    } catch (err: unknown) {
+      failed.push(repo);
+      log.error("Merge sweep could not list PRs", { repo, err });
+      continue;
+    }
+    for (const pr of prs.filter((p) => p.authorLogin === deps.botLogin)) {
+      considered++;
+      try {
+        const res = await evaluate({ github: deps.github, db: deps.db, botLogin: deps.botLogin }, repo, pr.number, "sweep");
+        log.debug("Merge sweep evaluated PR", { repo, prNumber: pr.number, ...res });
+      } catch (err: unknown) {
+        failed.push(`${repo}#${pr.number}`);
+        log.error("Merge sweep evaluation failed", { repo, prNumber: pr.number, err });
+      }
+    }
+  }
+  log.info("Merge sweep complete", { repos: repos.length, considered, failed: failed.length });
+  if (failed.length > 0) {
+    throw new Error(
+      `Merge sweep had ${failed.length} failure(s) across ${considered} PR(s) in ${repos.length} repo(s) ` +
+        `(${failed.join(", ")}) — see the errors above.`,
+    );
+  }
 }
 
 /**

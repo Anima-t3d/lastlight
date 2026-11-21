@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -13,6 +13,13 @@ import {
   recordBuildReview,
 } from "#src/engine/build-review.js";
 import { REVIEW_CHECK_NAME } from "#src/engine/review-check.js";
+
+// The merge executor is exercised in build-merge.test.ts; here only the hook's
+// call is asserted, so it is replaced wholesale.
+const { evaluateMerge } = vi.hoisted(() => ({
+  evaluateMerge: vi.fn(async () => ({ decision: "wait", reason: "x: y" })),
+}));
+vi.mock("#src/engine/build-merge.js", () => ({ evaluateBuildMerge: evaluateMerge }));
 
 vi.mock("#src/logging/logger.js", () => {
   const noopLogger = {
@@ -252,5 +259,74 @@ describe("readWorkspaceHead", () => {
     git("add", "f");
     git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c");
     expect(readWorkspaceHead({ sandboxDir }, "t1", "o", "r")).toBe(git("rev-parse", "HEAD"));
+  });
+});
+
+describe("finalizeBuildReviewForRun — the build-finished merge trigger", () => {
+  const ctx = {
+    owner: "o", repo: "r", branch: "lastlight/1-x", issueDir: ".lastlight/issue-1",
+    externalizeArtifacts: true, publicUrl: "https://dash",
+  } as any;
+  const ok = { success: true, prNumber: 9, review: { approved: true, cycles: 0, headSha: "head-after-push" } };
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  beforeEach(() => {
+    evaluateMerge.mockReset();
+    evaluateMerge.mockResolvedValue({ decision: "wait", reason: "x: y" });
+  });
+
+  it("evaluates the PR for merge after an APPROVED record is written", async () => {
+    const db = fakeDb();
+    const github = fakeGithub();
+    const rec = await finalizeBuildReviewForRun(
+      { workflowName: "build", result: ok, ctx, runId: "run-1" },
+      { db, github: () => github, ...botDeps },
+    );
+    await vi.waitFor(() => expect(evaluateMerge).toHaveBeenCalled());
+    expect(rec?.verdict).toBe("APPROVED");
+    expect(evaluateMerge).toHaveBeenCalledTimes(1);
+    expect(evaluateMerge).toHaveBeenCalledWith(
+      { github, db, botLogin: "last-light[bot]" },
+      "o/r",
+      9,
+      "build-finished",
+    );
+    // The record was already written when the evaluation started.
+    expect(db.runs.mergeScratch.mock.invocationCallOrder[0]).toBeLessThan(
+      evaluateMerge.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("does not evaluate after a REQUEST_CHANGES record", async () => {
+    const db = fakeDb();
+    await finalizeBuildReviewForRun(
+      { workflowName: "build", result: { ...ok, review: { approved: false, headSha: "head-after-push" } }, ctx, runId: "run-1" },
+      { db, github: () => fakeGithub(), ...botDeps },
+    );
+    await flush();
+    expect(evaluateMerge).not.toHaveBeenCalled();
+  });
+
+  it("does not evaluate when no record was written (approval not bound to the PR head)", async () => {
+    const db = fakeDb();
+    const rec = await finalizeBuildReviewForRun(
+      { workflowName: "build", result: { ...ok, review: { approved: true, headSha: "something-else" } }, ctx, runId: "run-1" },
+      { db, github: () => fakeGithub(), ...botDeps },
+    );
+    await flush();
+    expect(rec).toBeNull();
+    expect(evaluateMerge).not.toHaveBeenCalled();
+  });
+
+  it("a failing evaluation never fails the hook", async () => {
+    evaluateMerge.mockRejectedValue(new Error("boom"));
+    const db = fakeDb();
+    const rec = await finalizeBuildReviewForRun(
+      { workflowName: "build", result: ok, ctx, runId: "run-1" },
+      { db, github: () => fakeGithub(), ...botDeps },
+    );
+    await vi.waitFor(() => expect(evaluateMerge).toHaveBeenCalled());
+    await flush();
+    expect(rec?.verdict).toBe("APPROVED");
   });
 });

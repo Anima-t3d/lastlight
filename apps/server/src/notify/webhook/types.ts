@@ -1,7 +1,7 @@
 /**
  * Outgoing webhooks: Last Light POSTs a signed JSON payload to operator-listed
- * endpoints when a run starts, waits for an approval, finishes, or when an
- * autonomous dispatch is held. See spec/03-integrations.md ("Outgoing webhooks").
+ * endpoints when a run starts, waits for an approval, finishes, when an
+ * autonomous dispatch is held, or when the merge gate merges a build's PR. See spec/03-integrations.md ("Outgoing webhooks").
  *
  * Operator config only: the key is top-level `webhooks:`, which is not in
  * `repoConfig.allowKeys`, so a repo's `.lastlight/` can neither add an endpoint
@@ -16,6 +16,9 @@ export const WEBHOOK_EVENT_TYPES = [
   "run.approval_requested",
   "run.finished",
   "autonomy.held",
+  // Appended, never inserted: an endpoint with no `events:` list receives every
+  // type, and a receiver that switches on `type` ignores one it does not know.
+  "run.merged",
 ] as const;
 
 export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
@@ -55,6 +58,8 @@ export interface WebhookPayload {
   hold?: { provider: string; window: string; usedPct: number; maxPercent: number; resetsAt: string | null };
   /** For `autonomy.held`, which has no run yet: the held issue. */
   subject?: { repo: string; issueNumber?: number; issueUrl?: string };
+  /** For `run.merged`: the build PR the merge gate merged, and the squash commit. */
+  merge?: { prNumber: number; prUrl?: string; sha: string };
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
