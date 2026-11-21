@@ -37,6 +37,7 @@ import {
 } from "#src/config/config.js";
 import { makeTestDb } from "../helpers/state-db.js";
 import { resetAutonomyReposForTests } from "#src/autonomy-repos.js";
+import { resetMergeReposForTests } from "#src/merge-repos.js";
 
 const SECRET = "test-secret";
 /** A GitHub-OAuth session for `octocat` — carries a verified login. */
@@ -101,6 +102,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   resetAutonomyReposForTests();
+  resetMergeReposForTests();
   resetRuntimeConfigForTests();
   resetInstallationReposForTests();
   vi.restoreAllMocks();
@@ -319,5 +321,75 @@ describe("Managed repos — autonomous builds", () => {
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: "not a managed repo: a/nine" });
     expect((await db.activity.list()).total).toBe(0);
+  });
+});
+
+describe("Managed repos — autonomous merges", () => {
+  function config(approved: string[], autonomy: string[]): void {
+    setRuntimeConfig({
+      botName: "last-light",
+      managedRepos: approved,
+      requireRepoApproval: false,
+      autonomy: { ...defaultAutonomyConfig(), repos: autonomy },
+    } as unknown as LastLightConfig);
+  }
+
+  beforeEach(() => {
+    setInstallationRepos("1", ["a/one", "a/two", "a/three"]);
+  });
+
+  it("view reports an empty merge list by default", async () => {
+    config(["a/one"], ["a/one"]);
+    const { body } = await send("GET", "/managed-repos", { token: GITHUB_TOKEN });
+    expect(body.merge).toEqual([]);
+  });
+
+  it("merge toggle stores the repo, returns the view and writes one activity row", async () => {
+    config(["a/one", "a/two"], ["a/one"]);
+    const res = await send("POST", "/managed-repos/merge", {
+      token: GITHUB_TOKEN,
+      body: { repo: "a/one", enabled: true },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ merge: ["a/one"], autonomous: ["a/one"] });
+    const { activity, total } = await db.activity.list();
+    expect(total).toBe(1);
+    expect(activity[0]).toMatchObject({
+      action: "managed-repos.merge",
+      actorLogin: "octocat",
+      targetType: "managed-repos",
+      outcome: "ok",
+    });
+    expect(activity[0].detail).toEqual({ repo: "a/one", enabled: true });
+  });
+
+  it("merge toggle for a repo not on the autonomy list is 400 merge-requires-builds", async () => {
+    config(["a/one", "a/two"], ["a/one"]);
+    const res = await send("POST", "/managed-repos/merge", {
+      token: GITHUB_TOKEN,
+      body: { repo: "a/two", enabled: true },
+    });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: "merge-requires-builds" });
+    expect((await db.activity.list()).total).toBe(0);
+  });
+
+  it("merge toggle with a malformed body is 400", async () => {
+    config(["a/one"], ["a/one"]);
+    for (const body of [{ repo: "nope", enabled: true }, { repo: "a/one" }]) {
+      const res = await send("POST", "/managed-repos/merge", { token: GITHUB_TOKEN, body });
+      expect(res.status).toBe(400);
+    }
+    expect((await db.activity.list()).total).toBe(0);
+  });
+
+  it("turning Builds off drops the repo from the merge list in the view", async () => {
+    config(["a/one"], ["a/one"]);
+    await send("POST", "/managed-repos/merge", { token: GITHUB_TOKEN, body: { repo: "a/one", enabled: true } });
+    const res = await send("POST", "/managed-repos/autonomy", {
+      token: GITHUB_TOKEN,
+      body: { repo: "a/one", enabled: false },
+    });
+    expect(res.body).toMatchObject({ autonomous: [], merge: [] });
   });
 });

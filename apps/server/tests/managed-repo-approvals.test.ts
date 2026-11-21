@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { approveRepos, removeRepos, setRepoAutonomy, setRequireApproval } from "#src/managed-repo-approvals.js";
+import { approveRepos, removeRepos, setRepoAutonomy, setRepoMerge, setRequireApproval } from "#src/managed-repo-approvals.js";
 import { AUTONOMY_REPOS_SETTING_KEY, resetAutonomyReposForTests } from "#src/autonomy-repos.js";
+import { MERGE_REPOS_SETTING_KEY, resetMergeReposForTests } from "#src/merge-repos.js";
 import {
   getManagedRepos,
   getRepoApprovalState,
@@ -12,7 +13,9 @@ import {
 import {
   defaultAutonomyConfig,
   getAutonomyRepos,
+  getMergeRepos,
   isAutonomousRepo,
+  isMergeRepo,
   setRuntimeConfig,
   resetRuntimeConfigForTests,
   type LastLightConfig,
@@ -282,5 +285,102 @@ describe("managed-repo approvals — autonomy toggle", () => {
     config(["a/one", "a/two"], []);
     await Promise.all([setRepoAutonomy(db, "a/one", true), setRepoAutonomy(db, "a/two", true)]);
     expect((await db.getSetting(AUTONOMY_REPOS_SETTING_KEY))?.value).toEqual({ repos: ["a/one", "a/two"] });
+  });
+});
+
+describe("managed-repo approvals — merges", () => {
+  let db: StateDb;
+
+  function config(approved: string[], autonomy: string[]): void {
+    setRuntimeConfig({
+      managedRepos: approved,
+      requireRepoApproval: false,
+      autonomy: { ...defaultAutonomyConfig(), repos: autonomy },
+    } as unknown as LastLightConfig);
+  }
+
+  beforeEach(async () => {
+    db = await makeTestDb();
+    setInstallationRepos("1", ["a/one", "a/two", "a/three"]);
+  });
+
+  afterEach(() => {
+    resetAutonomyReposForTests();
+    resetMergeReposForTests();
+    resetRuntimeConfigForTests();
+    resetInstallationReposForTests();
+  });
+
+  it("is empty by default", () => {
+    config(["a/one"], ["a/one"]);
+    expect(getMergeRepos()).toEqual([]);
+    expect(isMergeRepo("a/one")).toBe(false);
+  });
+
+  it("enable stores the autonomy list's spelling, by actor", async () => {
+    config(["a/one"], ["a/one"]);
+    const res = await setRepoMerge(db, "A/One", true, "octocat");
+    expect(res).toEqual({ ok: true, repos: ["a/one"] });
+    const row = await db.getSetting(MERGE_REPOS_SETTING_KEY);
+    expect(row?.value).toEqual({ repos: ["a/one"] });
+    expect(row?.updatedBy).toBe("octocat");
+    expect(isMergeRepo("a/one")).toBe(true);
+    expect(isMergeRepo("A/One")).toBe(false);
+  });
+
+  it("enable for a repo not on the autonomy list is 400 merge-requires-builds and writes nothing", async () => {
+    config(["a/one", "a/two"], ["a/one"]);
+    const res = await setRepoMerge(db, "a/two", true);
+    expect(res).toEqual({ ok: false, status: 400, error: "merge-requires-builds" });
+    expect(await db.getSetting(MERGE_REPOS_SETTING_KEY)).toBeNull();
+  });
+
+  it("disable removes it; disabling an absent repo writes nothing", async () => {
+    config(["a/one", "a/two"], ["a/one", "a/two"]);
+    expect(await setRepoMerge(db, "a/two", false)).toEqual({ ok: true, repos: [] });
+    expect(await db.getSetting(MERGE_REPOS_SETTING_KEY)).toBeNull();
+    await setRepoMerge(db, "a/one", true);
+    await setRepoMerge(db, "a/two", true);
+    expect(await setRepoMerge(db, "A/Two", false)).toEqual({ ok: true, repos: ["a/one"] });
+    expect(isMergeRepo("a/two")).toBe(false);
+  });
+
+  it("turning Builds off drops the repo from merge", async () => {
+    config(["a/one", "a/two"], ["a/one", "a/two"]);
+    await setRepoMerge(db, "a/one", true);
+    await setRepoMerge(db, "a/two", true);
+    await setRepoAutonomy(db, "a/two", false);
+    expect(getMergeRepos()).toEqual(["a/one"]);
+    expect((await db.getSetting(MERGE_REPOS_SETTING_KEY))?.value).toEqual({ repos: ["a/one"] });
+  });
+
+  it("un-managing a repo drops it from both lists", async () => {
+    config(["a/one", "a/two"], ["a/one", "a/two"]);
+    await setRepoMerge(db, "a/two", true);
+    await removeRepos(db, ["a/two"], {});
+    expect(getAutonomyRepos()).toEqual(["a/one"]);
+    expect(getMergeRepos()).toEqual([]);
+  });
+
+  it("turning approval on drops merge for repos that are no longer managed", async () => {
+    config([], ["a/two"]);
+    await setRepoMerge(db, "a/two", true);
+    expect(isMergeRepo("a/two")).toBe(true);
+    await setRequireApproval(db, true);
+    expect(getMergeRepos()).toEqual([]);
+    await approveRepos(db, ["a/two"]);
+    expect(isMergeRepo("a/two")).toBe(false);
+  });
+
+  it("remove of a repo not in merge writes no merge row", async () => {
+    config(["a/one", "a/two"], ["a/one", "a/two"]);
+    await removeRepos(db, ["a/two"], {});
+    expect(await db.getSetting(MERGE_REPOS_SETTING_KEY)).toBeNull();
+  });
+
+  it("concurrent toggles do not lose updates", async () => {
+    config(["a/one", "a/two"], ["a/one", "a/two"]);
+    await Promise.all([setRepoMerge(db, "a/one", true), setRepoMerge(db, "a/two", true)]);
+    expect((await db.getSetting(MERGE_REPOS_SETTING_KEY))?.value).toEqual({ repos: ["a/one", "a/two"] });
   });
 });

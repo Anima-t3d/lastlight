@@ -11,6 +11,8 @@ import {
   followAppCount,
   followAppPhrase,
   isAutonomous,
+  isMerging,
+  mergeConfirmText,
   removeNeedsChoice,
   showGapSection,
   toggleConfirmText,
@@ -37,6 +39,7 @@ function view(over: Partial<ManagedRepos>): ManagedRepos {
     discoveryFailedAccounts: [],
     autonomous: [],
     autonomyStored: false,
+    merge: [],
     ...over,
   };
 }
@@ -118,5 +121,17 @@ describe("autonomous builds", () => {
     expect(autonomyConfirmText("a/one")).toBe(
       "A ready-for-agent label on a/one will start a build. Builds still wait at the approval gates and the build budget.",
     );
+  });
+});
+
+describe("autonomous merges", () => {
+  it("isMerging is an exact match, like the server", () => {
+    expect(isMerging(view({ merge: ["a/one"] }), "a/one")).toBe(true);
+    expect(isMerging(view({ merge: ["a/one"] }), "A/One")).toBe(false);
+    expect(isMerging(view({}), "a/one")).toBe(false);
+  });
+
+  it("the confirm text names the repo and what a merge needs", () => {
+    expect(mergeConfirmText("a/one")).toContain("a/one");
   });
 });

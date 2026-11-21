@@ -6,6 +6,11 @@ import {
   yamlAutonomyRepos,
 } from "./autonomy-repos.js";
 import {
+  MERGE_REPOS_SETTING_KEY,
+  normalizeMergeRepos,
+  setStoredMergeRepos,
+} from "./merge-repos.js";
+import {
   REPO_APPROVAL_SETTING_KEY,
   getInstallationDiscoveryFailures,
   getInstallationRepos,
@@ -69,11 +74,33 @@ async function saveAutonomy(db: SettingsDb, repos: string[], actor?: string): Pr
   setStoredAutonomyRepos({ repos });
 }
 
-/** Drop autonomy entries `keep` rejects; writes the row only when something was dropped. */
+/** The merge list a write starts from: the STORED row, else empty (there is no YAML list). */
+async function currentMerge(db: SettingsDb): Promise<string[]> {
+  const row = await db.getSetting<unknown>(MERGE_REPOS_SETTING_KEY);
+  return row ? normalizeMergeRepos(row.value).repos : [];
+}
+
+async function saveMerge(db: SettingsDb, repos: string[], actor?: string): Promise<void> {
+  await db.setSetting(MERGE_REPOS_SETTING_KEY, { repos }, actor);
+  setStoredMergeRepos({ repos });
+}
+
+/** Drop merge entries `keep` rejects; writes the row only when something was dropped. */
+async function pruneMerge(db: SettingsDb, keep: (repo: string) => boolean, actor?: string): Promise<void> {
+  const merge = await currentMerge(db);
+  const kept = merge.filter(keep);
+  if (kept.length !== merge.length) await saveMerge(db, kept, actor);
+}
+
+/**
+ * Drop autonomy entries `keep` rejects; writes the row only when something was
+ * dropped. Merges sit on top of Builds, so the same repos leave the merge list.
+ */
 async function pruneAutonomy(db: SettingsDb, keep: (repo: string) => boolean, actor?: string): Promise<void> {
   const autonomy = await currentAutonomy(db);
   const kept = autonomy.filter(keep);
   if (kept.length !== autonomy.length) await saveAutonomy(db, kept, actor);
+  await pruneMerge(db, keep, actor);
 }
 
 /** Writes run one at a time in this process, so two requests cannot interleave a read-modify-write. */
@@ -213,6 +240,40 @@ export function setRepoAutonomy(
     if (!has) return { ok: true, repos };
     const next = repos.filter((a) => !sameRepo(a, repo));
     await saveAutonomy(db, next, actor);
+    // Turning Builds off also turns Merges off.
+    await pruneMerge(db, (m) => !sameRepo(m, repo), actor);
+    return { ok: true, repos: next };
+  });
+}
+
+export type MergeResult = { ok: true; repos: string[] } | { ok: false; status: 400; error: string };
+
+/**
+ * Turn the autonomous merge gate on or off for one repo. Merges is a step on
+ * top of Builds, so enabling needs the repo on the autonomy list
+ * (`merge-requires-builds`). The entry is stored as the autonomy list spells it,
+ * which is GitHub's spelling (see {@link setRepoAutonomy}), because
+ * `isMergeRepo` is an exact match. A change that changes nothing stores no row.
+ */
+export function setRepoMerge(
+  db: SettingsDb,
+  repo: string,
+  enabled: boolean,
+  actor?: string,
+): Promise<MergeResult> {
+  return serialized(async () => {
+    const repos = await currentMerge(db);
+    if (enabled) {
+      const canonical = (await currentAutonomy(db)).find((a) => sameRepo(a, repo));
+      if (!canonical) return { ok: false, status: 400, error: "merge-requires-builds" };
+      if (repos.includes(canonical)) return { ok: true, repos };
+      const next = [...repos.filter((m) => !sameRepo(m, repo)), canonical];
+      await saveMerge(db, next, actor);
+      return { ok: true, repos: next };
+    }
+    if (!repos.some((m) => sameRepo(m, repo))) return { ok: true, repos };
+    const next = repos.filter((m) => !sameRepo(m, repo));
+    await saveMerge(db, next, actor);
     return { ok: true, repos: next };
   });
 }

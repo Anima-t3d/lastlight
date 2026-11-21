@@ -458,6 +458,8 @@ The block **ships inert**, and it is worth being precise about which key makes i
 
 **`autonomy.repos` can be overridden live from the dashboard.** Config → Managed repos has a per-repo *Builds* toggle on each approved repo. The first toggle copies the YAML list into a `harness_settings` row (`autonomy-repos`), and from then on that row is the allow-list the router, the dispatch gate and the board read, without a restart. Only a managed repo can be turned on, and it is stored as the managed list spells it, because the check stays an exact match. Removing a repo from the approved list also removes it from this list, so approving it again does not quietly turn its builds back on. A malformed row fails closed: only its valid entries count, never the YAML list. Everything else under `autonomy:` stays YAML-only.
 
+**The merge opt-in list is a second per-repo toggle, with no YAML counterpart.** Next to *Builds*, Config → Managed repos has a *Merges* toggle (`POST /managed-repos/merge`), stored as the `merge-repos` `harness_settings` row and empty until an operator turns a repo on. `isMergeRepo(repo)` is an exact `owner/repo` match, like `isAutonomousRepo`. Merges sits on top of Builds: enabling it for a repo that is not on the autonomy list is refused with `400 merge-requires-builds`, and turning Builds off, removing the repo, or turning approval on so the repo is no longer managed drops it from the merge list too.
+
 The four operator-only leaves are reported as `key-not-allowed`, the same code
 an operator narrowing `allowKeys` produces, because from the repo's side it is
 the same answer: this key is not yours to set. `minSettledChecks` is the

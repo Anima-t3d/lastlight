@@ -94,12 +94,14 @@ export const ACTIVITY_ACTIONS = [
    * "managed-repos"`, no `targetId`; `detail.repos` is the comma-joined list
    * (approve / remove, plus `whenEmpty` when the request named one), or
    * `detail.enabled` for the require-approval switch. `managed-repos.autonomy`
-   * (the per-repo Builds toggle) carries `detail.repo` and `detail.enabled`.
+   * (the per-repo Builds toggle) and `managed-repos.merge` (the Merges toggle)
+   * carry `detail.repo` and `detail.enabled`.
    */
   "managed-repos.approve",
   "managed-repos.remove",
   "managed-repos.require-approval",
   "managed-repos.autonomy",
+  "managed-repos.merge",
 ] as const;
 
 export type ActivityAction = (typeof ACTIVITY_ACTIONS)[number];

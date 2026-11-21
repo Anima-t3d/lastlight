@@ -240,6 +240,7 @@ describe("activity log — the write side", () => {
       "POST /managed-repos/remove",
       "POST /managed-repos/require-approval",
       "POST /managed-repos/autonomy",
+      "POST /managed-repos/merge",
     ]);
 
     /** Deliberately unlogged, with the reason. */

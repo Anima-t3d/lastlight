@@ -724,6 +724,31 @@ export function getAutonomyRepos(): string[] {
   return [...(autonomyReposOverride ?? getAutonomyConfig().repos)];
 }
 
+/**
+ * The dashboard's stored merge opt-in list (Config → Managed repos), set by
+ * `merge-repos.ts`. There is no YAML list: null = none stored = no repo merges.
+ */
+let mergeReposOverride: string[] | null = null;
+
+/** Set (or clear, with null) the stored merge list. Only `merge-repos.ts` calls this. */
+export function setMergeReposOverride(repos: string[] | null): void {
+  mergeReposOverride = repos ? [...repos] : null;
+}
+
+/** The merge opt-in list in effect: the stored list, else empty. A copy. */
+export function getMergeRepos(): string[] {
+  return [...(mergeReposOverride ?? [])];
+}
+
+/**
+ * Is `repo` ("owner/name") on the merge opt-in list? EXACT match, case as
+ * GitHub spells it — the same rule as {@link isAutonomousRepo}: merging is a
+ * decision per repository, never a pattern.
+ */
+export function isMergeRepo(repo: string): boolean {
+  return getMergeRepos().includes(repo);
+}
+
 // ── Packaged defaults, derived from config/default.yaml (issue #385) ─────────
 //
 // Every timeout default lives in `config/default.yaml` and NOWHERE else. The

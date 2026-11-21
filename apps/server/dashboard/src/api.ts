@@ -184,6 +184,8 @@ export interface ManagedRepos {
   autonomous: string[];
   /** The autonomy list comes from the stored setting, not the config file. */
   autonomyStored: boolean;
+  /** The merge opt-in list (autonomous merge gate): always a subset of `autonomous`. */
+  merge: string[];
   /** Accounts whose installation repo list failed to load; their repos are missing from `gap`. */
   discoveryFailedAccounts: string[];
 }
@@ -1636,6 +1638,12 @@ export const api = {
     }),
   setRepoAutonomy: (repo: string, enabled: boolean) =>
     reqAction<ManagedRepos>("/managed-repos/autonomy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repo, enabled }),
+    }),
+  setRepoMerge: (repo: string, enabled: boolean) =>
+    reqAction<ManagedRepos>("/managed-repos/merge", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ repo, enabled }),

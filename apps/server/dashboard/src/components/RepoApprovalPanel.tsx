@@ -4,6 +4,8 @@ import {
   autonomyConfirmText,
   followAppPhrase,
   isAutonomous,
+  isMerging,
+  mergeConfirmText,
   removeNeedsChoice,
   showGapSection,
   toggleConfirmText,
@@ -13,7 +15,8 @@ import {
  * Config → Managed repos, the writable part: the "Require repo approval"
  * switch, the approved list (remove) and the gap — repos the GitHub App can
  * see that are not approved (approve selected / all). Each approved repo also
- * has a Builds toggle: the autonomy allow-list (board + ready-for-agent builds).
+ * has a Builds toggle (the autonomy allow-list: board + ready-for-agent builds)
+ * and a Merges toggle (the merge opt-in list), which needs Builds on.
  *
  * Every write answers with the full `/managed-repos` view, which replaces the
  * pane's data via `onChange`, so what is shown is always the server's state.
@@ -39,6 +42,8 @@ export function RepoApprovalPanel({
   const [pendingToggle, setPendingToggle] = useState<boolean | null>(null);
   /** The repo whose autonomous builds are waiting on the enable confirm. */
   const [pendingAutonomy, setPendingAutonomy] = useState<string | null>(null);
+  /** The repo whose autonomous merges are waiting on the enable confirm. */
+  const [pendingMerge, setPendingMerge] = useState<string | null>(null);
 
   /**
    * Send a write and adopt the view it answers with. A 409 means this pane was
@@ -52,6 +57,7 @@ export function RepoApprovalPanel({
     setPendingRemove(null);
     setPendingToggle(null);
     setPendingAutonomy(null);
+    setPendingMerge(null);
     try {
       const next = await write();
       onChange(next);
@@ -83,7 +89,12 @@ export function RepoApprovalPanel({
 
   function setAutonomy(repo: string, enabled: boolean) {
     if (enabled) setPendingAutonomy(repo);
-    else void run(() => api.setRepoAutonomy(repo, false));
+    else void run(() => api.setRepoAutonomy(repo, false)); // the server drops Merges with it
+  }
+
+  function setMerge(repo: string, enabled: boolean) {
+    if (enabled) setPendingMerge(repo);
+    else void run(() => api.setRepoMerge(repo, false));
   }
 
   const gap = data.gap;
@@ -158,6 +169,19 @@ export function RepoApprovalPanel({
                         onChange={(e) => setAutonomy(r, e.target.checked)}
                       />
                       Builds
+                    </label>
+                    <label
+                      className="flex items-center gap-1 text-muted cursor-pointer"
+                      title="Autonomous merges (needs Builds on)"
+                    >
+                      <input
+                        type="checkbox"
+                        className="toggle toggle-xs"
+                        checked={isMerging(data, r)}
+                        disabled={busy || !isAutonomous(data, r)}
+                        onChange={(e) => setMerge(r, e.target.checked)}
+                      />
+                      Merges
                     </label>
                     <button className="btn btn-xs btn-ghost" disabled={busy} onClick={() => remove([r])}>
                       Remove
@@ -246,6 +270,22 @@ export function RepoApprovalPanel({
               label: "Turn on builds",
               className: "btn-primary",
               onClick: () => void run(() => api.setRepoAutonomy(pendingAutonomy, true)),
+            },
+          ]}
+        />
+      )}
+
+      {pendingMerge !== null && (
+        <Confirm
+          title={`Turn on autonomous merges for ${pendingMerge}?`}
+          body={mergeConfirmText(pendingMerge)}
+          busy={busy}
+          actions={[
+            { label: "Cancel", className: "btn-ghost", onClick: () => setPendingMerge(null) },
+            {
+              label: "Turn on merges",
+              className: "btn-primary",
+              onClick: () => void run(() => api.setRepoMerge(pendingMerge, true)),
             },
           ]}
         />

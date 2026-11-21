@@ -56,3 +56,16 @@ export function isAutonomous(data: ManagedRepos, repo: string): boolean {
 export function autonomyConfirmText(repo: string): string {
   return `A ready-for-agent label on ${repo} will start a build. Builds still wait at the approval gates and the build budget.`;
 }
+
+/**
+ * Is `repo` on the merge opt-in list (the autonomous merge gate)? An EXACT
+ * match, the same as the server's `isMergeRepo`.
+ */
+export function isMerging(data: ManagedRepos, repo: string): boolean {
+  return data.merge.includes(repo);
+}
+
+/** The confirm text for turning on autonomous merges for `repo`. */
+export function mergeConfirmText(repo: string): string {
+  return `Last Light may merge pull requests on ${repo} on its own once the merge gate's checks pass. Needs Builds on; turning Builds off turns this off.`;
+}
