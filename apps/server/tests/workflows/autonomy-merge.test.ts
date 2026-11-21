@@ -64,18 +64,20 @@ const AUTONOMOUS = { _stage: "build", _autonomous: true };
 
 describe("resolveAutonomyMerge — what becomes of the PR a build opens", () => {
   it("projects auto for an autonomous run whose stage asked for it", () => {
-    expect(resolveAutonomyMerge(AUTONOMOUS, stages("auto"))).toEqual({
+    expect(resolveAutonomyMerge(AUTONOMOUS, stages("auto"), false)).toEqual({
       configured: "auto",
       effective: "auto",
       auto: true,
+      gate: false,
     });
   });
 
   it("projects none for an autonomous run whose stage asked for none", () => {
-    expect(resolveAutonomyMerge(AUTONOMOUS, stages("none"))).toEqual({
+    expect(resolveAutonomyMerge(AUTONOMOUS, stages("none"), false)).toEqual({
       configured: "none",
       effective: "none",
       auto: false,
+      gate: false,
     });
   });
 
@@ -85,8 +87,8 @@ describe("resolveAutonomyMerge — what becomes of the PR a build opens", () => 
     // scores dependency bumps only, so there is nothing to score a feature PR
     // with and the conservative branch is the honest one. It is still RECORDED
     // on `configured`, which is what distinguishes it from a plain `none`.
-    const low = resolveAutonomyMerge(AUTONOMOUS, stages("auto-low-impact"));
-    const none = resolveAutonomyMerge(AUTONOMOUS, stages("none"));
+    const low = resolveAutonomyMerge(AUTONOMOUS, stages("auto-low-impact"), false);
+    const none = resolveAutonomyMerge(AUTONOMOUS, stages("none"), false);
     expect(low.effective).toBe("none");
     expect(low.auto).toBe(false);
     expect(low.effective).toBe(none.effective);
@@ -99,36 +101,69 @@ describe("resolveAutonomyMerge — what becomes of the PR a build opens", () => 
     // THE invariant of this phase. A comment-triggered build carries no stage
     // markers at all, so the operator's pipeline policy does not reach it: they
     // opted a pipeline into auto-merge, not every build anyone can ask for.
-    expect(resolveAutonomyMerge({}, stages("auto"))).toEqual({
+    expect(resolveAutonomyMerge({}, stages("auto"), false)).toEqual({
       configured: "none",
       effective: "none",
       auto: false,
+      gate: false,
     });
-    expect(resolveAutonomyMerge(undefined, stages("auto"))).toEqual({
+    expect(resolveAutonomyMerge(undefined, stages("auto"), false)).toEqual({
       configured: "none",
       effective: "none",
       auto: false,
+      gate: false,
     });
     // A run carrying only unrelated dispatch context is equally not autonomous.
-    expect(resolveAutonomyMerge({ prNumber: 7, _explicitRequest: true }, stages("auto")).auto).toBe(
+    expect(resolveAutonomyMerge({ prNumber: 7, _explicitRequest: true }, stages("auto"), false).auto).toBe(
       false,
     );
   });
 
   it("coerces an unknown or malformed on_merge to none", () => {
     for (const garbage of ["AUTO", "yes", "", null, undefined, 1, {}, ["auto"], true]) {
-      const got = resolveAutonomyMerge(AUTONOMOUS, stages(garbage));
+      const got = resolveAutonomyMerge(AUTONOMOUS, stages(garbage), false);
       expect(got.effective, `on_merge=${JSON.stringify(garbage)}`).toBe("none");
       expect(got.auto).toBe(false);
       expect(got.configured).toBe("none");
     }
     // A stage that is not in the map at all, and a garbage stage map.
-    expect(resolveAutonomyMerge({ _stage: "nope" }, stages("auto")).auto).toBe(false);
-    expect(resolveAutonomyMerge(AUTONOMOUS, {}).auto).toBe(false);
+    expect(resolveAutonomyMerge({ _stage: "nope" }, stages("auto"), false).auto).toBe(false);
+    expect(resolveAutonomyMerge(AUTONOMOUS, {}, false).auto).toBe(false);
   });
 
   it("stays inert on the packaged config — `on_merge: none` ships", () => {
-    expect(resolveAutonomyMerge(AUTONOMOUS, defaultAutonomyConfig().stages).auto).toBe(false);
+    expect(resolveAutonomyMerge(AUTONOMOUS, defaultAutonomyConfig().stages, false).auto).toBe(false);
+  });
+});
+
+
+describe("resolveAutonomyMerge — on_merge: gate", () => {
+  it("gate + autonomous + repo on the Merges list -> effective gate", () => {
+    expect(resolveAutonomyMerge(AUTONOMOUS, stages("gate"), true)).toEqual({
+      configured: "gate",
+      effective: "gate",
+      auto: false,
+      gate: true,
+    });
+  });
+
+  it("gate + repo NOT on the Merges list -> none (configured is still recorded)", () => {
+    expect(resolveAutonomyMerge(AUTONOMOUS, stages("gate"), false)).toEqual({
+      configured: "gate",
+      effective: "none",
+      auto: false,
+      gate: false,
+    });
+  });
+
+  it("a human build never gets the gate, even when listed", () => {
+    expect(resolveAutonomyMerge({}, stages("gate"), true).gate).toBe(false);
+    expect(resolveAutonomyMerge(undefined, stages("gate"), true).effective).toBe("none");
+  });
+
+  it("listing a repo does not turn auto or none into a gate", () => {
+    expect(resolveAutonomyMerge(AUTONOMOUS, stages("none"), true).gate).toBe(false);
+    expect(resolveAutonomyMerge(AUTONOMOUS, stages("auto"), true)).toMatchObject({ auto: true, gate: false });
   });
 });
 

@@ -10,6 +10,8 @@ import {
   defaultReviewConfig,
   effectiveGate,
   getAutonomyConfig,
+  isAutonomousRepo,
+  isMergeRepo,
   getBotName,
   getGateConfig,
   getRuntimeConfig,
@@ -888,6 +890,8 @@ export interface AutonomyMergeContext {
   effective: AutonomyMerge;
   /** `effective === "auto"`, as a boolean the prompt's `{{#if}}` arm can test. */
   auto: boolean;
+  /** `effective === "gate"`: the autonomous merge gate owns this PR's merge. */
+  gate: boolean;
 }
 
 /** The inert answer: park the PR, say nothing about merging. */
@@ -895,10 +899,11 @@ const NO_AUTONOMY_MERGE: AutonomyMergeContext = {
   configured: "none",
   effective: "none",
   auto: false,
+  gate: false,
 };
 
 function isAutonomyMerge(raw: unknown): raw is AutonomyMerge {
-  return raw === "none" || raw === "auto" || raw === "auto-low-impact";
+  return raw === "none" || raw === "auto" || raw === "auto-low-impact" || raw === "gate";
 }
 
 /**
@@ -920,6 +925,13 @@ function isAutonomyMerge(raw: unknown): raw is AutonomyMerge {
  * `_autonomyGates` does) and treat anything unrecognised as not-autonomous —
  * every unknown here has to fail toward "a human merges it".
  *
+ * `gate` is the autonomous merge gate: it is effective only for an autonomous
+ * run on a repo that is on BOTH the autonomy list and the Merges list.
+ * `mergeListed` is that intersection, computed by the CALLER
+ * (`isMergeRepo(r) && isAutonomousRepo(r)`) because the Merges-subset-of-autonomy
+ * invariant is enforced at write time only; passing a boolean keeps this pure.
+ * Anything else reads as `none`, with `configured` still recording the ask.
+ *
  * `auto-low-impact` is ACCEPTED, RECORDED, and behaves exactly as `none`. There
  * is no impact signal for a feature PR today — `dependencies.autoMergeMaxImpact`
  * scores dependency bumps and nothing else — and the honest response to a
@@ -931,6 +943,7 @@ function isAutonomyMerge(raw: unknown): raw is AutonomyMerge {
 export function resolveAutonomyMerge(
   extra: Record<string, unknown> | undefined,
   stages: Record<string, AutonomyStageConfig>,
+  mergeListed: boolean,
 ): AutonomyMergeContext {
   const stage = extra?._stage;
   const stageName = typeof stage === "string" && stage.trim() !== "" ? stage : undefined;
@@ -942,8 +955,9 @@ export function resolveAutonomyMerge(
 
   const raw = stageName === undefined ? undefined : stages[stageName]?.on_merge;
   const configured: AutonomyMerge = isAutonomyMerge(raw) ? raw : "none";
-  const effective: AutonomyMerge = configured === "auto" ? "auto" : "none";
-  return { configured, effective, auto: effective === "auto" };
+  const effective: AutonomyMerge =
+    configured === "auto" ? "auto" : configured === "gate" && mergeListed ? "gate" : "none";
+  return { configured, effective, auto: effective === "auto", gate: effective === "gate" };
 }
 
 function numberFromExtra(
@@ -1197,7 +1211,12 @@ async function runSimpleWorkflowBody(
   // opens. Read from the operator's config (the gate hands back gates, not a
   // merge policy) and keyed on the same dispatch markers, so an `@bot build`
   // and an autonomous build of the same issue differ here too.
-  const autonomyMerge = resolveAutonomyMerge(request.extra, getAutonomyConfig().stages);
+  const mergeRepo = `${owner}/${repo}`;
+  const autonomyMerge = resolveAutonomyMerge(
+    request.extra,
+    getAutonomyConfig().stages,
+    isMergeRepo(mergeRepo) && isAutonomousRepo(mergeRepo),
+  );
   if (autonomyMerge.configured !== autonomyMerge.effective) {
     // The one case where the two disagree. Logged rather than silently
     // downgraded: an operator who asked for `auto-low-impact` and got a parked

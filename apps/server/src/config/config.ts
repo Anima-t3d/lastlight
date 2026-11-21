@@ -26,6 +26,7 @@ import { installProviderOverrides } from "./provider-registry.js";
 import { HOST_READABLE_WORKSPACE } from "../workflows/handlers/host-repo-dir.js";
 import type { SandboxBackend, BuildAssetsLocation, OtelConfig } from "lastlight-workflow-engine";
 import { logger } from "../logging/logger.js";
+import { getCachedRepoLayer } from "./repo-config.js";
 import type { UsageGateConfig } from "../engine/usage-gate.js";
 import {
   assertWebhookSecrets,
@@ -353,6 +354,8 @@ export interface LastLightConfig {
    */
   fix: FixConfig;
   dependencies: DependenciesConfig;
+  /** The autonomous merge gate's policy — see {@link MergeConfig}. */
+  merge: MergeConfig;
   concurrency: { maxWorkflows: number; maxQueueWaitMs: number };
   /**
    * Sandbox-workspace reaping (issue #106). The harness owns cleanup of the
@@ -579,7 +582,7 @@ export interface AutonomyStageConfig {
    * `auto-low-impact` is NOT IMPLEMENTED — there is no impact signal for a
    * feature PR today, so it is recorded and behaves as `none`.
    */
-  on_merge: "none" | "auto" | "auto-low-impact";
+  on_merge: "none" | "auto" | "auto-low-impact" | "gate";
 }
 
 /**
@@ -708,6 +711,98 @@ export function isAutonomousRepo(repo: string): boolean {
   return getAutonomyRepos().includes(repo);
 }
 
+// ---------------------------------------------------------------------------
+// merge: — the autonomous merge gate's policy
+// ---------------------------------------------------------------------------
+
+/**
+ * Policy for the autonomous merge gate (`autonomy.stages.*.on_merge: gate`).
+ *
+ * Resolved operator -> repo by {@link resolveMergeConfig}, and a repo layer can
+ * only TIGHTEN: it adds protected paths and hold labels, and can raise
+ * `minSettledChecks`, never lower it. `method` is not configurable.
+ */
+export interface MergeConfig {
+  method: "squash";
+  /** The gate needs >= N settled checks on the head SHA before it merges. */
+  minSettledChecks: number;
+  /** A PR touching any of these globs is never merged by the gate. */
+  protectedPaths: string[];
+  /** A PR carrying any of these labels is never merged by the gate. */
+  holdLabels: string[];
+}
+
+/** Paths no repo layer can drop from {@link MergeConfig.protectedPaths}. */
+const DEFAULT_PROTECTED_PATHS = [".github/**", ".lastlight/**", "**/CODEOWNERS"];
+
+/** The shipped `merge:` block. Mirrors `merge:` in `config/default.yaml`. */
+export function defaultMergeConfig(): MergeConfig {
+  return {
+    method: "squash",
+    minSettledChecks: 1,
+    protectedPaths: [...DEFAULT_PROTECTED_PATHS],
+    holdLabels: ["do-not-merge"],
+  };
+}
+
+/** Non-empty trimmed strings of an array; anything else yields `[]`. */
+function mergeStringList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => v.trim());
+}
+
+/** `base` followed by the entries of `extra` it does not already hold. */
+function unionList(base: string[], extra: string[]): string[] {
+  return [...base, ...extra.filter((v) => !base.includes(v))];
+}
+
+/**
+ * Fold `layer` (a raw operator or repo `merge:` node) onto `base`, tighten-only:
+ * lists are unioned, `minSettledChecks` is `max(base, layer)`, `method` is fixed.
+ * Pure and total — garbage in a layer is ignored.
+ */
+export function resolveMergeConfig(base: MergeConfig, layer: unknown): MergeConfig {
+  const node = isPlainObject(layer) ? layer : {};
+  const min = node.minSettledChecks;
+  return {
+    method: "squash",
+    minSettledChecks:
+      typeof min === "number" && Number.isFinite(min) && min >= 0
+        ? Math.max(base.minSettledChecks, min)
+        : base.minSettledChecks,
+    protectedPaths: unionList(base.protectedPaths, mergeStringList(node.protectedPaths)),
+    holdLabels: unionList(base.holdLabels, mergeStringList(node.holdLabels)),
+  };
+}
+
+/**
+ * The operator's `merge:` block. Unlike a repo layer it may set
+ * `minSettledChecks` freely (including 0 — the escape hatch for a deployment
+ * with no CI), but the protected-path defaults are always kept.
+ */
+function normalizeMergeConfig(raw: unknown): MergeConfig {
+  const defaults = defaultMergeConfig();
+  const node = isPlainObject(raw) ? raw : {};
+  const min = nonNegativeNumber(node.minSettledChecks);
+  return {
+    ...resolveMergeConfig(defaults, node),
+    minSettledChecks: min ?? defaults.minSettledChecks,
+  };
+}
+
+/**
+ * The merge gate's effective policy for `repo` ("owner/name"): the operator's
+ * block with the repo's cached `.lastlight/` `merge:` node folded on, tighten
+ * only. No network — a repo whose layer is not cached yet gets the operator's
+ * policy, which is the stricter-or-equal answer by construction.
+ */
+export function getMergeConfig(repo?: string): MergeConfig {
+  const operator = currentConfig?.merge ?? defaultMergeConfig();
+  if (!repo) return operator;
+  const layer = getCachedRepoLayer(repo)?.config?.merge;
+  return resolveMergeConfig(operator, layer);
+}
+
 /**
  * The dashboard's stored autonomy list (Config → Managed repos), set by
  * `autonomy-repos.ts`; null = none stored, so YAML `autonomy.repos` applies.
@@ -815,9 +910,9 @@ function packagedAutonomy(): AutonomyConfig {
   }
 }
 
-/** The three legal `on_merge` values; anything else is coerced to `none`. */
+/** The four legal `on_merge` values; anything else is coerced to `none`. */
 function isAutonomyMerge(raw: unknown): raw is AutonomyStageConfig["on_merge"] {
-  return raw === "none" || raw === "auto" || raw === "auto-low-impact";
+  return raw === "none" || raw === "auto" || raw === "auto-low-impact" || raw === "gate";
 }
 
 /** A trimmed string, or `""` when the value is not a usable string at all. */
@@ -1382,6 +1477,7 @@ export function loadConfig(): LastLightConfig {
     sandboxTimeouts: fileCfg.sandboxTimeouts,
     fix: fileCfg.fix,
     dependencies: fileCfg.dependencies,
+    merge: fileCfg.merge,
     concurrency: fileCfg.concurrency,
     cleanup: fileCfg.cleanup,
     feedback: fileCfg.feedback,
@@ -1428,6 +1524,7 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
   sandboxTimeouts: SandboxTimeoutsConfig;
   fix: FixConfig;
   dependencies: DependenciesConfig;
+  merge: MergeConfig;
   otel: OtelConfig;
   concurrency: { maxWorkflows: number; maxQueueWaitMs: number };
   cleanup: { sandbox: SandboxCleanupConfig };
@@ -1905,6 +2002,7 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
     sandboxTimeouts,
     fix,
     dependencies,
+    merge: normalizeMergeConfig(raw.merge),
     otel: normalizeOtelFileConfig(otelRaw),
     concurrency: { maxWorkflows, maxQueueWaitMs },
     cleanup: { sandbox: sandboxCleanup },

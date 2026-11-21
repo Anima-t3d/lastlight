@@ -850,6 +850,9 @@ autonomy:
       #                    (`dependencies.autoMergeMaxImpact` scores dependency
       #                    bumps and nothing else). The value is accepted and
       #                    recorded, and behaves as `none` until one exists.
+      #   gate             hand the PR to the autonomous merge gate (see `merge:`
+      #                    below). Acts only for a repo on BOTH `autonomy.repos`
+      #                    and the dashboard's per-repo Merges list; otherwise `none`.
       on_merge: none
   # Bounds on the pipeline as a whole, enforced at the DISPATCH GATE — before a
   # run starts, never mid-flight — and EVERY refusal is recorded, so "a quiet
@@ -915,6 +918,21 @@ dependencies:
   requireSettledChecks: true   # enforce settled-"passing" on ALL routes (webhook, cron, comment)
   minSettledChecks: 1          # an auto-merge decision needs >= N settled checks; 0 = legacy behaviour
   auditComment: true           # post the evidence comment when auto-merging a major
+
+# The autonomous merge gate's policy (`autonomy.stages.*.on_merge: gate`).
+# Operator-set; a repo's `.lastlight/` layer may only TIGHTEN it: it adds to
+# `protectedPaths` / `holdLabels` (unioned with these defaults, never replacing
+# them) and may raise `minSettledChecks`, never lower it. The method is always
+# `squash` and is not configurable.
+merge:
+  method: squash
+  minSettledChecks: 1          # the gate needs >= N settled checks on the head SHA
+  protectedPaths:              # a PR touching any of these is never gate-merged
+    - ".github/**"
+    - ".lastlight/**"
+    - "**/CODEOWNERS"
+  holdLabels:                  # a PR carrying any of these is never gate-merged
+    - do-not-merge
 
 # Which crons participate (issue #180). The SAME block is valid here, in your
 # overlay's config.yaml, and in a managed repo's .lastlight/lastlight.yml — the
