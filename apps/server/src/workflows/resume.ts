@@ -1,7 +1,7 @@
 import { isOwnedRun, type StateDb, type WorkflowRun } from "../state/db.js";
 import type { ExecutorConfig } from "../engine/github/profiles.js";
 import type { GitHubClient } from "../engine/github/github.js";
-import type { ModelConfig, VariantConfig } from "../config/config.js";
+import { getRuntimeConfig, type ModelConfig, type VariantConfig } from "../config/config.js";
 import { finalizeBuildReviewForRun } from "../engine/build-review.js";
 import { runWorkflow, type ApprovalGateConfig, type RunnerCallbacks } from "./runner.js";
 import { getWorkflow } from "./loader.js";
@@ -531,7 +531,7 @@ export async function resumeSimpleRun(run: WorkflowRun, opts: ResumeOptions): Pr
           runId: run.id,
           runUrl: runDashboardUrl(opts.publicUrl, run.id, run.workflowName),
         },
-        { db: opts.db, github: () => github },
+        { db: opts.db, github: () => github, botLogin: getRuntimeConfig()?.botLogin },
       );
     } else if (result.backpressure) {
       // Same backpressure requeue as the fresh-dispatch path: a promoted run

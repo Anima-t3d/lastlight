@@ -58,6 +58,8 @@ import type { ProgressReporter } from "../notify/types.js";
 import { collapseDetail } from "../notify/render.js";
 import { markRunLive } from "./live-runs.js";
 import { nextNotBefore } from "./usage-wait.js";
+import { PhaseRef } from "./phase-ref.js";
+import { readWorkspaceHead } from "../engine/build-review.js";
 
 // `isTerminated` used to live here; re-exported for API stability.
 export { isTerminated };
@@ -443,7 +445,21 @@ async function runWorkflowBody(
   const notify = callbacks.postComment || (async () => {});
   const reporter = callbacks.reporter;
   const onStart = callbacks.onPhaseStart || (async () => {});
-  const onEnd = callbacks.onPhaseEnd || (async () => {});
+  const callbackOnEnd = callbacks.onPhaseEnd || (async () => {});
+  // The commit each review pass of the reviewer loop judged. The LAST pass wins,
+  // and it is read at the end of that pass — before the `pr` phase can push
+  // anything the reviewer never saw. See `engine/build-review.ts`.
+  const reviewerLoop = definition.phases.find((p) => p.output_var === "review" && p.loop);
+  let reviewedHead: string | undefined;
+  const onEnd = async (phase: string, result: PhaseResult): Promise<void> => {
+    await callbackOnEnd(phase, result);
+    if (!reviewerLoop) return;
+    const ref = PhaseRef.parse(phase);
+    if (ref.base !== reviewerLoop.name || (ref.kind !== "phase" && ref.kind !== "recheck")) return;
+    reviewedHead = result.success
+      ? readWorkspaceHead(config, taskId, String(ctx.owner), String(ctx.repo))
+      : undefined;
+  };
 
   // Terminal step key — dynamic loop steps (re-review / fix cycles) are
   // inserted just above it so the checklist reads top-to-bottom in run order.
@@ -802,7 +818,9 @@ async function runWorkflowBody(
     // `review` is the reviewer loop's `{ approved, cycles }` output var, surfaced
     // so the caller that owns the GitHub client can record the build review
     // (`engine/build-review.ts`). Absent for every workflow without one.
-    const withReview = outputs.review ? { ...result, review: outputs.review } : result;
+    const withReview = outputs.review
+      ? { ...result, review: { ...(outputs.review as object), headSha: reviewedHead } }
+      : result;
     return quota.hit ? { ...withReview, backpressure: true, ...(quota.notBefore ? { notBefore: quota.notBefore } : {}) } : withReview;
   } catch (err) {
     // A hard phase failure — notably a single-phase workflow (e.g. issue-triage)

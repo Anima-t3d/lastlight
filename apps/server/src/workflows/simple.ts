@@ -1686,7 +1686,7 @@ async function runSimpleWorkflowBody(
           runId: workflowId,
           runUrl: runDashboardUrl(callbacks.publicUrl, workflowId, workflowName),
         },
-        { db, github: () => resolveReviewGitHubClient(config) },
+        { db, github: () => resolveReviewGitHubClient(config), botLogin: getRuntimeConfig()?.botLogin },
       );
       reapOnSuccess(workflowName, taskId, config);
     } else if (result.backpressure) {

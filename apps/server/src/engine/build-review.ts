@@ -16,6 +16,10 @@ import type { StateDb } from "../state/db.js";
 import type { WorkflowRun } from "../state/workflow-run-store.js";
 import type { GitHubClient } from "./github/github.js";
 import { renderTemplate, type TemplateContext } from "lastlight-workflow-engine";
+import { dirname } from "node:path";
+import type { ExecutorConfig } from "lastlight-workflow-engine";
+import { hostGit, sanitizeCheckout } from "./host-git.js";
+import { resolveHostRepoDir } from "../workflows/handlers/host-repo-dir.js";
 import { REVIEW_CHECK_NAME } from "./review-check.js";
 import { logger } from "../logging/logger.js";
 
@@ -67,31 +71,69 @@ export interface FinalizeBuildReviewArgs {
   runId: string;
   owner: string;
   repo: string;
-  /** The PR the `pr` phase opened. */
+  /** The PR the `pr` phase claims to have opened — agent-supplied, so verified. */
   prNumber: number;
   /** The reviewer loop's `output_var` verdict (`review.approved`). */
   approved: boolean;
   verdictUrl: string;
+  /** The branch this run built and pushed; the PR's head must be exactly it. */
+  branch: string;
+  /** The workspace HEAD the reviewer's final pass reviewed. */
+  reviewedHeadSha?: string;
 }
 
 /**
  * Record the build review against the PR head and post the check there.
  *
+ * Two bindings keep the record honest, because the merge gate acts on it
+ * unattended:
+ *
+ * 1. The PR number comes from the agent's `pr` phase output, so the PR is
+ *    fetched and must be THIS build's: head ref equals the run's branch, head
+ *    repo is the target repo (not a fork), author is our bot, base is the
+ *    default branch. Otherwise nothing is recorded or posted.
+ * 2. An approval is a statement about the commit the reviewer saw. The `pr`
+ *    phase can push more, so an APPROVED verdict is recorded only when the PR
+ *    head equals the captured reviewed SHA (a missing capture also refuses).
+ *    REQUEST_CHANGES carries no authority and is recorded either way.
+ *
  * Never throws: a failure to record or post must not fail a run that already
- * succeeded. The gate fails closed on a missing record, so losing one costs a
- * human merge, not safety. The record is written before the check is posted, so
- * a failed post still leaves the gate its evidence.
+ * succeeded. The gate fails closed on a missing record. The record is written
+ * before the check is posted, so a failed post still leaves the gate its evidence.
  */
 export async function finalizeBuildReview(
   args: FinalizeBuildReviewArgs,
-  deps: { db: StateDb; github: GitHubClient | null },
+  deps: { db: StateDb; github: GitHubClient | null; botLogin?: string },
 ): Promise<BuildReviewRecord | null> {
   const { github, db } = deps;
   if (!github || !args.prNumber) return null;
   const verdict = args.approved ? "APPROVED" : "REQUEST_CHANGES";
+  const ctx = { runId: args.runId, prNumber: args.prNumber };
   try {
-    const reviewedSha = await github.getPullRequestHeadSha(args.owner, args.repo, args.prNumber);
-    if (!reviewedSha) return null;
+    const refuse = (reason: string): null => {
+      log.warn("Not recording build review", { ...ctx, reason });
+      return null;
+    };
+    if (!args.branch) return refuse("the run's branch is unknown");
+    if (!deps.botLogin) return refuse("the bot login is unknown");
+    const pr = await github.getPullRequest(args.owner, args.repo, args.prNumber);
+    if (pr.head?.ref !== args.branch) return refuse(`PR head ref ${pr.head?.ref} is not the run branch ${args.branch}`);
+    if (pr.head?.repo?.full_name?.toLowerCase() !== `${args.owner}/${args.repo}`.toLowerCase()) {
+      return refuse(`PR head repo ${pr.head?.repo?.full_name} is not ${args.owner}/${args.repo}`);
+    }
+    if (pr.user?.login !== deps.botLogin) return refuse(`PR author ${pr.user?.login} is not ${deps.botLogin}`);
+    const defaultBranch = await github.getDefaultBranch(args.owner, args.repo);
+    if (!defaultBranch || pr.base?.ref !== defaultBranch) {
+      return refuse(`PR base ${pr.base?.ref} is not the default branch ${defaultBranch}`);
+    }
+    const reviewedSha = pr.head?.sha;
+    if (!reviewedSha) return refuse("the PR head SHA is unknown");
+    if (args.approved) {
+      if (!args.reviewedHeadSha) return refuse("no reviewed commit was captured for the approval");
+      if (reviewedSha !== args.reviewedHeadSha) {
+        return refuse(`PR head ${reviewedSha} is not the reviewed commit ${args.reviewedHeadSha}`);
+      }
+    }
     const rec: BuildReviewRecord = {
       prNumber: args.prNumber,
       reviewedSha,
@@ -113,11 +155,11 @@ export async function finalizeBuildReview(
             },
       });
     } catch (err: unknown) {
-      log.warn("Failed to post build review check", { runId: args.runId, prNumber: args.prNumber, err });
+      log.warn("Failed to post build review check", { ...ctx, err });
     }
     return rec;
   } catch (err: unknown) {
-    log.warn("Failed to record build review", { runId: args.runId, prNumber: args.prNumber, err });
+    log.warn("Failed to record build review", { ...ctx, err });
     return null;
   }
 }
@@ -142,12 +184,12 @@ export async function finalizeBuildReviewForRun(
     /** Dashboard link for the run, used when the verdict artifact has no URL. */
     runUrl?: string;
   },
-  deps: { db: StateDb; github: () => GitHubClient | null },
+  deps: { db: StateDb; github: () => GitHubClient | null; botLogin?: string },
 ): Promise<BuildReviewRecord | null> {
   const { result } = args;
   if (args.workflowName !== BUILD_WORKFLOW || !result.success || result.paused) return null;
   if (!result.prNumber) return null;
-  const review = result.review as { approved?: unknown } | undefined;
+  const review = result.review as { approved?: unknown; headSha?: unknown } | undefined;
   if (!review || typeof review.approved !== "boolean") return null;
   try {
     const artifact = renderTemplate("{{artifactUrl reviewer-verdict.md}}", args.ctx).trim();
@@ -159,11 +201,39 @@ export async function finalizeBuildReviewForRun(
         prNumber: result.prNumber,
         approved: review.approved,
         verdictUrl: artifact || args.runUrl || "",
+        branch: typeof args.ctx.branch === "string" ? args.ctx.branch : "",
+        reviewedHeadSha: typeof review.headSha === "string" && review.headSha ? review.headSha : undefined,
       },
-      { db: deps.db, github: deps.github() },
+      { db: deps.db, github: deps.github(), botLogin: deps.botLogin },
     );
   } catch (err: unknown) {
     log.warn("Build review hook failed", { runId: args.runId, err });
     return null;
+  }
+}
+
+/**
+ * The commit the run's workspace is at, read by the harness — or undefined when
+ * it cannot be read (kubernetes keeps the workspace in a pod). Called at the end
+ * of each review pass, so the SHA it returns is the one the reviewer judged;
+ * undefined makes an approval unrecordable rather than approximate.
+ */
+export function readWorkspaceHead(
+  config: Pick<ExecutorConfig, "sandboxDir" | "stateDir">,
+  taskId: string,
+  owner: string,
+  repo: string,
+): string | undefined {
+  try {
+    const repoDir = resolveHostRepoDir(config, taskId, repo);
+    // The agent has had this checkout: make its `.git` inert before host git runs.
+    sanitizeCheckout(dirname(repoDir), repoDir, `https://github.com/${owner}/${repo}.git`);
+    const sha = hostGit(repoDir, ["rev-parse", "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return /^[0-9a-f]{40}$/i.test(sha) ? sha : undefined;
+  } catch {
+    return undefined;
   }
 }
