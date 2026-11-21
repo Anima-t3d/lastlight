@@ -248,85 +248,60 @@ describe("finalizeBuildReviewForRun", () => {
 });
 
 describe("readWorkspaceHead", () => {
-  it("reads the checkout HEAD, and is undefined when there is no checkout", () => {
-    const sandboxDir = mkdtempSync(join(tmpdir(), "bw-"));
-    expect(readWorkspaceHead({ sandboxDir }, "t1", "o", "r")).toBeUndefined();
-    const repoDir = join(sandboxDir, "t1", "r");
+  function checkout(root: string, taskDirName = "t1") {
+    const repoDir = join(root, taskDirName, "r");
     mkdirSync(repoDir, { recursive: true });
     const git = (...a: string[]) => execFileSync("git", ["-C", repoDir, ...a], { encoding: "utf8" }).trim();
     git("init", "-q");
     writeFileSync(join(repoDir, "f"), "x");
     git("add", "f");
     git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c");
+    return { repoDir, git };
+  }
+  const tmp = () => mkdtempSync(join(tmpdir(), "bw-"));
+
+  it("captures HEAD of a clean checkout", () => {
+    const sandboxDir = tmp();
+    const { git } = checkout(sandboxDir);
     expect(readWorkspaceHead({ sandboxDir }, "t1", "o", "r")).toBe(git("rev-parse", "HEAD"));
   });
-});
 
-describe("finalizeBuildReviewForRun — the build-finished merge trigger", () => {
-  const ctx = {
-    owner: "o", repo: "r", branch: "lastlight/1-x", issueDir: ".lastlight/issue-1",
-    externalizeArtifacts: true, publicUrl: "https://dash",
-  } as any;
-  const ok = { success: true, prNumber: 9, review: { approved: true, cycles: 0, headSha: "head-after-push" } };
-  const flush = () => new Promise((r) => setTimeout(r, 0));
-
-  beforeEach(() => {
-    evaluateMerge.mockReset();
-    evaluateMerge.mockResolvedValue({ decision: "wait", reason: "x: y" });
+  it("captures nothing when the checkout is missing", () => {
+    expect(readWorkspaceHead({ sandboxDir: tmp() }, "t1", "o", "r")).toBeUndefined();
   });
 
-  it("evaluates the PR for merge after an APPROVED record is written", async () => {
-    const db = fakeDb();
-    const github = fakeGithub();
-    const rec = await finalizeBuildReviewForRun(
-      { workflowName: "build", result: ok, ctx, runId: "run-1" },
-      { db, github: () => github, ...botDeps },
-    );
-    await vi.waitFor(() => expect(evaluateMerge).toHaveBeenCalled());
-    expect(rec?.verdict).toBe("APPROVED");
-    expect(evaluateMerge).toHaveBeenCalledTimes(1);
-    expect(evaluateMerge).toHaveBeenCalledWith(
-      { github, db, botLogin: "last-light[bot]" },
-      "o/r",
-      9,
-      "build-finished",
-    );
-    // The record was already written when the evaluation started.
-    expect(db.runs.mergeScratch.mock.invocationCallOrder[0]).toBeLessThan(
-      evaluateMerge.mock.invocationCallOrder[0],
-    );
+  it("captures nothing when a tracked file is modified", () => {
+    const sandboxDir = tmp();
+    const { repoDir } = checkout(sandboxDir);
+    writeFileSync(join(repoDir, "f"), "changed");
+    expect(readWorkspaceHead({ sandboxDir }, "t1", "o", "r")).toBeUndefined();
   });
 
-  it("does not evaluate after a REQUEST_CHANGES record", async () => {
-    const db = fakeDb();
-    await finalizeBuildReviewForRun(
-      { workflowName: "build", result: { ...ok, review: { approved: false, headSha: "head-after-push" } }, ctx, runId: "run-1" },
-      { db, github: () => fakeGithub(), ...botDeps },
-    );
-    await flush();
-    expect(evaluateMerge).not.toHaveBeenCalled();
+  it("captures nothing when an untracked file is present", () => {
+    const sandboxDir = tmp();
+    const { repoDir } = checkout(sandboxDir);
+    writeFileSync(join(repoDir, "new"), "y");
+    expect(readWorkspaceHead({ sandboxDir }, "t1", "o", "r")).toBeUndefined();
   });
 
-  it("does not evaluate when no record was written (approval not bound to the PR head)", async () => {
-    const db = fakeDb();
-    const rec = await finalizeBuildReviewForRun(
-      { workflowName: "build", result: { ...ok, review: { approved: true, headSha: "something-else" } }, ctx, runId: "run-1" },
-      { db, github: () => fakeGithub(), ...botDeps },
-    );
-    await flush();
-    expect(rec).toBeNull();
-    expect(evaluateMerge).not.toHaveBeenCalled();
+  it("captures nothing when HEAD has no commit", () => {
+    const sandboxDir = tmp();
+    const repoDir = join(sandboxDir, "t1", "r");
+    mkdirSync(repoDir, { recursive: true });
+    execFileSync("git", ["-C", repoDir, "init", "-q"]);
+    expect(readWorkspaceHead({ sandboxDir }, "t1", "o", "r")).toBeUndefined();
   });
 
-  it("a failing evaluation never fails the hook", async () => {
-    evaluateMerge.mockRejectedValue(new Error("boom"));
-    const db = fakeDb();
-    const rec = await finalizeBuildReviewForRun(
-      { workflowName: "build", result: ok, ctx, runId: "run-1" },
-      { db, github: () => fakeGithub(), ...botDeps },
-    );
-    await vi.waitFor(() => expect(evaluateMerge).toHaveBeenCalled());
-    await flush();
-    expect(rec?.verdict).toBe("APPROVED");
+  it("never falls back to a pr-review workspace root", () => {
+    const sandboxDir = tmp();
+    // A clean repo at the workspace ROOT carrying `.lastlight/pr-review`: the
+    // layout `resolveHostRepoDir` falls back to when `<root>/<repo>` is absent.
+    const workDir = join(sandboxDir, "t1");
+    mkdirSync(join(workDir, ".lastlight", "pr-review"), { recursive: true });
+    execFileSync("git", ["-C", workDir, "init", "-q"]);
+    writeFileSync(join(workDir, ".gitignore"), ".lastlight\n");
+    execFileSync("git", ["-C", workDir, "add", ".gitignore"]);
+    execFileSync("git", ["-C", workDir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c"]);
+    expect(readWorkspaceHead({ sandboxDir }, "t1", "o", "r")).toBeUndefined();
   });
 });

@@ -16,10 +16,10 @@ import type { StateDb } from "../state/db.js";
 import type { WorkflowRun } from "../state/workflow-run-store.js";
 import type { GitHubClient } from "./github/github.js";
 import { renderTemplate, type TemplateContext } from "lastlight-workflow-engine";
-import { dirname } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import type { ExecutorConfig } from "lastlight-workflow-engine";
 import { hostGit, sanitizeCheckout } from "./host-git.js";
-import { resolveHostRepoDir } from "../workflows/handlers/host-repo-dir.js";
 import { REVIEW_CHECK_NAME } from "./review-check.js";
 import { logger } from "../logging/logger.js";
 
@@ -247,10 +247,14 @@ function triggerMergeEvaluation(
 }
 
 /**
- * The commit the run's workspace is at, read by the harness — or undefined when
- * it cannot be read (kubernetes keeps the workspace in a pod). Called at the end
- * of each review pass, so the SHA it returns is the one the reviewer judged;
- * undefined makes an approval unrecordable rather than approximate.
+ * The commit the reviewer judged, read by the harness — or undefined when it
+ * cannot be vouched for. The agent controls the workspace, so HEAD alone proves
+ * nothing: a dirty tree means the code the reviewer saw differs from what is
+ * committed. Capture succeeds only when the BUILD's own checkout
+ * (`<sandboxDir>/<taskId>/<repo>`, never the pr-review layout fallback
+ * `resolveHostRepoDir` can return) has a real HEAD commit and nothing
+ * uncommitted or untracked. Otherwise undefined, which makes an approval
+ * unrecordable, with one warning naming the reason.
  */
 export function readWorkspaceHead(
   config: Pick<ExecutorConfig, "sandboxDir" | "stateDir">,
@@ -258,16 +262,31 @@ export function readWorkspaceHead(
   owner: string,
   repo: string,
 ): string | undefined {
+  const refuse = (reason: "dirty-tree" | "no-commit" | "no-checkout", err?: unknown): undefined => {
+    log.warn("Not capturing the reviewed commit", { taskId, repo: `${owner}/${repo}`, reason, ...(err ? { err } : {}) });
+    return undefined;
+  };
+  const repoDir = resolve(config.sandboxDir || join(config.stateDir || "data", "sandboxes"), taskId, repo);
+  if (!existsSync(join(repoDir, ".git"))) return refuse("no-checkout");
   try {
-    const repoDir = resolveHostRepoDir(config, taskId, repo);
     // The agent has had this checkout: make its `.git` inert before host git runs.
     sanitizeCheckout(dirname(repoDir), repoDir, `https://github.com/${owner}/${repo}.git`);
-    const sha = hostGit(repoDir, ["rev-parse", "HEAD"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    return /^[0-9a-f]{40}$/i.test(sha) ? sha : undefined;
+  } catch (err: unknown) {
+    return refuse("no-checkout", err);
+  }
+  const run = (args: string[]) =>
+    hostGit(repoDir, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  try {
+    run(["cat-file", "-e", "HEAD^{commit}"]);
   } catch {
-    return undefined;
+    return refuse("no-commit");
+  }
+  try {
+    if (run(["status", "--porcelain", "--untracked-files=all"]).trim() !== "") return refuse("dirty-tree");
+    const sha = run(["rev-parse", "HEAD"]).trim();
+    return /^[0-9a-f]{40}$/i.test(sha) ? sha : refuse("no-commit");
+  } catch (err: unknown) {
+    // git could not say whether the tree is clean: do not vouch for it.
+    return refuse("dirty-tree", err);
   }
 }
