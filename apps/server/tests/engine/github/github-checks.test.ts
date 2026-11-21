@@ -513,3 +513,97 @@ describe("GitHubClient.getBaseChecksState", () => {
     expect(spy).toHaveBeenCalledWith("o", "r", "release/2.x", {});
   });
 });
+
+/**
+ * `strict: true` — the merge gate's read. The default read degrades a failed
+ * status leg to "no statuses" and reads only the first page of check runs,
+ * both right for a trigger and both wrong for a merge.
+ */
+describe("GitHubClient.getChecksSummary — strict (the merge gate's read)", () => {
+  const ok = (i: number): Run => ({ status: "completed", conclusion: "success", name: `job-${i}`, id: i });
+
+  /** Paged check runs (100 per page) and paged statuses; records the pages asked for. */
+  function pagedOctokit(
+    allRuns: Run[],
+    combined: { state: string; statuses: unknown[] },
+    calls: { runs: number[]; statuses: number[] },
+  ) {
+    return {
+      rest: {
+        checks: {
+          listForRef: async (p: { page?: number; per_page?: number }) => {
+            const page = p.page ?? 1;
+            const per = p.per_page ?? 30;
+            calls.runs.push(page);
+            return {
+              data: { total_count: allRuns.length, check_runs: allRuns.slice((page - 1) * per, page * per) },
+            };
+          },
+        },
+        repos: {
+          getCombinedStatusForRef: async (p: { page?: number; per_page?: number }) => {
+            const page = p.page ?? 1;
+            const per = p.per_page ?? 30;
+            calls.statuses.push(page);
+            return {
+              data: {
+                state: combined.state,
+                total_count: combined.statuses.length,
+                statuses: combined.statuses.slice((page - 1) * per, page * per),
+              },
+            };
+          },
+        },
+      },
+    };
+  }
+
+  it("reads a failing check run on page 2 as failing, not passing", async () => {
+    const runs = [...Array.from({ length: 100 }, (_, i) => ok(i)), { ...ok(100), conclusion: "failure" }];
+    const calls = { runs: [] as number[], statuses: [] as number[] };
+    const c = clientWith(pagedOctokit(runs, { state: "success", statuses: [] }, calls));
+    const summary = await c.getChecksSummary("o-strict-p2", "r", "sha", { strict: true });
+    expect(summary.state).toBe("failing");
+    expect(summary.settledCount).toBe(101);
+    expect(calls.runs).toEqual([1, 2]);
+  });
+
+  it("counts statuses across pages", async () => {
+    const statuses = Array.from({ length: 120 }, (_, i) => ({ context: `ci/${i}`, state: "success" }));
+    const calls = { runs: [] as number[], statuses: [] as number[] };
+    const c = clientWith(pagedOctokit([ok(1)], { state: "success", statuses }, calls));
+    const summary = await c.getChecksSummary("o-strict-st", "r", "sha", { strict: true });
+    expect(summary).toEqual({ state: "passing", settledCount: 121, pendingCount: 0 });
+    expect(calls.statuses).toEqual([1, 2]);
+  });
+
+  it("throws on a 403 on commit statuses instead of reading them as none", async () => {
+    const c = clientWith({
+      rest: {
+        checks: { listForRef: async () => ({ data: { total_count: 1, check_runs: [ok(1)] } }) },
+        repos: {
+          getCombinedStatusForRef: async () => {
+            throw Object.assign(new Error("Resource not accessible by integration"), { status: 403 });
+          },
+        },
+      },
+    });
+    await expect(c.getChecksSummary("o-strict-403", "r", "sha", { strict: true })).rejects.toThrow(
+      "Resource not accessible by integration",
+    );
+  });
+
+  it("refuses to judge a ref with more check runs than it will page through", async () => {
+    const runs = Array.from({ length: 1001 }, (_, i) => ok(i));
+    const calls = { runs: [] as number[], statuses: [] as number[] };
+    const c = clientWith(pagedOctokit(runs, { state: "success", statuses: [] }, calls));
+    await expect(c.getChecksSummary("o-strict-cap", "r", "sha", { strict: true })).rejects.toThrow(/check runs/);
+  });
+
+  it("leaves the default read unchanged: one call per leg", async () => {
+    const calls = { runs: [] as number[], statuses: [] as number[] };
+    const c = clientWith(pagedOctokit([ok(1)], { state: "success", statuses: [] }, calls));
+    await c.getChecksSummary("o-default", "r", "sha");
+    expect(calls).toEqual({ runs: [1], statuses: [1] });
+  });
+});

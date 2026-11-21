@@ -36,14 +36,12 @@ import { BUILD_WORKFLOW, readBuildReview, type BuildReviewRecord } from "./build
 import { issueTriggerId } from "./build-decisions.js";
 import { mayMergeBuild, type BuildMergeDecision } from "./merge-decisions.js";
 import { emptyPrState, type PrState } from "./pr-state.js";
+import type { MergeTrigger } from "./build-merge-route.js";
 import { logger } from "../logging/logger.js";
 
 const log = logger("build-merge");
 
-export type MergeTrigger = "checks-settled" | "build-finished" | "sweep";
-
-/** The in-process route handler the router names for a green build PR (`dispatcher.ts`). */
-export const BUILD_MERGE_HANDLER = "build-merge";
+export { BUILD_MERGE_HANDLER, type MergeTrigger } from "./build-merge-route.js";
 
 export type MergeOutcome = "merged" | "head-moved" | "already-merged" | "not-mergeable";
 
@@ -175,7 +173,7 @@ async function evaluateOnce(
 
   const [checks, changedPaths, defaultBranch] = await Promise.all([
     headSha
-      ? github.getChecksSummary(owner, name, headSha, { excludeApp: appSlug(deps.botLogin) })
+      ? github.getChecksSummary(owner, name, headSha, { excludeApp: appSlug(deps.botLogin), strict: true })
       : Promise.resolve(null),
     github.listAllPullRequestFilePaths(owner, name, prNumber),
     github.getDefaultBranch(owner, name),
@@ -199,7 +197,43 @@ async function evaluateOnce(
   const { decision, reason } = decided;
   const ctx = { repo, prNumber, runId: run.id, trigger, decision, reason };
 
+  /**
+   * Hand the PR to a human: one comment per (reason case, head), deduped
+   * against the ledger's `commented` entries, then one ledger entry.
+   */
+  const handOff = async (
+    handReason: string,
+    body: string,
+    outcome?: MergeOutcome,
+  ): Promise<BuildMergeResult> => {
+    const already = priorEntries(run).some(
+      (e) =>
+        e.decision === "hand-off" &&
+        e.headSha === headSha &&
+        e.commented === true &&
+        reasonCase(e.reason) === reasonCase(handReason),
+    );
+    const commented = already ? false : await comment(github, owner, name, prNumber, body, ctx);
+    log.info("Build PR handed off to a human", { ...ctx, reason: handReason, outcome, commented, alreadyCommented: already });
+    await appendDecision(deps.db, run, {
+      trigger,
+      decision: "hand-off",
+      reason: handReason,
+      headSha,
+      ...(outcome ? { outcome } : {}),
+      ...(commented ? { commented } : {}),
+    });
+    return { decision: "hand-off", reason: handReason, ...(outcome ? { outcome } : {}) };
+  };
+
   if (decision === "merge" && review) {
+    // GitHub already refused a merge of THIS head as `not-mergeable` (squash
+    // merging disabled, a required merge queue, required signatures — refusals
+    // that do not go away while `mergeable_state` still reads `clean`). The
+    // PUT is not sent again: a new push is a new head, and gets one fresh try.
+    if (priorEntries(run).some((e) => e.outcome === "not-mergeable" && e.headSha === headSha)) {
+      return handOff(NOT_MERGEABLE_REASON, notMergeableComment(review));
+    }
     // The decision already holds `review.reviewedSha === state.headSha`; the
     // reviewed SHA is passed because it is the evidence, and GitHub refuses the
     // merge if the head is anything else by the time it lands.
@@ -207,12 +241,17 @@ async function evaluateOnce(
       sha: review.reviewedSha,
       method: "squash",
     });
+    if (res.outcome === "not-mergeable") {
+      log.warn("Merge refused by GitHub as not mergeable", { ...ctx, message: res.message });
+      return handOff(NOT_MERGEABLE_REASON, notMergeableComment(review, res.message), "not-mergeable");
+    }
     let commented = false;
     if (res.outcome === "merged") {
       log.info("Merged build PR", { ...ctx, sha: res.sha });
       commented = await comment(github, owner, name, prNumber, mergedComment(repo, prNumber, review, res.sha), ctx);
       emitMerged(run, repo, prNumber, res.sha ?? "");
     } else {
+      // `head-moved` / `already-merged`: the next evaluation reads the new state.
       log.info("Merge refused by GitHub", { ...ctx, outcome: res.outcome, message: res.message });
     }
     await appendDecision(deps.db, run, {
@@ -226,31 +265,16 @@ async function evaluateOnce(
     return { decision, outcome: res.outcome, reason };
   }
 
-  let commented = false;
-  if (decision === "hand-off") {
-    const already = priorEntries(run).some(
-      (e) =>
-        e.decision === "hand-off" &&
-        e.headSha === headSha &&
-        e.commented === true &&
-        reasonCase(e.reason) === reasonCase(reason),
-    );
-    if (!already) {
-      commented = await comment(github, owner, name, prNumber, handOffComment(reason, review), ctx);
-    }
-    log.info("Build PR handed off to a human", { ...ctx, commented, alreadyCommented: already });
-  } else {
-    log.debug("Build PR not merged yet", ctx);
-  }
-  await appendDecision(deps.db, run, {
-    trigger,
-    decision,
-    reason,
-    headSha,
-    ...(commented ? { commented } : {}),
-  });
+  if (decision === "hand-off") return handOff(reason, handOffComment(reason, review));
+
+  log.debug("Build PR not merged yet", ctx);
+  await appendDecision(deps.db, run, { trigger, decision, reason, headSha });
   return { decision, reason };
 }
+
+/** The hand-off reason after GitHub refused the merge itself. Case: `not-mergeable`. */
+const NOT_MERGEABLE_REASON =
+  "not-mergeable: GitHub refused the squash merge of this head; the gate will not retry it";
 
 /**
  * The succeeded build run that recorded THIS PR, or null.
@@ -374,6 +398,19 @@ function handOffComment(reason: string, review: BuildReviewRecord | null): strin
     "It needs a human to review and merge it, or to fix what is listed above.",
   ];
   if (review?.verdictUrl) lines.push("", `Build review: [verdict](${review.verdictUrl})`);
+  return lines.join("\n");
+}
+
+function notMergeableComment(review: BuildReviewRecord, githubMessage?: string): string {
+  const lines = [
+    "The merge gate tried to squash-merge this PR and GitHub refused it" +
+      (githubMessage ? `: ${codeSpan(githubMessage)}.` : "."),
+    "",
+    "The gate will not try this commit again. A human needs to merge it, or to change the " +
+      "repository setting that blocks it (for example squash merging disabled, a merge queue, " +
+      "or required signed commits). A new push gets one fresh attempt.",
+  ];
+  if (review.verdictUrl) lines.push("", `Build review: [verdict](${review.verdictUrl})`);
   return lines.join("\n");
 }
 

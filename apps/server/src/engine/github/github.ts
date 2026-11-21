@@ -360,7 +360,24 @@ export interface ChecksQueryOptions {
    * state to a *human* (or to the merge prompt) should show what GitHub shows.
    */
   excludeApp?: string;
+  /**
+   * The MERGE gate's read (`engine/build-merge.ts`). Every page of check runs
+   * and of commit statuses is read, and any failure throws — including the 403
+   * a missing `Commit statuses: read` produces, which the default read
+   * deliberately degrades to "no statuses". A ref with more than
+   * {@link STRICT_CHECKS_MAX} entries on either leg throws rather than be
+   * judged on part of them. Default off: every trigger-side caller keeps the
+   * degrading, first-page read.
+   */
+  strict?: boolean;
 }
+
+/** Page size and ceiling for a {@link ChecksQueryOptions.strict} read. */
+const STRICT_CHECKS_PER_PAGE = 100;
+const STRICT_CHECKS_MAX = 1000;
+
+type CheckRunList = Awaited<ReturnType<Octokit["rest"]["checks"]["listForRef"]>>["data"]["check_runs"];
+type CombinedStatusRead = { state: string; statuses?: Array<unknown> };
 
 /** One `search` node as {@link GitHubClient.listOpenBoardItems} selects it. */
 interface GraphQlBoardNode {
@@ -432,6 +449,45 @@ function httpStatus(err: unknown): number | undefined {
  * Only check runs carry an `app`; commit statuses do not, and we never post
  * one, so there is nothing to exclude on that side.
  */
+/**
+ * Every page of check runs and commit statuses for `ref`, failing loudly: a
+ * rejected page throws, and so does a ref with more than
+ * {@link STRICT_CHECKS_MAX} entries on either leg. See
+ * {@link ChecksQueryOptions.strict}.
+ */
+async function readChecksStrict(
+  kit: Octokit,
+  owner: string,
+  repo: string,
+  ref: string,
+): Promise<{ checkRuns: CheckRunList; status: CombinedStatusRead }> {
+  const per = STRICT_CHECKS_PER_PAGE;
+  const checkRuns: CheckRunList = [];
+  for (let page = 1; ; page++) {
+    const { data } = await kit.rest.checks.listForRef({ owner, repo, ref, filter: "latest", per_page: per, page });
+    const batch = data.check_runs ?? [];
+    checkRuns.push(...batch);
+    if (checkRuns.length > STRICT_CHECKS_MAX) {
+      throw new Error(`${owner}/${repo}@${ref} has more than ${STRICT_CHECKS_MAX} check runs; refusing to judge part of them`);
+    }
+    if (batch.length < per || checkRuns.length >= data.total_count) break;
+  }
+  let state = "";
+  const statuses: unknown[] = [];
+  for (let page = 1; ; page++) {
+    const { data } = await kit.rest.repos.getCombinedStatusForRef({ owner, repo, ref, per_page: per, page });
+    // The combined state is computed over every context, so page 1 carries it.
+    if (page === 1) state = data.state;
+    const batch = data.statuses ?? [];
+    statuses.push(...batch);
+    if (statuses.length > STRICT_CHECKS_MAX) {
+      throw new Error(`${owner}/${repo}@${ref} has more than ${STRICT_CHECKS_MAX} commit statuses; refusing to judge part of them`);
+    }
+    if (batch.length < per || statuses.length >= data.total_count) break;
+  }
+  return { checkRuns, status: { state, statuses } };
+}
+
 function excludingApp<T extends { app?: { slug?: string | null } | null }>(
   runs: T[],
   opts: ChecksQueryOptions,
@@ -2446,24 +2502,32 @@ export class GitHubClient {
     // permitted to read, and every `pr.synchronize` / settle event read blind
     // while the run still recorded success. Check runs alone are a usable
     // signal, so the status leg degrades to "no status contexts" instead.
-    const [checksRes, statusRes] = await Promise.allSettled([
-      kit.rest.checks.listForRef({ owner, repo, ref, filter: "latest" }),
-      kit.rest.repos.getCombinedStatusForRef({ owner, repo, ref }),
-    ]);
-    if (checksRes.status === "rejected") throw checksRes.reason;
-    const checks = checksRes.value.data;
-    if (statusRes.status === "rejected") noteMissingCombinedStatus(owner, statusRes.reason);
-    // The degraded shape is EMPTY, not green: `statuses: []` makes every use of
-    // `state` below inert (both the pending and the failing test are gated on
-    // there being contexts), so the ref is judged purely on its check runs and
-    // the unreadable half can neither fail it nor pad `settledCount`.
-    const status: { state: string; statuses?: Array<unknown> } =
-      statusRes.status === "fulfilled" ? statusRes.value.data : { state: "success", statuses: [] };
+    //
+    // The merge gate's `strict` read is the exception: it reads every page of
+    // both legs and lets any failure throw (see ChecksQueryOptions.strict).
+    let checkRuns: CheckRunList;
+    let status: CombinedStatusRead;
+    if (opts.strict) {
+      ({ checkRuns, status } = await readChecksStrict(kit, owner, repo, ref));
+    } else {
+      const [checksRes, statusRes] = await Promise.allSettled([
+        kit.rest.checks.listForRef({ owner, repo, ref, filter: "latest" }),
+        kit.rest.repos.getCombinedStatusForRef({ owner, repo, ref }),
+      ]);
+      if (checksRes.status === "rejected") throw checksRes.reason;
+      checkRuns = checksRes.value.data.check_runs;
+      if (statusRes.status === "rejected") noteMissingCombinedStatus(owner, statusRes.reason);
+      // The degraded shape is EMPTY, not green: `statuses: []` makes every use of
+      // `state` below inert (both the pending and the failing test are gated on
+      // there being contexts), so the ref is judged purely on its check runs and
+      // the unreadable half can neither fail it nor pad `settledCount`.
+      status = statusRes.status === "fulfilled" ? statusRes.value.data : { state: "success", statuses: [] };
+    }
     // Drop OUR OWN check runs when the caller is deciding whether to TRIGGER
     // work — see {@link ChecksQueryOptions.excludeApp} — then collapse each
     // check to the run that survives a re-run ({@link latestPerCheck}), so a
     // job that was re-run green stops reporting the SHA red forever.
-    const runs = latestPerCheck(excludingApp(checks.check_runs, opts));
+    const runs = latestPerCheck(excludingApp(checkRuns, opts));
     const statuses = status.statuses ?? [];
 
     const runPendingCount = runs.filter(

@@ -18,7 +18,7 @@ import type { StateDb } from "../state/db.js";
 import type { GitHubClient } from "./github/github.js";
 import { isDependencyPr } from "../cron/dependabot-discovery.js";
 import { holdReply } from "./pr-decisions.js";
-import { BUILD_MERGE_HANDLER } from "./build-merge.js";
+import { BUILD_MERGE_HANDLER } from "./build-merge-route.js";
 import { logger } from "../logging/logger.js";
 
 const log = logger("router");

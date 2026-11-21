@@ -3,6 +3,8 @@
  * run store and a fake GitHub that models the PR's state.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 vi.mock("#src/logging/logger.js", () => {
   const noopLogger = {
@@ -182,6 +184,80 @@ describe("evaluateBuildMerge — merge path", () => {
     expect(emit).not.toHaveBeenCalled();
     expect((await ledger(db))[0]).toMatchObject({ outcome: "head-moved" });
     expect((await ledger(db))[0].commented).toBeUndefined();
+  });
+
+  it("not-mergeable: one comment the first time; the same head is not PUT or commented again", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub({ mergeOutcome: "not-mergeable" });
+    github.mergePullRequest.mockImplementation(async () => ({
+      outcome: "not-mergeable",
+      message: "Squash merges are not allowed on this `repo`\n@team",
+    }));
+    const deps = { github: github as any, db, botLogin: BOT };
+
+    const first = await evaluateBuildMerge(deps, REPO, PR, "checks-settled");
+    expect(first).toMatchObject({ decision: "hand-off", outcome: "not-mergeable" });
+    expect(first.reason).toMatch(/^not-mergeable:/);
+    expect(github.mergePullRequest).toHaveBeenCalledTimes(1);
+    expect(github.postComment).toHaveBeenCalledTimes(1);
+    const body = github.postComment.mock.calls[0][3] as string;
+    // GitHub's message only inside the sanitised code span.
+    expect(body).toContain("`Squash merges are not allowed on this 'repo''@team`");
+    expect(emit).not.toHaveBeenCalled();
+
+    const again = await evaluateBuildMerge(deps, REPO, PR, "sweep");
+    await evaluateBuildMerge(deps, REPO, PR, "sweep");
+    expect(again.decision).toBe("hand-off");
+    expect(again.reason).toMatch(/^not-mergeable:/);
+    expect(again.outcome).toBeUndefined();
+    expect(github.mergePullRequest).toHaveBeenCalledTimes(1);
+    expect(github.postComment).toHaveBeenCalledTimes(1);
+
+    // A new push is a new head: one fresh attempt (stale review aside, the
+    // record is re-pinned here to model a re-reviewed head).
+    github.pr.head.sha = "C";
+    await db.runs.mergeScratch("run-1", {
+      [BUILD_REVIEW_SCRATCH_KEY]: {
+        prNumber: PR, reviewedSha: "C", verdict: "APPROVED", verdictUrl: "https://dash/verdict", recordedAt: "t",
+      },
+    });
+    await evaluateBuildMerge(deps, REPO, PR, "sweep");
+    expect(github.mergePullRequest).toHaveBeenCalledTimes(2);
+    expect(github.mergePullRequest).toHaveBeenLastCalledWith("acme", "widgets", PR, { sha: "C", method: "squash" });
+    expect(github.postComment).toHaveBeenCalledTimes(2);
+  });
+
+  it("not-mergeable whose comment failed is commented on the next evaluation, still without a PUT", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub({ mergeOutcome: "not-mergeable" });
+    github.postComment.mockRejectedValueOnce(new Error("502"));
+    const deps = { github: github as any, db, botLogin: BOT };
+    await evaluateBuildMerge(deps, REPO, PR, "sweep");
+    await evaluateBuildMerge(deps, REPO, PR, "sweep");
+    await evaluateBuildMerge(deps, REPO, PR, "sweep");
+    expect(github.mergePullRequest).toHaveBeenCalledTimes(1);
+    expect(github.postComment).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["getPullRequest"],
+    ["getChecksSummary"],
+    ["getDefaultBranch"],
+    ["listAllPullRequestFilePaths"],
+    ["listPullRequestClosingIssues"],
+  ] as const)("a rejected %s read propagates: no merge, no comment, no merge entry", async (method) => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub();
+    (github[method] as any).mockRejectedValueOnce(Object.assign(new Error(`${method} 403`), { status: 403 }));
+    await expect(
+      evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "checks-settled"),
+    ).rejects.toThrow(`${method} 403`);
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+    expect(github.postComment).not.toHaveBeenCalled();
+    expect((await ledger(db)).some((e) => e.decision === "merge")).toBe(false);
   });
 
   it("already-merged: no comment, no event", async () => {
@@ -396,11 +472,21 @@ describe("evaluateBuildMerge — waits and the ledger", () => {
     expect(github.mergePullRequest).not.toHaveBeenCalled();
   });
 
-  it("excludes our own review check from the settled-checks read", async () => {
+  it("reads checks strictly and excludes our own review check", async () => {
     const db = await makeTestDb();
     await seedBuildRun(db);
     const github = fakeGithub();
     await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
-    expect(github.getChecksSummary).toHaveBeenCalledWith("acme", "widgets", "B", { excludeApp: "last-light" });
+    expect(github.getChecksSummary).toHaveBeenCalledWith("acme", "widgets", "B", {
+      excludeApp: "last-light",
+      strict: true,
+    });
+  });
+});
+
+describe("module boundaries", () => {
+  it("the router does not statically import the executor (and its pr-state/sandbox chain)", () => {
+    const src = readFileSync(join(__dirname, "../../src/engine/router.ts"), "utf8");
+    expect(src).not.toMatch(/from "\.\/build-merge\.js"/);
   });
 });
