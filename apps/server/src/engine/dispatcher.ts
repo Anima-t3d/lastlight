@@ -46,6 +46,8 @@ import {
 import { logger } from "../logging/logger.js";
 import { recordActivity } from "../activity.js";
 import { BUILD_MERGE_HANDLER, evaluateBuildMerge } from "./build-merge.js";
+import { PROMOTE_DEPENDENTS_HANDLER } from "./promotion-route.js";
+import { promoteDependents } from "./promotion.js";
 
 const eventLog = logger("event");
 const dispatchLog = logger("dispatch");
@@ -73,6 +75,8 @@ const IN_PROCESS_HANDLERS = new Set([
   // The merge gate. Its off switch is the per-repo Merges toggle, which the
   // executor reads on every evaluation, not the workflow kill switch.
   BUILD_MERGE_HANDLER,
+  // L2 unblock: label moves only, no workflow and no run row.
+  PROMOTE_DEPENDENTS_HANDLER,
 ]);
 
 /**
@@ -296,6 +300,18 @@ export async function dispatch(
   // nothing, and the 20-minute sweep evaluates the PR again.
   if (handler === BUILD_MERGE_HANDLER) {
     return handleBuildMerge(context, deps);
+  }
+
+  // A closed issue that may unblock queued dependents. `promoteDependents`
+  // swallows its own errors per issue, so this never throws into the dispatch.
+  if (handler === PROMOTE_DEPENDENTS_HANDLER) {
+    const repo = typeof context.repo === "string" ? context.repo : "";
+    const issueNumber = typeof context.issueNumber === "number" ? context.issueNumber : 0;
+    if (!deps.github || !repo || !issueNumber) {
+      return { kind: "skipped", reason: "promote-dependents: no GitHub client or issue" };
+    }
+    await promoteDependents({ github: deps.github }, repo, issueNumber);
+    return { kind: "handled", handler: PROMOTE_DEPENDENTS_HANDLER };
   }
 
   // ── The PR state machine (09-state-machine.md) ────────────────────────────

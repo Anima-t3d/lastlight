@@ -82,3 +82,18 @@ describe("dispatch — build-merge handler", () => {
     expect(evaluate).not.toHaveBeenCalled();
   });
 });
+
+describe("dispatch — promote-dependents handler", () => {
+  it("promotes in process, with no workflow dispatch", async () => {
+    const d = deps({
+      route: vi.fn().mockResolvedValue({
+        action: "handler",
+        handler: "promote-dependents",
+        context: { repo: "acme/widgets", issueNumber: 5 },
+      }),
+    });
+    const outcome = await dispatch({ ...envelope(), type: "issue.closed" }, d);
+    expect(outcome).toEqual({ kind: "handled", handler: "promote-dependents" });
+    expect(d.dispatchWorkflow).not.toHaveBeenCalled();
+  });
+});

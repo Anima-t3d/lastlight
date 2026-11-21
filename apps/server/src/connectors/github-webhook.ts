@@ -290,8 +290,14 @@ export class GitHubWebhookConnector extends EventEmitter implements Connector {
         }
       }
 
+      // `issues.closed` is the one ignored action that is a signal: closing an
+      // issue may unblock queued dependents. The router drops it for any repo
+      // not on the autonomy allow-list, and the managed-repo filter below still
+      // applies. Other event types' `closed` (pull_request) stay ignored.
+      const isIssueClosed = eventType === "issues" && action === "closed";
+
       // Filter out ignored actions
-      if (action && IGNORED_ACTIONS.has(action)) {
+      if (action && IGNORED_ACTIONS.has(action) && !isIssueClosed) {
         return c.json({ filtered: true, reason: `action=${action}` }, 200);
       }
 
@@ -370,7 +376,10 @@ export class GitHubWebhookConnector extends EventEmitter implements Connector {
       // still drop on the filter below, so the bot still cannot reply to
       // itself — the failure mode the strict filter was written for.
       const isStageAttention = eventType === "issues" && action === "labeled";
-      if (isBotSender && !isPrAttention && !isCheckAttention && !isStageAttention) {
+      // A bot can close an issue (merging its own PR closes the linked issue);
+      // that close unblocks dependents just the same. It cannot reply to
+      // itself: the only effect is a label move host-side.
+      if (isBotSender && !isPrAttention && !isCheckAttention && !isStageAttention && !isIssueClosed) {
         return c.json({ filtered: true, reason: "bot sender" }, 200);
       }
 
@@ -700,6 +709,7 @@ export class GitHubWebhookConnector extends EventEmitter implements Connector {
         issueAuthor = payload.issue?.user?.login;
         if (action === "opened") type = "issue.opened";
         else if (action === "reopened") type = "issue.reopened";
+        else if (action === "closed") type = "issue.closed";
         // A label was added to an issue. Mirrors the `pull_request` case below:
         // the router drops every label that is not a configured pipeline stage,
         // so this only ever reaches a dispatch when a stage really advanced.

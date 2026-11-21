@@ -608,6 +608,12 @@ export interface AutonomyBudgetConfig {
 export interface AutonomyConfig {
   /** Exact `owner/repo` names — no globs; see {@link isAutonomousRepo}. */
   repos: string[];
+  /**
+   * The label that parks an issue until every issue blocking it has closed as
+   * completed. Only an issue carrying it is ever promoted to the build stage's
+   * `enter` label (`engine/promotion.ts`).
+   */
+  queuedLabel: string;
   stages: Record<string, AutonomyStageConfig>;
   budget: AutonomyBudgetConfig;
 }
@@ -892,6 +898,7 @@ function packagedAutonomy(): AutonomyConfig {
   if (resolvingPackagedAutonomy) {
     return {
       repos: [],
+      queuedLabel: "lastlight:queued",
       stages: {},
       budget: {
         maxConcurrentBuilds: 0,
@@ -1835,6 +1842,7 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
     repos: Array.isArray(autonomyRaw.repos)
       ? autonomyRaw.repos.filter((r): r is string => typeof r === "string" && !!r.trim()).map((r) => r.trim())
       : [],
+    queuedLabel: autonomyLabel(autonomyRaw.queuedLabel) || "lastlight:queued",
     stages: normalizeAutonomyStages(autonomyRaw.stages),
     budget: normalizeAutonomyBudget(autonomyRaw.budget),
   };

@@ -19,6 +19,7 @@ import type { GitHubClient } from "./github/github.js";
 import { isDependencyPr } from "../cron/dependabot-discovery.js";
 import { holdReply } from "./pr-decisions.js";
 import { BUILD_MERGE_HANDLER } from "./build-merge-route.js";
+import { PROMOTE_DEPENDENTS_HANDLER } from "./promotion-route.js";
 import { logger } from "../logging/logger.js";
 
 const log = logger("router");
@@ -321,7 +322,9 @@ export async function routeEvent(
   // The HOLD, before every branch below — see `holdRoute`. Above even the
   // reply-gate and re-triage short-circuits inside `comment.created`: "stay off
   // this" has no carve-outs, or it is not a hold.
-  const held = holdRoute(envelope, bot);
+  // `issue.closed` is exempt: the hold says "stay off THIS issue", and the close
+  // only unblocks OTHER issues (each re-checked by the build gate's own hold).
+  const held = envelope.type === "issue.closed" ? null : holdRoute(envelope, bot);
   if (held) return held;
   switch (envelope.type) {
     case "issue.opened": {
@@ -368,6 +371,23 @@ export async function routeEvent(
           reopened: true,
         },
       };
+
+    case "issue.closed": {
+      // L2: a closed issue may unblock queued dependents. In process, no
+      // workflow. The allow-list is checked here so a repo that never opted in
+      // costs nothing, and again by `promoteDependents` before any GitHub call.
+      if (!envelope.repo || !envelope.issueNumber || !isAutonomousRepo(envelope.repo)) {
+        return {
+          action: "ignore",
+          reason: `${envelope.repo ?? "this repo"} is not on the autonomy allow-list`,
+        };
+      }
+      return {
+        action: "handler",
+        handler: PROMOTE_DEPENDENTS_HANDLER,
+        context: { repo: envelope.repo, issueNumber: envelope.issueNumber },
+      };
+    }
 
     case "issue.labeled": {
       // The label-driven pipeline: a stage's `enter` label landed on an issue,

@@ -171,3 +171,23 @@ describe("discoverIssuesReadyForAgent", () => {
     );
   });
 });
+
+describe("discoverIssuesReadyForAgent — L2 promotion hook", () => {
+  it("promotes each repo before listing, and survives a throwing promoter", async () => {
+    const order: string[] = [];
+    const gh = {
+      listOpenIssuesByLabel: vi.fn(async () => {
+        order.push("list");
+        return [];
+      }),
+    };
+    const promoteQueued = vi.fn(async (repo: string) => {
+      order.push(`promote:${repo}`);
+      if (repo === "a/one") throw new Error("boom");
+    });
+    await discoverIssuesReadyForAgent(["a/one", "a/two"], gh as never, { promoteQueued, log: () => {} });
+    expect(promoteQueued).toHaveBeenCalledTimes(2);
+    expect(order.slice(0, 2)).toEqual(["promote:a/one", "list"]);
+    expect(order).toContain("promote:a/two");
+  });
+});

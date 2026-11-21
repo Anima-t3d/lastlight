@@ -1422,6 +1422,36 @@ describe("GitHubWebhookConnector — issue stage labels", () => {
   });
 });
 
+/** `issues.closed` is the L2 unblock signal: it must normalize, even from a bot. */
+describe("GitHubWebhookConnector — issues.closed", () => {
+  beforeEach(() => {
+    setRuntimeConfig({ managedRepos: [REPO] } as unknown as LastLightConfig);
+  });
+  afterEach(() => resetRuntimeConfigForTests());
+
+  it("becomes an issue.closed envelope carrying the repo and issue number", async () => {
+    const { status, emitted } = await postIssues(connector(), { action: "closed" });
+    expect(status).toBe(202);
+    expect(emitted?.type).toBe("issue.closed");
+    expect(emitted.repo).toBe(REPO);
+    expect(emitted.issueNumber).toBe(9);
+  });
+
+  it("admits a BOT-sent close (a bot merging a PR closes its issue)", async () => {
+    const { emitted } = await postIssues(connector(), {
+      action: "closed",
+      sender: { login: BOT_LOGIN, type: "Bot" },
+    });
+    expect(emitted?.type).toBe("issue.closed");
+  });
+
+  it("still filters issues.closed on an UNMANAGED repo", async () => {
+    const { json, emitted } = await postIssues(connector(), { action: "closed", repoFullName: "someone-else/other" });
+    expect(json.filtered).toBe(true);
+    expect(emitted).toBeNull();
+  });
+});
+
 /**
  * The BOARD invalidation hook.
  *
@@ -1450,11 +1480,13 @@ describe("GitHubWebhookConnector — board invalidation", () => {
     // Nothing below the filter will ever hear about this, and a closed issue
     // has to disappear from the board.
     const onBoardChanged = vi.fn();
-    const { json } = await postIssues(boardConnector(onBoardChanged), { action: "closed" });
+    const { status, emitted } = await postIssues(boardConnector(onBoardChanged), { action: "closed" });
 
     expect(onBoardChanged).toHaveBeenCalledWith(REPO);
-    // And it is STILL filtered — the hook noted it and changed nothing else.
-    expect(json.filtered).toBe(true);
+    // The hook noted it and the delivery went on: a closed issue now becomes the
+    // `issue.closed` envelope that unblocks queued dependents.
+    expect(status).toBe(202);
+    expect(emitted?.type).toBe("issue.closed");
   });
 
   it("fires on an UNLABELED issue — also below the filter", async () => {

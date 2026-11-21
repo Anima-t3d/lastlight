@@ -1735,6 +1735,37 @@ describe('routeEvent — @bot retry', () => {
  * stage writes now reach the router. Dropping every non-`enter` label is what
  * stops them turning into a loop.
  */
+describe('routeEvent — issue.closed (L2 unblock)', () => {
+  const autonomyFor = (repos: string[]) =>
+    setRuntimeConfig({
+      managedRepos: ['cliftonc/drizzle-cube'],
+      autonomy: { repos, queuedLabel: 'lastlight:queued', stages: {}, budget: {} },
+    } as unknown as LastLightConfig);
+  const closed = (over: Partial<EventEnvelope> = {}) =>
+    makeEnvelope({ type: 'issue.closed', issueNumber: 5, labels: [], ...over });
+
+  it('routes to promote-dependents on an autonomy repo', async () => {
+    autonomyFor(['cliftonc/drizzle-cube']);
+    const result = await routeEvent(closed());
+    expect(result).toEqual({
+      action: 'handler',
+      handler: 'promote-dependents',
+      context: { repo: 'cliftonc/drizzle-cube', issueNumber: 5 },
+    });
+  });
+
+  it('ignores a repo that is not on the autonomy allow-list', async () => {
+    autonomyFor([]);
+    expect((await routeEvent(closed())).action).toBe('ignore');
+  });
+
+  it('still unblocks dependents when the closed issue itself is on hold', async () => {
+    autonomyFor(['cliftonc/drizzle-cube']);
+    const result = await routeEvent(closed({ labels: ['hold'] }));
+    expect(result.action).toBe('handler');
+  });
+});
+
 describe('routeEvent — issue.labeled (the autonomy pipeline)', () => {
   const STAGES = {
     build: {

@@ -814,6 +814,12 @@ autonomy:
   # somebody creates it. Matching is exact string equality
   # (`isAutonomousRepo()`); `owner/*` is a repo name that will never exist.
   repos: []
+  # The label that parks an issue until every issue blocking it (GitHub issue
+  # dependencies) has closed as completed. Only an issue carrying it is ever
+  # promoted: it moves to the build stage's `enter` label and the normal build
+  # dispatch picks it up. A blocker closed as not planned moves the issue to the
+  # build stage's `on_failure` label instead, with one comment.
+  queuedLabel: lastlight:queued
   # The stages a label can start. `build` is the one shipped stage.
   stages:
     build:

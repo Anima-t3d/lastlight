@@ -152,6 +152,11 @@ describe("resolveBuildTrigger — the already-built asymmetry", () => {
     expect(d.reason).toMatch(/^already-built:/);
   });
 
+  it("NOT built + senderIsBot: true → dispatch (L2 promotion applies the entry label as the bot)", () => {
+    const d = decide(inputs({ alreadyBuilt: false, senderIsBot: true }));
+    expect(d.decision).toBe("dispatch");
+  });
+
   it("already-built + senderIsBot: false → dispatch (a maintainer re-label is an explicit retry)", () => {
     const d = decide(inputs({ alreadyBuilt: true, senderIsBot: false }));
     expect(d.decision).toBe("dispatch");

@@ -44,6 +44,7 @@ import { buildCronHandlers } from "./cron/handlers.js";
 import type { KnownBlock } from "@slack/web-api";
 import { discoverPrsAwaitingReview } from "./cron/review-discovery.js";
 import { discoverIssuesReadyForAgent } from "./cron/issue-discovery.js";
+import { promoteReadyQueued } from "./engine/promotion.js";
 import { mountAdmin } from "./admin/index.js";
 import { cleanupOrphanedSandboxes } from "./sandbox/index.js";
 import { mountSkillBundle } from "./sandbox/k8s/skill-bundle-route.js";
@@ -1685,7 +1686,15 @@ async function main() {
     // are decided once by `resolveBuildTrigger` at the dispatch choke point the
     // webhook route crosses too — which is also why this sweep cannot become
     // the re-dispatch spend loop. See `cron/issue-discovery.ts`.
-    "issues-ready-for-agent": (repos, gh, opts) => discoverIssuesReadyForAgent(repos, gh, opts),
+    //
+    // It also runs L2 promotion first (`promoteReadyQueued`): queued issues
+    // whose blockers have closed move to the entry label and are offered on the
+    // same tick. This is the backstop for a missed `issues.closed` delivery.
+    "issues-ready-for-agent": (repos, gh, opts) =>
+      discoverIssuesReadyForAgent(repos, gh, {
+        ...opts,
+        promoteQueued: (repo) => promoteReadyQueued({ github: gh }, repo),
+      }),
   };
 
   // Construct the cron scheduler before mounting admin so the dashboard can

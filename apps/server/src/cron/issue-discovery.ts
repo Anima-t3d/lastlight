@@ -119,6 +119,13 @@ export interface IssueDiscoverOptions {
    * a page count to raise.
    */
   maxPages?: number;
+  /**
+   * L2: promote the repo's queued issues whose blockers have closed, BEFORE the
+   * listing below, so a promoted issue is offered on this same tick. Wired to
+   * `promoteReadyQueued`, which checks the allow-list itself and swallows its
+   * own errors; a throw here is logged and never stops the sweep.
+   */
+  promoteQueued?: (repo: string) => Promise<void>;
 }
 
 const DEFAULT_MAX_PER_REPO = 25;
@@ -143,6 +150,12 @@ export async function discoverIssuesReadyForAgent(
     if (!owner || !repo) {
       opts.log?.(`[issue-discovery] skipping malformed repo "${full}"`);
       continue;
+    }
+
+    try {
+      await opts.promoteQueued?.(full);
+    } catch (err) {
+      opts.log?.(`[issue-discovery] ${full}: promoting queued issues failed: ${String(err)}`);
     }
 
     // Keyed by issue number so an issue carrying two stages' entry labels is
