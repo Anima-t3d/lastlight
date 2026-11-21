@@ -253,8 +253,19 @@ function triggerMergeEvaluation(
  * committed. Capture succeeds only when the BUILD's own checkout
  * (`<sandboxDir>/<taskId>/<repo>`, never the pr-review layout fallback
  * `resolveHostRepoDir` can return) has a real HEAD commit and nothing
- * uncommitted or untracked. Otherwise undefined, which makes an approval
- * unrecordable, with one warning naming the reason.
+ * uncommitted or untracked (ignored files never reach the commit, so they do
+ * not count). Otherwise undefined, which makes an approval unrecordable, with
+ * one warning naming the reason.
+ *
+ * Two shapes are refused before any status runs:
+ *  - `submodules`: a `.git/modules` entry or a gitlink (mode 160000) in the
+ *    index. `git status` recurses into submodules, and a submodule's own config
+ *    (under `.git/modules/*`, or wherever its gitfile points) is not sanitized,
+ *    so its `filter.*` drivers would run on the host.
+ *  - `index-flags`: an entry marked assume-unchanged or skip-worktree, which
+ *    makes status report a modified file as clean.
+ * `ls-files` reads only the index: it starts no subprocess and does not
+ * recurse (`submodule.recurse` does not apply to it).
  */
 export function readWorkspaceHead(
   config: Pick<ExecutorConfig, "sandboxDir" | "stateDir">,
@@ -262,7 +273,8 @@ export function readWorkspaceHead(
   owner: string,
   repo: string,
 ): string | undefined {
-  const refuse = (reason: "dirty-tree" | "no-commit" | "no-checkout", err?: unknown): undefined => {
+  type Reason = "dirty-tree" | "no-commit" | "no-checkout" | "submodules" | "index-flags";
+  const refuse = (reason: Reason, err?: unknown): undefined => {
     log.warn("Not capturing the reviewed commit", { taskId, repo: `${owner}/${repo}`, reason, ...(err ? { err } : {}) });
     return undefined;
   };
@@ -274,15 +286,33 @@ export function readWorkspaceHead(
   } catch (err: unknown) {
     return refuse("no-checkout", err);
   }
+  // `ls-files` lists every index entry: give it room for a large repository.
   const run = (args: string[]) =>
-    hostGit(repoDir, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    hostGit(repoDir, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 256 * 1024 * 1024 });
+  // NUL-separated `ls-files` records; a failure to list means the index cannot be vouched for.
+  const indexEntries = (flag: "-s" | "-v"): string[] => run(["ls-files", flag, "-z"]).split("\0").filter(Boolean);
+  try {
+    if (existsSync(join(repoDir, ".git", "modules"))) return refuse("submodules");
+    // `<mode> <object> <stage>\t<path>`
+    if (indexEntries("-s").some((e) => e.startsWith("160000 "))) return refuse("submodules");
+  } catch (err: unknown) {
+    return refuse("submodules", err);
+  }
+  try {
+    // `<tag> <path>`: lowercase = assume-unchanged (`s` when skip-worktree too), `S` = skip-worktree.
+    if (indexEntries("-v").some((e) => /^[a-zS] /.test(e))) return refuse("index-flags");
+  } catch (err: unknown) {
+    return refuse("index-flags", err);
+  }
   try {
     run(["cat-file", "-e", "HEAD^{commit}"]);
   } catch {
     return refuse("no-commit");
   }
   try {
-    if (run(["status", "--porcelain", "--untracked-files=all"]).trim() !== "") return refuse("dirty-tree");
+    // Submodules were refused above; never recurse into one regardless.
+    const status = ["-c", "submodule.recurse=false", "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=all"];
+    if (run(status).trim() !== "") return refuse("dirty-tree");
     const sha = run(["rev-parse", "HEAD"]).trim();
     return /^[0-9a-f]{40}$/i.test(sha) ? sha : refuse("no-commit");
   } catch (err: unknown) {

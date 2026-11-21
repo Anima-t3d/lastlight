@@ -13,6 +13,7 @@ import {
   recordBuildReview,
 } from "#src/engine/build-review.js";
 import { REVIEW_CHECK_NAME } from "#src/engine/review-check.js";
+import { logger } from "#src/logging/logger.js";
 
 // The merge executor is exercised in build-merge.test.ts; here only the hook's
 // call is asserted, so it is replaced wholesale.
@@ -303,6 +304,75 @@ describe("readWorkspaceHead", () => {
     execFileSync("git", ["-C", workDir, "add", ".gitignore"]);
     execFileSync("git", ["-C", workDir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c"]);
     expect(readWorkspaceHead({ sandboxDir }, "t1", "o", "r")).toBeUndefined();
+  });
+
+  // The reasons logged by each call: exactly one per refusal, none on capture.
+  function capture(sandboxDir: string) {
+    const warn = vi.mocked(logger("t").warn);
+    warn.mockClear();
+    const sha = readWorkspaceHead({ sandboxDir }, "t1", "o", "r");
+    return { sha, reasons: warn.mock.calls.map((c) => (c[1] as { reason?: string } | undefined)?.reason) };
+  }
+  const commit = (git: (...a: string[]) => string) =>
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c2");
+
+  it("captures HEAD of a clean checkout with no warning", () => {
+    const sandboxDir = tmp();
+    const { git } = checkout(sandboxDir);
+    expect(capture(sandboxDir)).toEqual({ sha: git("rev-parse", "HEAD"), reasons: [] });
+  });
+
+  it("refuses a checkout whose index holds a gitlink (submodule)", () => {
+    const sandboxDir = tmp();
+    const { git } = checkout(sandboxDir);
+    git("update-index", "--add", "--cacheinfo", `160000,${git("rev-parse", "HEAD")},sub`);
+    commit(git);
+    expect(capture(sandboxDir)).toEqual({ sha: undefined, reasons: ["submodules"] });
+  });
+
+  it("refuses a checkout carrying a .git/modules directory", () => {
+    const sandboxDir = tmp();
+    const { repoDir } = checkout(sandboxDir);
+    mkdirSync(join(repoDir, ".git", "modules", "sub"), { recursive: true });
+    expect(capture(sandboxDir)).toEqual({ sha: undefined, reasons: ["submodules"] });
+  });
+
+  it("refuses a modified file hidden by assume-unchanged", () => {
+    const sandboxDir = tmp();
+    const { repoDir, git } = checkout(sandboxDir);
+    git("update-index", "--assume-unchanged", "f");
+    writeFileSync(join(repoDir, "f"), "changed");
+    expect(git("status", "--porcelain")).toBe(""); // the hiding works on plain status
+    expect(capture(sandboxDir)).toEqual({ sha: undefined, reasons: ["index-flags"] });
+  });
+
+  it("refuses a modified file hidden by skip-worktree", () => {
+    const sandboxDir = tmp();
+    const { repoDir, git } = checkout(sandboxDir);
+    git("update-index", "--skip-worktree", "f");
+    writeFileSync(join(repoDir, "f"), "changed");
+    expect(git("status", "--porcelain")).toBe("");
+    expect(capture(sandboxDir)).toEqual({ sha: undefined, reasons: ["index-flags"] });
+  });
+
+  it("refuses a file carrying both assume-unchanged and skip-worktree", () => {
+    const sandboxDir = tmp();
+    const { repoDir, git } = checkout(sandboxDir);
+    git("update-index", "--assume-unchanged", "f");
+    git("update-index", "--skip-worktree", "f");
+    expect(git("ls-files", "-v")).toBe("s f");
+    writeFileSync(join(repoDir, "f"), "changed");
+    expect(capture(sandboxDir)).toEqual({ sha: undefined, reasons: ["index-flags"] });
+  });
+
+  it("still captures a clean checkout with an ignored untracked file", () => {
+    const sandboxDir = tmp();
+    const { repoDir, git } = checkout(sandboxDir);
+    writeFileSync(join(repoDir, ".gitignore"), "scratch\n");
+    git("add", ".gitignore");
+    commit(git);
+    writeFileSync(join(repoDir, "scratch"), "notes");
+    expect(capture(sandboxDir)).toEqual({ sha: git("rev-parse", "HEAD"), reasons: [] });
   });
 });
 
