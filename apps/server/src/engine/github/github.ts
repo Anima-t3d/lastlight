@@ -1051,6 +1051,88 @@ export class GitHubClient {
   }
 
   /**
+   * Squash-merge a PR, guarded by the head SHA the caller evaluated.
+   *
+   * GitHub refuses the merge (409) when the PR head is no longer `opts.sha`, so
+   * a push that lands after the gate decided can never be merged unreviewed.
+   * Expected refusals are returned as outcomes; auth, rate-limit, 5xx and
+   * network failures THROW so they are never mistaken for a merge decision.
+   */
+  async mergePullRequest(
+    owner: string,
+    repo: string,
+    pullNumber: number,
+    opts: { sha: string; method: "squash" },
+  ): Promise<{
+    outcome: "merged" | "head-moved" | "already-merged" | "not-mergeable";
+    sha?: string;
+    message?: string;
+  }> {
+    const kit = await this.kit(owner);
+    try {
+      const { data } = await kit.rest.pulls.merge({
+        owner,
+        repo,
+        pull_number: pullNumber,
+        sha: opts.sha,
+        merge_method: opts.method,
+      });
+      return { outcome: "merged", sha: data.sha, message: data.message };
+    } catch (err) {
+      const status = (err as { status?: number }).status;
+      const message = err instanceof Error ? err.message : String(err);
+      if (status === 409) return { outcome: "head-moved", message };
+      if (status === 405 && /already merged/i.test(message)) {
+        return { outcome: "already-merged", message };
+      }
+      if (status === 405 || status === 422) return { outcome: "not-mergeable", message };
+      throw err;
+    }
+  }
+
+  /**
+   * Issues that block this issue (`blocked_by`) or that this issue blocks
+   * (`blocking`), via GitHub's issue-dependencies REST routes. Paginated at
+   * 100; throws on any transport error.
+   */
+  async listIssueDependencies(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    kind: "blocked_by" | "blocking",
+  ): Promise<
+    Array<{
+      number: number;
+      state: "open" | "closed";
+      stateReason: "completed" | "not_planned" | "reopened" | null;
+    }>
+  > {
+    const kit = await this.kit(owner);
+    const perPage = 100;
+    const out: Array<{
+      number: number;
+      state: "open" | "closed";
+      stateReason: "completed" | "not_planned" | "reopened" | null;
+    }> = [];
+    for (let page = 1; ; page++) {
+      const res = await kit.request(
+        `GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/${kind}`,
+        { owner, repo, issue_number: issueNumber, per_page: perPage, page },
+      );
+      const rows = res.data as Array<{ number: number; state: string; state_reason?: string | null }>;
+      for (const i of rows) {
+        out.push({
+          number: i.number,
+          state: i.state === "closed" ? "closed" : "open",
+          stateReason: (i.state_reason ?? null) as "completed" | "not_planned" | "reopened" | null,
+        });
+      }
+      if (rows.length < perPage) break;
+    }
+    return out;
+  }
+
+  /**
    * The OPEN pull request whose HEAD is this commit — the fork-PR answer to a
    * question `check_suite` / `check_run` payloads cannot answer themselves.
    *
@@ -2042,7 +2124,15 @@ export class GitHubClient {
       per_page: max,
     });
     if (!Array.isArray(res.data)) return null;
-    return res.data.map((f) => f.filename).filter((p): p is string => typeof p === "string" && !!p);
+    // A rename contributes BOTH names: the old path is where the change used to
+    // live, so a "where could this have landed" caller must see it too.
+    const paths = new Set<string>();
+    for (const f of res.data) {
+      for (const p of [f.filename, f.previous_filename]) {
+        if (typeof p === "string" && p) paths.add(p);
+      }
+    }
+    return [...paths];
   }
 
   /**
