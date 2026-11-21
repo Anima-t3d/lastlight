@@ -16,7 +16,8 @@ import type { StateDb } from "../state/db.js";
 import type { WorkflowRun } from "../state/workflow-run-store.js";
 import type { GitHubClient } from "./github/github.js";
 import { renderTemplate, type TemplateContext } from "lastlight-workflow-engine";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { ExecutorConfig } from "lastlight-workflow-engine";
 import { hostGit, sanitizeCheckout } from "./host-git.js";
@@ -265,7 +266,8 @@ function triggerMergeEvaluation(
  *  - `index-flags`: an entry marked assume-unchanged or skip-worktree, which
  *    makes status report a modified file as clean.
  * `ls-files` reads only the index: it starts no subprocess and does not
- * recurse (`submodule.recurse` does not apply to it).
+ * recurse (`submodule.recurse` does not apply to it). The dirty check itself
+ * runs against a fresh temp index (`temp-index` if that cannot be built).
  */
 export function readWorkspaceHead(
   config: Pick<ExecutorConfig, "sandboxDir" | "stateDir">,
@@ -273,7 +275,7 @@ export function readWorkspaceHead(
   owner: string,
   repo: string,
 ): string | undefined {
-  type Reason = "dirty-tree" | "no-commit" | "no-checkout" | "submodules" | "index-flags";
+  type Reason = "dirty-tree" | "no-commit" | "no-checkout" | "submodules" | "index-flags" | "temp-index";
   const refuse = (reason: Reason, err?: unknown): undefined => {
     log.warn("Not capturing the reviewed commit", { taskId, repo: `${owner}/${repo}`, reason, ...(err ? { err } : {}) });
     return undefined;
@@ -287,14 +289,22 @@ export function readWorkspaceHead(
     return refuse("no-checkout", err);
   }
   // `ls-files` lists every index entry: give it room for a large repository.
-  const run = (args: string[]) =>
-    hostGit(repoDir, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 256 * 1024 * 1024 });
+  // `indexFile` points git at the harness's temp index instead of `.git/index`.
+  const run = (args: string[], indexFile?: string) =>
+    hostGit(repoDir, args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      maxBuffer: 256 * 1024 * 1024,
+      ...(indexFile ? { env: { ...process.env, GIT_INDEX_FILE: indexFile } } : {}),
+    });
   // NUL-separated `ls-files` records; a failure to list means the index cannot be vouched for.
-  const indexEntries = (flag: "-s" | "-v"): string[] => run(["ls-files", flag, "-z"]).split("\0").filter(Boolean);
+  const indexEntries = (flag: "-s" | "-v", indexFile?: string): string[] =>
+    run(["ls-files", flag, "-z"], indexFile).split("\0").filter(Boolean);
+  // `<mode> <object> <stage>\t<path>`
+  const hasGitlink = (indexFile?: string) => indexEntries("-s", indexFile).some((e) => e.startsWith("160000 "));
   try {
     if (existsSync(join(repoDir, ".git", "modules"))) return refuse("submodules");
-    // `<mode> <object> <stage>\t<path>`
-    if (indexEntries("-s").some((e) => e.startsWith("160000 "))) return refuse("submodules");
+    if (hasGitlink()) return refuse("submodules");
   } catch (err: unknown) {
     return refuse("submodules", err);
   }
@@ -304,19 +314,52 @@ export function readWorkspaceHead(
   } catch (err: unknown) {
     return refuse("index-flags", err);
   }
+  let sha: string;
   try {
     run(["cat-file", "-e", "HEAD^{commit}"]);
+    sha = run(["rev-parse", "HEAD^{commit}"]).trim();
   } catch {
     return refuse("no-commit");
   }
+  if (!/^[0-9a-f]{40}$/i.test(sha)) return refuse("no-commit");
+
+  // The agent wrote `.git/index`, and status trusts its stat cache: an entry
+  // holding HEAD's blob with a modified file's stat reads as clean. So the tree
+  // is checked against a fresh index built from `sha` outside the checkout. It
+  // has no stat cache and no flags, so status must hash every file against HEAD
+  // (a HEAD that moved since `sha` shows as a staged change).
+  let indexDir: string | undefined;
   try {
-    // Submodules were refused above; never recurse into one regardless.
-    const status = ["-c", "submodule.recurse=false", "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=all"];
-    if (run(status).trim() !== "") return refuse("dirty-tree");
-    const sha = run(["rev-parse", "HEAD"]).trim();
-    return /^[0-9a-f]{40}$/i.test(sha) ? sha : refuse("no-commit");
-  } catch (err: unknown) {
-    // git could not say whether the tree is clean: do not vouch for it.
-    return refuse("dirty-tree", err);
+    let indexFile: string;
+    try {
+      indexDir = mkdtempSync(join(tmpdir(), "lastlight-review-index-"));
+      indexFile = join(indexDir, "index");
+      run(["read-tree", sha], indexFile);
+    } catch (err: unknown) {
+      return refuse("temp-index", err);
+    }
+    try {
+      // A gitlink in HEAD that the agent's index left out.
+      if (hasGitlink(indexFile)) return refuse("submodules");
+    } catch (err: unknown) {
+      return refuse("submodules", err);
+    }
+    try {
+      // Submodules were refused above; never recurse into one regardless.
+      const status = ["-c", "submodule.recurse=false", "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=all"];
+      return run(status, indexFile).trim() === "" ? sha : refuse("dirty-tree");
+    } catch (err: unknown) {
+      // git could not say whether the tree is clean: do not vouch for it.
+      return refuse("dirty-tree", err);
+    }
+  } finally {
+    if (indexDir) {
+      try {
+        rmSync(indexDir, { recursive: true, force: true });
+      } catch (err: unknown) {
+        // The verdict stands; a stray temp dir holds only a copy of HEAD's tree listing.
+        log.debug("Could not remove the temp index", { taskId, indexDir, err });
+      }
+    }
   }
 }

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WorkflowRun } from "#src/state/workflow-run-store.js";
@@ -373,6 +374,52 @@ describe("readWorkspaceHead", () => {
     commit(git);
     writeFileSync(join(repoDir, "scratch"), "notes");
     expect(capture(sandboxDir)).toEqual({ sha: git("rev-parse", "HEAD"), reasons: [] });
+  });
+
+  // Temp index dirs readWorkspaceHead creates under os.tmpdir().
+  const tempIndexDirs = () => readdirSync(tmpdir()).filter((n) => n.startsWith("lastlight-review-index-"));
+
+  it("refuses a modification hidden by a forged index entry (HEAD blob, current stat)", () => {
+    const sandboxDir = tmp();
+    const { repoDir, git } = checkout(sandboxDir);
+    const headBlob = git("rev-parse", "HEAD:f");
+    writeFileSync(join(repoDir, "f"), "changed");
+    // Back-date the file so the entry is not "racily clean" against the index's own mtime.
+    const past = new Date(Date.now() - 60_000);
+    utimesSync(join(repoDir, "f"), past, past);
+    git("update-index", "f"); // the index now holds the new blob with the file's current stat
+    const indexPath = join(repoDir, ".git", "index");
+    const idx = readFileSync(indexPath);
+    expect(idx.subarray(0, 4).toString()).toBe("DIRC");
+    expect(idx.readUInt32BE(8)).toBe(1); // one entry, starting at byte 12; its object id at 12 + 40
+    Buffer.from(headBlob, "hex").copy(idx, 52);
+    createHash("sha1").update(idx.subarray(0, idx.length - 20)).digest().copy(idx, idx.length - 20);
+    writeFileSync(indexPath, idx);
+    expect(git("status", "--porcelain")).toBe(""); // the forgery hides the change from plain status
+    expect(git("ls-files", "-v")).toBe("H f"); // and sets no index flag
+    expect(capture(sandboxDir)).toEqual({ sha: undefined, reasons: ["dirty-tree"] });
+  });
+
+  it("removes its temp index after a capture and after a refusal", () => {
+    const before = tempIndexDirs();
+    const clean = tmp();
+    const { git } = checkout(clean);
+    expect(capture(clean)).toEqual({ sha: git("rev-parse", "HEAD"), reasons: [] });
+    expect(tempIndexDirs()).toEqual(before);
+    const dirty = tmp();
+    writeFileSync(join(checkout(dirty).repoDir, "f"), "changed");
+    expect(capture(dirty)).toEqual({ sha: undefined, reasons: ["dirty-tree"] });
+    expect(tempIndexDirs()).toEqual(before);
+  });
+
+  it("refuses temp-index when HEAD's tree cannot be read into the temp index", () => {
+    const before = tempIndexDirs();
+    const sandboxDir = tmp();
+    const { repoDir, git } = checkout(sandboxDir);
+    const tree = git("rev-parse", "HEAD^{tree}");
+    rmSync(join(repoDir, ".git", "objects", tree.slice(0, 2), tree.slice(2)));
+    expect(capture(sandboxDir)).toEqual({ sha: undefined, reasons: ["temp-index"] });
+    expect(tempIndexDirs()).toEqual(before);
   });
 });
 
