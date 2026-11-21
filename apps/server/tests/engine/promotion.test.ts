@@ -21,6 +21,7 @@ import {
   setRuntimeConfig,
   resetRuntimeConfigForTests,
   defaultAutonomyConfig,
+  getHoldLabel,
   type LastLightConfig,
 } from "#src/config/config.js";
 
@@ -169,6 +170,71 @@ describe("promoteDependents", () => {
     const gh = fake({});
     gh.listIssueDependencies.mockRejectedValueOnce(new Error("down"));
     await expect(promoteDependents(asDeps(gh), "o/r", 1)).resolves.toBeUndefined();
+  });
+});
+
+describe("hold and block safety", () => {
+  const HOLD = "lastlight:hold";
+  const base = (labels: string[], bb: Dep[]) =>
+    fake({
+      issues: { 7: { labels, state: "open" } },
+      blocking: { 1: [{ number: 7, state: "open", stateReason: null }] },
+      blockedBy: { 7: bb },
+    });
+  const completed: Dep = { number: 1, state: "closed", stateReason: "completed" };
+  const notPlanned: Dep = { number: 1, state: "closed", stateReason: "not_planned" };
+
+  it("resolvePromotion: held outranks promote and block", () => {
+    const cfg = { ...CFG, holdLabel: HOLD };
+    const issue = { labels: [QUEUED, HOLD], state: "open" as const };
+    expect(resolvePromotion(issue, [done], cfg).reason.startsWith("held")).toBe(true);
+    const np = resolvePromotion(issue, [{ state: "closed", stateReason: "not_planned" }], cfg);
+    expect(np.decision).toBe("skip");
+    expect(np.reason.startsWith("held")).toBe(true);
+  });
+
+  it("a held queued issue with all blockers completed is not promoted", async () => {
+    const gh = base([QUEUED, getHoldLabel()], [completed]);
+    await promoteDependents(asDeps(gh), "o/r", 1);
+    expect(gh.addLabels).not.toHaveBeenCalled();
+    expect(gh.removeLabel).not.toHaveBeenCalled();
+    expect(gh.postComment).not.toHaveBeenCalled();
+  });
+
+  it("a held issue with a not_planned blocker is not blocked and gets no comment", async () => {
+    const gh = base([QUEUED, getHoldLabel()], [notPlanned]);
+    await promoteDependents(asDeps(gh), "o/r", 1);
+    expect(gh.addLabels).not.toHaveBeenCalled();
+    expect(gh.postComment).not.toHaveBeenCalled();
+  });
+
+  it("block with add-failed posts no comment", async () => {
+    const gh = base([QUEUED], [notPlanned]);
+    gh.addLabels.mockRejectedValue(new Error("nope"));
+    await promoteDependents(asDeps(gh), "o/r", 1);
+    expect(gh.postComment).not.toHaveBeenCalled();
+  });
+
+  it("block with remove-failed posts no comment", async () => {
+    const gh = base([QUEUED], [notPlanned]);
+    gh.removeLabel.mockRejectedValue(new Error("nope"));
+    await promoteDependents(asDeps(gh), "o/r", 1);
+    expect(gh.postComment).not.toHaveBeenCalled();
+  });
+
+  it("two evaluations of a block whose advance keeps failing post zero comments", async () => {
+    const gh = base([QUEUED], [notPlanned]);
+    gh.addLabels.mockRejectedValue(new Error("nope"));
+    await promoteDependents(asDeps(gh), "o/r", 1);
+    await promoteDependents(asDeps(gh), "o/r", 1);
+    expect(gh.postComment).not.toHaveBeenCalled();
+  });
+
+  it("an issue already at agent-blocked gets no second comment", async () => {
+    const gh = base([QUEUED, "agent-blocked"], [notPlanned]);
+    await promoteDependents(asDeps(gh), "o/r", 1);
+    expect(gh.addLabels).not.toHaveBeenCalled();
+    expect(gh.postComment).not.toHaveBeenCalled();
   });
 });
 

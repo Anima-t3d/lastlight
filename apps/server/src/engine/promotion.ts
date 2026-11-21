@@ -24,7 +24,7 @@
 import type { GitHubClient } from "./github/github.js";
 import type { Decision } from "./pr-decisions.js";
 import { advanceStage } from "./stage-advance.js";
-import { getAutonomyConfig, isAutonomousRepo } from "../config/config.js";
+import { getAutonomyConfig, getHoldLabel, isAutonomousRepo } from "../config/config.js";
 import { logger } from "../logging/logger.js";
 
 const log = logger("promotion");
@@ -34,7 +34,7 @@ export type PromotionDecision = "promote" | "wait" | "block" | "skip";
 export function resolvePromotion(
   issue: { labels: readonly string[]; state: "open" | "closed" },
   blockers: ReadonlyArray<{ state: "open" | "closed"; stateReason: string | null }>,
-  cfg: { queuedLabel: string; autonomyEnabled: boolean },
+  cfg: { queuedLabel: string; autonomyEnabled: boolean; holdLabel?: string },
 ): Decision<PromotionDecision> {
   const inputs = { state: issue.state, blockers: blockers.length };
   if (!cfg.autonomyEnabled) {
@@ -45,6 +45,11 @@ export function resolvePromotion(
   }
   if (!issue.labels.includes(cfg.queuedLabel)) {
     return { decision: "skip", reason: `not-queued: the issue does not carry \`${cfg.queuedLabel}\``, inputs };
+  }
+  // A held issue is never promoted or blocked, so lifting the hold later does
+  // not build it without a human re-label.
+  if (cfg.holdLabel && issue.labels.includes(cfg.holdLabel)) {
+    return { decision: "skip", reason: `held: the issue carries the hold label \`${cfg.holdLabel}\``, inputs };
   }
   if (blockers.some((b) => b.state === "closed" && b.stateReason === "not_planned")) {
     return { decision: "block", reason: "blocker-not-planned: a blocker was closed as not planned", inputs };
@@ -106,7 +111,7 @@ async function evaluate(
   if (issue.state === "closed" || !issue.labels.includes(autonomy.queuedLabel)) return;
 
   const blockers = await github.listIssueDependencies(owner, repo, issueNumber, "blocked_by");
-  const result = resolvePromotion(issue, blockers, { queuedLabel: autonomy.queuedLabel, autonomyEnabled: true });
+  const result = resolvePromotion(issue, blockers, { queuedLabel: autonomy.queuedLabel, autonomyEnabled: true, holdLabel: getHoldLabel() });
   log.info("Promotion evaluated", { repo: `${owner}/${repo}`, issueNumber, decision: result.decision, reason: result.reason });
 
   if (result.decision === "promote") {
@@ -115,11 +120,23 @@ async function evaluate(
       { github: github as GitHubClient },
     );
   } else if (result.decision === "block") {
+    // Already parked on the failure label: nothing to do, and no second comment.
+    if (stage.on_failure && issue.labels.includes(stage.on_failure)) return;
     const bad = blockers.find((b) => b.state === "closed" && b.stateReason === "not_planned");
-    await advanceStage(
+    const moved = await advanceStage(
       { owner, repo, issueNumber, from: autonomy.queuedLabel, to: stage.on_failure },
       { github: github as GitHubClient },
     );
+    // Comment only once the label really moved (queued removed, failure added);
+    // otherwise the issue stays queued and every sweep would comment again.
+    if (!(moved.advanced && moved.removed)) {
+      log.warn("Block did not move the label; no comment posted", {
+        repo: `${owner}/${repo}`,
+        issueNumber,
+        reason: moved.reason,
+      });
+      return;
+    }
     if (bad) {
       await github.postComment(
         owner,
