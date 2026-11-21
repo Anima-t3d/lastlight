@@ -124,3 +124,58 @@ describe("listPullRequestFilePaths renames", () => {
     expect(await c.listPullRequestFilePaths("o", "r", 1)).toEqual(["new/a.ts", "old/a.ts", "b.ts"]);
   });
 });
+
+describe("listAllPullRequestFilePaths", () => {
+  const file = (name: string, prev?: string) => ({ filename: name, previous_filename: prev });
+  const make = (changed: number, pages: Array<Array<ReturnType<typeof file>>>) => {
+    const listFiles = vi.fn(async (p: { page: number }) => ({ data: pages[p.page - 1] ?? [] }));
+    const get = vi.fn(async () => ({ data: { changed_files: changed } }));
+    return { listFiles, c: clientWith({ rest: { pulls: { listFiles, get } } }) };
+  };
+
+  it("walks 2 pages and includes rename previous names, deduped", async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => file(`f${i}.ts`));
+    page1[0] = file("new/a.ts", "old/a.ts");
+    const { c, listFiles } = make(102, [page1, [file("x.ts"), file("old/a.ts")]]);
+    const out = await c.listAllPullRequestFilePaths("o", "r", 1);
+    expect(out).toContain("old/a.ts");
+    expect(out).toContain("new/a.ts");
+    expect(out).toContain("x.ts");
+    expect(out).toHaveLength(102);
+    expect(new Set(out).size).toBe(102);
+    expect(listFiles).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns null when fewer files were fetched than changed_files", async () => {
+    const { c } = make(150, [[file("a.ts")]]);
+    expect(await c.listAllPullRequestFilePaths("o", "r", 1)).toBeNull();
+  });
+
+  it("returns null when the 3000-file ceiling is reached", async () => {
+    const pages = Array.from({ length: 31 }, (_, p) =>
+      Array.from({ length: 100 }, (_, i) => file(`d${p}/f${i}.ts`)),
+    );
+    const { c } = make(3000, pages);
+    expect(await c.listAllPullRequestFilePaths("o", "r", 1)).toBeNull();
+  });
+
+  it("propagates errors", async () => {
+    const c = clientWith({
+      rest: { pulls: { get: async () => { throw httpError(500, "boom"); }, listFiles: vi.fn() } },
+    });
+    await expect(c.listAllPullRequestFilePaths("o", "r", 1)).rejects.toThrow("boom");
+  });
+});
+
+describe("listIssueDependencies state_reason narrowing", () => {
+  it("maps unexpected state_reason to null", async () => {
+    const request = vi.fn(async () => ({
+      data: [
+        { number: 1, state: "closed", state_reason: "duplicate" },
+        { number: 2, state: "closed", state_reason: "completed" },
+      ],
+    }));
+    const out = await clientWith({ request }).listIssueDependencies("o", "r", 5, "blocked_by");
+    expect(out.map((i) => i.stateReason)).toEqual([null, "completed"]);
+  });
+});

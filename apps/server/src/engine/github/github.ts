@@ -1124,7 +1124,12 @@ export class GitHubClient {
         out.push({
           number: i.number,
           state: i.state === "closed" ? "closed" : "open",
-          stateReason: (i.state_reason ?? null) as "completed" | "not_planned" | "reopened" | null,
+          stateReason:
+            i.state_reason === "completed" ||
+            i.state_reason === "not_planned" ||
+            i.state_reason === "reopened"
+              ? i.state_reason
+              : null,
         });
       }
       if (rows.length < perPage) break;
@@ -2132,6 +2137,48 @@ export class GitHubClient {
         if (typeof p === "string" && p) paths.add(p);
       }
     }
+    return [...paths];
+  }
+
+  /**
+   * EVERY path a pull request touches (renames contribute both names), or
+   * `null` when completeness cannot be confirmed — fail closed, for gates that
+   * must not miss a protected path hiding past the first page.
+   *
+   * Pages `pulls.listFiles` at 100 until a short page. `null` when fewer entries
+   * were fetched than the PR's `changed_files`, or when GitHub's 3000-file
+   * listing ceiling is reached (it silently stops there). Errors propagate.
+   */
+  async listAllPullRequestFilePaths(
+    owner: string,
+    repo: string,
+    pullNumber: number,
+  ): Promise<string[] | null> {
+    const perPage = 100;
+    const ceiling = 3000;
+    const kit = await this.kit(owner);
+    const { data: pr } = await kit.rest.pulls.get({ owner, repo, pull_number: pullNumber });
+    const paths = new Set<string>();
+    let fetched = 0;
+    for (let page = 1; fetched < ceiling; page++) {
+      const res = await kit.rest.pulls.listFiles({
+        owner,
+        repo,
+        pull_number: pullNumber,
+        per_page: perPage,
+        page,
+      });
+      if (!Array.isArray(res.data)) return null;
+      for (const f of res.data) {
+        for (const p of [f.filename, f.previous_filename]) {
+          if (typeof p === "string" && p) paths.add(p);
+        }
+      }
+      fetched += res.data.length;
+      if (res.data.length < perPage) break;
+    }
+    if (fetched >= ceiling) return null;
+    if (fetched < pr.changed_files) return null;
     return [...paths];
   }
 
