@@ -166,9 +166,11 @@ export function RepoApprovalPanel({
                 {data.approved.map((r) => (
                   <li
                     key={r}
-                    className="rounded border border-hairline px-2 py-1 flex flex-wrap items-center gap-2 text-xs"
+                    className="rounded border border-hairline px-2 py-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs"
                   >
-                    <span className="font-mono text-base-content break-all min-w-0 flex-1">{r}</span>
+                    {/* Full row for the name: as a shrinkable flex-1 item it collapsed to one
+                        letter per line on a phone once the row held three toggles. */}
+                    <span className="font-mono text-base-content break-all basis-full">{r}</span>
                     {noAccess.has(r.toLowerCase()) && <span className="text-warning">App has no access</span>}
                     <label
                       className="flex items-center gap-1 text-muted cursor-pointer"
