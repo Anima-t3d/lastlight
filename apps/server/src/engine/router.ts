@@ -163,6 +163,35 @@ function stageForLabel(
   return undefined;
 }
 
+/**
+ * The build stage whose `on_failure` label `labels` carries — the issue a
+ * `@bot retry` may restart. Only a stage whose workflow is `build`.
+ */
+function blockedBuildStage(
+  labels: readonly string[] | undefined,
+): { name: string; stage: AutonomyStageConfig } | undefined {
+  if (!labels?.length) return undefined;
+  try {
+    for (const [name, stage] of Object.entries(getAutonomyConfig().stages)) {
+      if (stageWorkflow(stage) === "build" && labels.includes(stage.on_failure)) return { name, stage };
+    }
+  } catch (err: unknown) {
+    log.warn("Could not resolve the autonomy stages; not treating the comment as a build retry", { err });
+  }
+  return undefined;
+}
+
+/** The most of a `@bot retry` hint the architect is shown. */
+export const RETRY_HINT_MAX_CHARS = 2000;
+
+/**
+ * The text after `retry`, trimmed and capped. A run of three or more backticks
+ * is shortened so the hint cannot close the fence the prompt renders it in.
+ */
+function retryHint(raw: string): string {
+  return raw.replace(/`{3,}/g, "``").trim().slice(0, RETRY_HINT_MAX_CHARS).trim();
+}
+
 /** Friendly reply when a Slack/CLI command targets an unmanaged repo. */
 function unmanagedRepoReply(repo: string): string {
   return (
@@ -855,6 +884,62 @@ export async function routeEvent(
               by: envelope.sender,
               ...(note ? { note } : {}),
             },
+          },
+        };
+      }
+
+      // `@<bot> retry [hint]` on an ISSUE the build pipeline handed to a human
+      // (its build stage's `on_failure` label, `agent-blocked`) — restart the
+      // build, with the maintainer's hint rendered for the architect.
+      //
+      // Maintainer-gated by the `MAINTAINER_ROLES` check above, like every
+      // mutating `@`-mention command (there is no per-command permission check
+      // anywhere in the router). The bot is refused here too, although the
+      // connector already drops bot comments.
+      //
+      // Dispatched as a HUMAN request (`_buildRoute: "api"`), attempt 1, so the
+      // build gate's human-retry rule applies and the run gets its own one
+      // escalation. On any other issue `retry` falls through to classification.
+      const issueRetryMatch = !envelope.prNumber && envelope.issueNumber
+        ? envelope.body.match(bot.command("retry\\b([\\s\\S]*)"))
+        : null;
+      const blocked = issueRetryMatch && envelope.repo && isAutonomousRepo(envelope.repo)
+        ? blockedBuildStage(envelope.labels)
+        : undefined;
+      if (issueRetryMatch && blocked) {
+        if (envelope.senderIsBot || envelope.sender.endsWith("[bot]")) {
+          return { action: "ignore", reason: "a bot cannot retry a blocked build" };
+        }
+        let hint = retryHint(issueRetryMatch[1] ?? "");
+        if (hint) {
+          // Untrusted text bound for the architect's prompt: screened like any
+          // comment, and flagged rather than refused.
+          const screen = await screenForInjection(hint);
+          if (screen.flagged) hint = `${flagPrefix(screen.reason)}${hint}`;
+        }
+        log.info("Blocked build retry requested", {
+          repo: envelope.repo,
+          issueNumber: envelope.issueNumber,
+          by: envelope.sender,
+          stage: blocked.name,
+          hasHint: !!hint,
+        });
+        return {
+          action: "handler",
+          handler: stageWorkflow(blocked.stage),
+          context: {
+            _routeKey: "github.issue_retry",
+            _stage: blocked.name,
+            _buildRoute: "api",
+            _senderIsBot: false,
+            _attempt: 1,
+            ...(hint ? { _hint: hint } : {}),
+            repo: envelope.repo,
+            issueNumber: envelope.issueNumber,
+            title: envelope.title,
+            sender: envelope.sender,
+            commentBody: envelope.body,
+            labels: envelope.labels,
           },
         };
       }

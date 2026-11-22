@@ -356,6 +356,8 @@ export interface LastLightConfig {
   dependencies: DependenciesConfig;
   /** The autonomous merge gate's policy — see {@link MergeConfig}. */
   merge: MergeConfig;
+  /** L3 escalation of a failed autonomous build — see {@link BuildConfig}. */
+  build: BuildConfig;
   concurrency: { maxWorkflows: number; maxQueueWaitMs: number };
   /**
    * Sandbox-workspace reaping (issue #106). The harness owns cleanup of the
@@ -807,6 +809,53 @@ export function getMergeConfig(repo?: string): MergeConfig {
   if (!repo) return operator;
   const layer = getCachedRepoLayer(repo)?.config?.merge;
   return resolveMergeConfig(operator, layer);
+}
+
+// ---------------------------------------------------------------------------
+// build: — L3 escalation of a failed autonomous build
+// ---------------------------------------------------------------------------
+
+/**
+ * How often a failed AUTONOMOUS build is retried before it goes to a human
+ * (`engine/stage-observer.ts`), and from which attempt the run's `executor` /
+ * `fix` models are swapped for `models["executor-retry"]` /
+ * `models["fix-retry"]` (when those keys are set; unset = no swap).
+ * Operator-only: there is no repo layer for it.
+ */
+export interface BuildConfig {
+  /** Attempts ABOVE this use the `-retry` models. `0` = from attempt 1. */
+  escalateAfterAttempt: number;
+  /** The most attempts one failure chain may reach, the first included. */
+  maxAttempts: number;
+}
+
+/** The shipped `build:` block. Mirrors `build:` in `config/default.yaml`. */
+export function defaultBuildConfig(): BuildConfig {
+  return { escalateAfterAttempt: 1, maxAttempts: 2 };
+}
+
+function normalizeBuildConfig(raw: unknown): BuildConfig {
+  const defaults = defaultBuildConfig();
+  const node = isPlainObject(raw) ? raw : {};
+  const after = node.escalateAfterAttempt;
+  const max = node.maxAttempts;
+  const wholeAtLeast = (v: unknown, min: number): v is number =>
+    typeof v === "number" && Number.isInteger(v) && v >= min;
+  if (after !== undefined && !wholeAtLeast(after, 0)) {
+    log.warn("Ignoring invalid build.escalateAfterAttempt — must be a whole number >= 0", { value: after });
+  }
+  if (max !== undefined && !wholeAtLeast(max, 1)) {
+    log.warn("Ignoring invalid build.maxAttempts — must be a whole number >= 1", { value: max });
+  }
+  return {
+    escalateAfterAttempt: wholeAtLeast(after, 0) ? after : defaults.escalateAfterAttempt,
+    maxAttempts: wholeAtLeast(max, 1) ? max : defaults.maxAttempts,
+  };
+}
+
+/** The operator's `build:` block, or the shipped defaults before boot. */
+export function getBuildConfig(): BuildConfig {
+  return currentConfig?.build ?? defaultBuildConfig();
 }
 
 /**
@@ -1485,6 +1534,7 @@ export function loadConfig(): LastLightConfig {
     fix: fileCfg.fix,
     dependencies: fileCfg.dependencies,
     merge: fileCfg.merge,
+    build: fileCfg.build,
     concurrency: fileCfg.concurrency,
     cleanup: fileCfg.cleanup,
     feedback: fileCfg.feedback,
@@ -1532,6 +1582,7 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
   fix: FixConfig;
   dependencies: DependenciesConfig;
   merge: MergeConfig;
+  build: BuildConfig;
   otel: OtelConfig;
   concurrency: { maxWorkflows: number; maxQueueWaitMs: number };
   cleanup: { sandbox: SandboxCleanupConfig };
@@ -2011,6 +2062,7 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
     fix,
     dependencies,
     merge: normalizeMergeConfig(raw.merge),
+    build: normalizeBuildConfig(raw.build),
     otel: normalizeOtelFileConfig(otelRaw),
     concurrency: { maxWorkflows, maxQueueWaitMs },
     cleanup: { sandbox: sandboxCleanup },

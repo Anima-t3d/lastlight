@@ -23,7 +23,7 @@
  * keeps the footprint of this feature small enough to read in one sitting.
  */
 
-import { getAutonomyConfig, getHoldLabel, isAutonomousRepo, stageWorkflow } from "../config/config.js";
+import { getAutonomyConfig, getBuildConfig, getHoldLabel, isAutonomousRepo, stageWorkflow } from "../config/config.js";
 import type { AutonomyStageConfig } from "../config/config.js";
 import { issueTriggerId, resolveBuildTrigger } from "./build-decisions.js";
 import { advanceStage } from "./stage-advance.js";
@@ -47,10 +47,15 @@ export interface BuildGateArgs {
   labels: readonly string[];
   /** The label whose application triggered this, when one did. */
   addedLabel?: string;
-  /** Which surface this dispatch arrived on. */
-  route: "labeled" | "sweep" | "api";
+  /**
+   * Which surface this dispatch arrived on. `escalation` is the terminal
+   * observer's one retry of a failed autonomous build.
+   */
+  route: "labeled" | "sweep" | "api" | "escalation";
   /** Did OUR bot apply the label? Drives the already-built asymmetry. */
   senderIsBot: boolean;
+  /** The dispatch's `_attempt` (default 1). Bounded by `build.maxAttempts` on `escalation`. */
+  attempt?: number;
   /** Stage name from `autonomy.stages`, e.g. "build". */
   stage: string;
 }
@@ -161,6 +166,17 @@ export async function applyBuildDispatchGate(
     // same pre-burst count.
     const pending = await pendingReservations(deps.db, workflow, triggerId);
     const concurrentAutonomousBuilds = liveRows + pending.length;
+    // The escalation dedupe key is (triggerId, attempt): one failed run buys at
+    // most one retry, however often its terminal observer fires. Two halves,
+    // because the run row a dispatch creates appears only later: a build run
+    // for this trigger already stamped with this attempt (the durable half), or
+    // this gate's own live reservation for it (the in-process half).
+    const attempt = args.attempt ?? 1;
+    const escalationDispatched =
+      args.route === "escalation"
+        ? (await attemptAlreadyRun(deps.db, workflow, triggerId, attempt)) ||
+          reservedAttempt(deps.db, workflow, triggerId) >= attempt
+        : false;
     const spendTodayUsd = dailyStats[dailyStats.length - 1]?.costUsd ?? 0;
 
     const decision = resolveBuildTrigger({
@@ -180,8 +196,11 @@ export async function applyBuildDispatchGate(
       spendTodayUsd,
       repoSpendTodayUsd: repoSpend.costUsd,
       usage,
+      attempt,
+      maxAttempts: getBuildConfig().maxAttempts,
+      escalationDispatched,
     }, budget);
-    if (decision.decision === "dispatch") reserve(deps.db, workflow, triggerId, args.repo);
+    if (decision.decision === "dispatch") reserve(deps.db, workflow, triggerId, args.repo, attempt);
     return decision;
   });
 
@@ -281,6 +300,8 @@ interface Reservation {
   triggerId: string;
   repo: string;
   at: number;
+  /** The dispatch's `_attempt`: the in-process half of the escalation dedupe. */
+  attempt: number;
 }
 
 const RESERVATION_TTL_MS = 5 * 60_000;
@@ -295,8 +316,31 @@ function reservationsFor(db: StateDb): Map<string, Reservation> {
   return held;
 }
 
-function reserve(db: StateDb, workflow: string, triggerId: string, repo: string): void {
-  reservationsFor(db).set(`${workflow}\u0000${triggerId}`, { workflow, triggerId, repo, at: Date.now() });
+function reserve(db: StateDb, workflow: string, triggerId: string, repo: string, attempt: number): void {
+  reservationsFor(db).set(`${workflow}\u0000${triggerId}`, { workflow, triggerId, repo, at: Date.now(), attempt });
+}
+
+/** The attempt this trigger's live (unexpired) reservation was made for, else 0. */
+function reservedAttempt(db: StateDb, workflow: string, triggerId: string): number {
+  const r = reservationsFor(db).get(`${workflow}\u0000${triggerId}`);
+  return r && Date.now() - r.at <= RESERVATION_TTL_MS ? r.attempt : 0;
+}
+
+/**
+ * Does the latest `workflow` run for this trigger already carry `_attempt >=
+ * attempt`? Then this escalation was dispatched before. Read defensively: the
+ * context is untyped JSON, and an old row carries no `_attempt` (attempt 1).
+ */
+async function attemptAlreadyRun(
+  db: StateDb,
+  workflow: string,
+  triggerId: string,
+  attempt: number,
+): Promise<boolean> {
+  const latest = await db.runs.latestForTrigger([workflow], triggerId);
+  const stamped = latest?.context?._attempt;
+  const latestAttempt = typeof stamped === "number" && Number.isFinite(stamped) ? stamped : 1;
+  return !!latest && latestAttempt >= attempt;
 }
 
 /**

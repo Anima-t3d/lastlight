@@ -212,6 +212,94 @@ describe("applyBuildDispatchGate", () => {
     expect(result.reason).toMatch(/^retry:/);
   });
 
+  describe("the escalation route", () => {
+    /** The failed attempt-1 run the observer is escalating, as the store holds it. */
+    async function seedAttempt(id: string, attempt: number, status: "failed" | "running" = "failed") {
+      await db.runs.createRun({
+        id,
+        workflowName: "build",
+        triggerId: issueTriggerId(REPO, ISSUE),
+        owner: "cliftonc",
+        repo: "lastlight",
+        issueNumber: ISSUE,
+        currentPhase: "executor",
+        status,
+        context: { _stage: "build", _autonomous: true, _attempt: attempt },
+        // Later attempts start later, as they do in life — `latestForTrigger` orders on it.
+        startedAt: new Date(Date.now() - 10_000 + attempt * 1000).toISOString(),
+      });
+    }
+    const escalate = (attempt: number) =>
+      args({ route: "escalation", senderIsBot: true, addedLabel: undefined, labels: [STAGE_AGENT_BUILDING], attempt });
+
+    it("dispatches attempt 2 although a build already ran — and keeps the issue on running", async () => {
+      await seedAttempt("run-a1", 1);
+      const github = fakeGithub();
+
+      const result = await applyBuildDispatchGate(escalate(2), { db, github });
+
+      expect(result.decision).toBe("dispatch");
+      expect(result.reason).toMatch(/^escalation:/);
+      // The advance re-asserts `running`; the failure label it clears was never applied.
+      expect(github.addLabels).toHaveBeenCalledWith("cliftonc", "lastlight", ISSUE, [STAGE_AGENT_BUILDING]);
+    });
+
+    it("skips attempt 3 with the packaged maxAttempts of 2", async () => {
+      await seedAttempt("run-a1", 1);
+      await seedAttempt("run-a2", 2);
+      const result = await applyBuildDispatchGate(escalate(3), { db, github: fakeGithub() });
+      expect(result.decision).toBe("skip");
+      expect(result.reason).toMatch(/^attempts-exhausted:/);
+    });
+
+    it("skips a second escalation for the same (trigger, attempt) — one failed run, one retry", async () => {
+      await seedAttempt("run-a1", 1);
+      // The first escalation's run already exists for attempt 2 and has since ended.
+      await seedAttempt("run-a2", 2);
+      const result = await applyBuildDispatchGate(escalate(2), { db, github: fakeGithub() });
+      expect(result.decision).toBe("skip");
+      expect(result.reason).toMatch(/^already-escalated:/);
+    });
+
+    it("skips a second escalation that arrives before the first one's run row exists", async () => {
+      await seedAttempt("run-a1", 1);
+      const first = await applyBuildDispatchGate(escalate(2), { db, github: fakeGithub() });
+      const second = await applyBuildDispatchGate(escalate(2), { db, github: fakeGithub() });
+      expect(first.decision).toBe("dispatch");
+      expect(second.decision).toBe("skip");
+      expect(second.reason).toMatch(/^already-escalated:/);
+    });
+
+    it("a human restart opens a fresh chain: an OLDER attempt-2 run does not block it", async () => {
+      // Chain 1 ran attempts 1 and 2 and handed off; `@bot retry` started a new
+      // attempt 1, which has now failed. Only the LATEST run is the key.
+      useBudget({ maxBuildsPerRepoPerDay: 10 });
+      await seedAttempt("run-old-a1", 1);
+      await seedAttempt("run-old-a2", 2);
+      await db.runs.createRun({
+        id: "run-new-a1",
+        workflowName: "build",
+        triggerId: issueTriggerId(REPO, ISSUE),
+        owner: "cliftonc",
+        repo: "lastlight",
+        issueNumber: ISSUE,
+        currentPhase: "executor",
+        status: "failed",
+        context: { _stage: "build", _autonomous: true, _attempt: 1 },
+        startedAt: new Date().toISOString(),
+      });
+      const result = await applyBuildDispatchGate(escalate(2), { db, github: fakeGithub() });
+      expect(result.decision).toBe("dispatch");
+    });
+
+    it("a BOT re-label of an already-built issue still skips", async () => {
+      await seedAttempt("run-a1", 1);
+      const result = await applyBuildDispatchGate(args({ senderIsBot: true, attempt: 2 }), { db, github: fakeGithub() });
+      expect(result.decision).toBe("skip");
+      expect(result.reason).toMatch(/^already-built:/);
+    });
+  });
+
   it("skips a held issue silently — no label, no advance", async () => {
     const github = fakeGithub();
 

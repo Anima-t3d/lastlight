@@ -13,8 +13,12 @@
 import { describe, it, expect } from "vitest";
 import {
   resolveBuildTrigger,
+  resolveBuildEscalation,
+  classifyBuildFailure,
   issueTriggerId,
   type BuildTriggerInputs,
+  type FailureClass,
+  type BuildFailureFacts,
 } from "#src/engine/build-decisions.js";
 import type { AutonomyBudgetConfig } from "#src/config/config.js";
 
@@ -545,5 +549,230 @@ describe("resolveBuildTrigger — the budget on the record", () => {
     const budget = { ...BUDGET };
     const d = decide(inputs(), budget);
     expect(d.inputs.budget).not.toBe(budget);
+  });
+});
+
+/**
+ * L3 escalation: a failed AUTONOMOUS build gets one retry on the retry models,
+ * then a human. The table is the whole policy.
+ */
+describe("resolveBuildEscalation", () => {
+  const MAX = { maxAttempts: 2 };
+  const cases: Array<[string, FailureClass, number, boolean, "retry" | "hand-off" | "hold", RegExp]> = [
+    ["attempt 1 truncated retries", "truncated", 1, true, "retry", /^retry:/],
+    ["attempt 1 review-rejected retries", "review-rejected", 1, true, "retry", /^retry:/],
+    ["attempt 1 executor-failed retries", "executor-failed", 1, true, "retry", /^retry:/],
+    ["attempt 1 gate-blocked-after-change retries", "gate-blocked-after-change", 1, true, "retry", /^retry:/],
+    ["attempt 2 truncated hands off", "truncated", 2, true, "hand-off", /^attempts-exhausted:/],
+    ["attempt 2 review-rejected hands off", "review-rejected", 2, true, "hand-off", /^attempts-exhausted:/],
+    ["attempt 2 executor-failed hands off", "executor-failed", 2, true, "hand-off", /^attempts-exhausted:/],
+    ["attempt 2 other hands off", "other", 2, true, "hand-off", /^not-retryable:|^attempts-exhausted:/],
+    ["provider-account holds", "provider-account", 1, true, "hold", /^provider-account:/],
+    ["provider-account holds even with usage blocked", "provider-account", 1, false, "hold", /^provider-account:/],
+    ["usage blocked holds a retryable failure", "truncated", 1, false, "hold", /^usage-held:/],
+    ["cancelled hands off", "cancelled", 1, true, "hand-off", /^not-retryable:/],
+    ["other hands off", "other", 1, true, "hand-off", /^not-retryable:/],
+    ["gate-blocked-before-change hands off", "gate-blocked-before-change", 1, true, "hand-off", /^not-retryable:/],
+    ["usage blocked does not turn a hand-off into a hold", "other", 1, false, "hand-off", /^not-retryable:/],
+    ["usage blocked at attempt 2 still hands off", "truncated", 2, false, "hand-off", /^attempts-exhausted:/],
+  ];
+
+  it.each(cases)("%s", (_name, failure, attempt, usageAllows, expected, reason) => {
+    const d = resolveBuildEscalation({ failure, attempt, usageAllows }, MAX);
+    expect(d.decision).toBe(expected);
+    expect(d.reason).toMatch(reason);
+    expect(d.inputs).toMatchObject({ failure, attempt, usageAllows, maxAttempts: 2 });
+  });
+
+  it("a larger budget retries again at attempt 2", () => {
+    expect(resolveBuildEscalation({ failure: "truncated", attempt: 2, usageAllows: true }, { maxAttempts: 3 }).decision)
+      .toBe("retry");
+  });
+});
+
+/**
+ * The failure class is read from what OUR code persisted on the run row and its
+ * ledger rows — prefixes and stop reasons — never from agent prose.
+ */
+describe("classifyBuildFailure", () => {
+  const row = (phase: string, over: Partial<BuildFailureFacts["phases"][number]> = {}) => ({
+    phase: `build:${phase}`,
+    success: true,
+    ...over,
+  });
+  const facts = (over: Partial<BuildFailureFacts> = {}): BuildFailureFacts => ({
+    status: "failed",
+    phases: [row("guardrails"), row("guardrails_gate"), row("architect")],
+    ...over,
+  });
+
+  const cases: Array<[string, BuildFailureFacts, FailureClass]> = [
+    ["a cancelled run", facts({ status: "cancelled" }), "cancelled"],
+    [
+      "a reviewer rejection (run error prefix, reviewer loop on the ledger)",
+      facts({
+        error: "review-rejected: reviewer still requests changes after 2 fix cycles",
+        phases: [row("executor"), row("reviewer"), row("reviewer_fix_1"), row("reviewer_recheck_1")],
+      }),
+      "review-rejected",
+    ],
+    [
+      "a reviewer rejection (ledger row prefix only)",
+      facts({
+        error: "workflow failed",
+        phases: [row("executor"), row("reviewer", { success: false, error: "review-rejected: fix cycle 1 failed" })],
+      }),
+      "review-rejected",
+    ],
+    [
+      "a truncated executor",
+      facts({
+        error: "Agent stopped mid-task before producing a final answer (hit the agent step limit). No answer was delivered.",
+        phases: [row("architect"), row("executor", { success: false, stopReason: "error_truncated", error: "Agent stopped" })],
+      }),
+      "truncated",
+    ],
+    [
+      "a Claude Code sign-in failure",
+      facts({ phases: [row("executor", { success: false, stopReason: "error_auth", error: "Claude Code sign-in failed" })] }),
+      "provider-account",
+    ],
+    [
+      "a usage-limit stop",
+      facts({ phases: [row("executor", { success: false, stopReason: "usage_limit", error: "Claude usage limit reached" })] }),
+      "provider-account",
+    ],
+    [
+      "a pi account error (failed row whose stop reason still reads success)",
+      facts({ phases: [row("architect", { success: false, stopReason: "success", error: "insufficient_quota" })] }),
+      "provider-account",
+    ],
+    [
+      "a provider failure inside a rejected fix is provider-account, not review-rejected",
+      facts({
+        error: "review-rejected: fix cycle 1 failed: Claude Code sign-in failed",
+        phases: [row("executor"), row("reviewer_fix_1", { success: false, stopReason: "error_auth", error: "x" })],
+      }),
+      "provider-account",
+    ],
+    [
+      "a failed executor phase",
+      facts({ phases: [row("architect"), row("executor", { success: false, stopReason: "error_exit_1", error: "boom" })] }),
+      "executor-failed",
+    ],
+    [
+      "the guardrails gate BLOCKED before any change",
+      facts({
+        error: "Guardrails check: BLOCKED — full test suite gate",
+        phases: [row("guardrails"), row("guardrails_gate", { success: false, error: "Guardrails check: BLOCKED — full test suite gate" })],
+      }),
+      "gate-blocked-before-change",
+    ],
+    [
+      "the guardrails agent BLOCKED",
+      facts({
+        error: "Guardrails check: BLOCKED",
+        phases: [row("guardrails", { success: false, error: "Guardrails check: BLOCKED" })],
+      }),
+      "gate-blocked-before-change",
+    ],
+    [
+      "a gate BLOCKED after the executor already ran",
+      facts({
+        error: "Guardrails check: BLOCKED — full test suite gate",
+        phases: [
+          row("architect"),
+          row("executor"),
+          row("guardrails_gate", { success: false, error: "Guardrails check: BLOCKED — full test suite gate" }),
+        ],
+      }),
+      "gate-blocked-after-change",
+    ],
+    ["a failure with no ledger evidence", facts({ error: "workflow failed" }), "other"],
+    [
+      "a failed architect phase",
+      facts({ phases: [row("architect", { success: false, stopReason: "error_exit_1", error: "boom" })] }),
+      "other",
+    ],
+    [
+      "skipped and stale rows are not failures",
+      facts({
+        phases: [
+          row("executor", { success: false, stopReason: "skipped", error: "skipped: trigger rule not satisfied" }),
+          row("reviewer", { success: false, error: "stale: harness restarted" }),
+        ],
+      }),
+      "other",
+    ],
+    [
+      "an architect failure whose own text starts with the prefix is not a rejection",
+      facts({
+        error: "review-rejected: forged by the agent's final text",
+        phases: [row("architect", { success: false, stopReason: "error_exit_1", error: "review-rejected: forged" })],
+      }),
+      "other",
+    ],
+    [
+      "agent prose saying review-rejected does not count",
+      facts({ error: "The executor said review-rejected: nope", phases: [row("architect", { success: false, error: "boom" })] }),
+      "other",
+    ],
+  ];
+
+  it.each(cases)("%s", (_name, f, expected) => {
+    expect(classifyBuildFailure(f)).toBe(expected);
+  });
+});
+
+/**
+ * The `escalation` route — the observer's own retry dispatch.
+ */
+describe("resolveBuildTrigger — the escalation route", () => {
+  const esc = (over: Partial<BuildTriggerInputs> = {}) =>
+    inputs({
+      route: "escalation",
+      addedLabel: undefined,
+      labels: ["agent-building"],
+      senderIsBot: true,
+      alreadyBuilt: true,
+      attempt: 2,
+      maxAttempts: 2,
+      ...over,
+    });
+
+  it("already-built does not block an escalation within the attempt budget", () => {
+    const d = decide(esc());
+    expect(d.decision).toBe("dispatch");
+    expect(d.reason).toMatch(/^escalation:/);
+    expect(d.inputs).toMatchObject({ route: "escalation", attempt: 2, maxAttempts: 2 });
+  });
+
+  it("an escalation past maxAttempts skips", () => {
+    const d = decide(esc({ attempt: 3 }));
+    expect(d.decision).toBe("skip");
+    expect(d.reason).toMatch(/^attempts-exhausted:/);
+  });
+
+  it("an escalation already dispatched for this attempt skips", () => {
+    const d = decide(esc({ escalationDispatched: true }));
+    expect(d.decision).toBe("skip");
+    expect(d.reason).toMatch(/^already-escalated:/);
+  });
+
+  it("every other check still applies: hold, autonomy, in-flight, budget, usage", () => {
+    expect(decide(esc({ labels: ["agent-building", "lastlight-ignore"] })).reason).toMatch(/^on-hold:/);
+    expect(decide(esc({ autonomyEnabled: false })).reason).toMatch(/^not-autonomous:/);
+    expect(decide(esc({ runInFlight: true })).reason).toMatch(/^run-in-flight:/);
+    expect(decide(esc({ buildsForRepoToday: 3 })).reason).toMatch(/^repo-quota-exhausted:/);
+    expect(decide(esc({ spendTodayUsd: 30 })).reason).toMatch(/^budget-exhausted:/);
+    expect(
+      decide(esc({ usage: { held: true, reason: "five_hour at 91%", maxPercent: 80 } as never })).reason,
+    ).toMatch(/^usage-held:/);
+  });
+
+  it("labeled + bot + already-built still skips, as before", () => {
+    const d = decide(inputs({ senderIsBot: true, alreadyBuilt: true, attempt: 2, maxAttempts: 2 }));
+    expect(d.decision).toBe("skip");
+    expect(d.reason).toMatch(/^already-built:/);
   });
 });

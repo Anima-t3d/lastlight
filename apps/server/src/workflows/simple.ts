@@ -10,6 +10,7 @@ import {
   defaultReviewConfig,
   effectiveGate,
   getAutonomyConfig,
+  getBuildConfig,
   isAutonomousRepo,
   isMergeRepo,
   getBotName,
@@ -17,6 +18,7 @@ import {
   getRuntimeConfig,
   getSandboxTimeouts,
   withReviewDurations,
+  type BuildConfig,
   type DependenciesConfig,
   type FixConfig,
   type GateConfig,
@@ -952,18 +954,70 @@ export function escalateFixModel(
   // `dependabot-pr-merge` too), so without this guard a review run would record
   // a rewritten map it never used.
   if (!isPrFixShaped(workflowName)) return models;
-  if (!models) return models;
-  const retry = models[FIX_RETRY_MODEL_KEY];
-  if (!retry) return models;
   // The config leaf is expressed in ATTEMPTS, and stays that way — an operator
   // who wrote `escalateModelAfterAttempt: 1` meant "attempt 2 onwards". An
   // empty journal is attempt 1, which is also what a dispatch with no snapshot
   // at all reads as. `escalateModelAfterAttempt: 0` is legal and means
   // "escalate from attempt 1".
   const attempt = (priorAttempts ?? 0) + 1;
-  if (attempt <= fix.escalateModelAfterAttempt) return models;
-  if (models[FIX_MODEL_KEY] === retry) return models;
-  return { ...models, [FIX_MODEL_KEY]: retry };
+  return substituteRetryModels(
+    models,
+    [FIX_MODEL_KEY],
+    () => FIX_RETRY_MODEL_KEY,
+    attempt,
+    fix.escalateModelAfterAttempt,
+  );
+}
+
+/**
+ * The shared model swap behind both escalations: past `escalateAfter`
+ * attempts, each `key` in `keys` takes the model configured under
+ * `retryKeyFor(key)`. A key whose retry model is unset keeps its own, and when
+ * nothing changes the map comes back BY IDENTITY, so a deployment with no
+ * `-retry` keys cannot tell this exists. Never mutates `models`.
+ */
+export function substituteRetryModels(
+  models: ModelConfig | undefined,
+  keys: readonly string[],
+  retryKeyFor: (key: string) => string,
+  attempt: number,
+  escalateAfter: number,
+): ModelConfig | undefined {
+  if (!models) return models;
+  if (attempt <= escalateAfter) return models;
+  let out: ModelConfig | undefined;
+  for (const key of keys) {
+    const retry = models[retryKeyFor(key)];
+    if (!retry || models[key] === retry) continue;
+    out ??= { ...models };
+    out[key] = retry;
+  }
+  return out ?? models;
+}
+
+/** The build phases an escalated attempt moves to stronger models. */
+const BUILD_RETRY_MODEL_KEYS = ["executor", "fix"] as const;
+
+/**
+ * L3 escalation's model half: on an autonomous build retry (`_attempt` on the
+ * dispatch context, set by `engine/stage-observer.ts`), swap `executor` →
+ * `executor-retry` and `fix` → `fix-retry` once `attempt` is above
+ * `build.escalateAfterAttempt`. Same rules as {@link escalateFixModel}: unset
+ * keys keep today's model, attempt 1 is untouched, and the swapped map is what
+ * gets persisted on `context.models`.
+ */
+export function escalateBuildModels(
+  models: ModelConfig | undefined,
+  attempt: number | undefined,
+  build: BuildConfig,
+): ModelConfig | undefined {
+  return substituteRetryModels(
+    models,
+    BUILD_RETRY_MODEL_KEYS,
+    (key) => `${key}-retry`,
+    attempt ?? 1,
+    build.escalateAfterAttempt,
+  );
 }
 
 /**
@@ -1185,11 +1239,10 @@ async function runSimpleWorkflowBody(
   const priorAttempts = Array.isArray(request.extra?.priorAttempts)
     ? request.extra.priorAttempts.length
     : undefined;
-  const effectiveModels = escalateFixModel(
-    workflowName,
-    repoConfig?.models ?? models,
-    priorAttempts,
-    effectiveFix,
+  const effectiveModels = escalateBuildModels(
+    escalateFixModel(workflowName, repoConfig?.models ?? models, priorAttempts, effectiveFix),
+    numberFromExtra(request.extra, "_attempt"),
+    getBuildConfig(),
   );
   definition = promoteFlakyDiagnosis(definition, flakyDeferrals, effectiveFix);
 

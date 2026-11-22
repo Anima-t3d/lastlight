@@ -24,7 +24,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { installStageObserver } from "#src/engine/stage-observer.js";
+import { escalationDispatchPort, installStageObserver } from "#src/engine/stage-observer.js";
 import { loadConfig, resetRuntimeConfigForTests } from "#src/config/config.js";
 import {
   STAGE_AGENT_BUILDING,
@@ -325,5 +325,291 @@ describe("installStageObserver", () => {
     await settle();
 
     expect(github.addLabels).toHaveBeenCalledWith(OWNER, NAME, ISSUE, [STAGE_READY_FOR_HUMAN]);
+  });
+});
+
+/**
+ * L3 escalation on the terminal observer: a FAILED autonomous build at attempt
+ * 1 with a retryable failure is retried once (route `escalation`) and stays on
+ * `agent-building`; everything else lands on `agent-blocked` as before.
+ */
+describe("installStageObserver — L3 escalation", () => {
+  let db: StateDb;
+
+  beforeEach(async () => {
+    db = await makeTestDb();
+    for (const k of ["GITHUB_APP_ID", "SLACK_BOT_TOKEN", "LASTLIGHT_MODEL", "LASTLIGHT_MODELS"]) {
+      vi.stubEnv(k, "");
+    }
+    const dir = mkdtempSync(join(tmpdir(), "stage-observer-esc-"));
+    writeFileSync(join(dir, "config.yaml"), `autonomy:\n  repos:\n    - "${REPO}"\n`);
+    vi.stubEnv("LASTLIGHT_OVERLAY_DIR", dir);
+    loadConfig();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    resetRuntimeConfigForTests();
+  });
+
+  /** GitHub with the reads the escalation needs: the issue, and a comment sink. */
+  function escGithub() {
+    const base = fakeGithub();
+    const getIssue = vi.fn(async () => ({
+      title: "Add a dark-mode toggle",
+      body: "Follow the OS.",
+      state: "open",
+      labels: [{ name: STAGE_AGENT_BUILDING }],
+    }));
+    const postComment = vi.fn(async () => 1);
+    return Object.assign(base, { getIssue, postComment }) as typeof base & {
+      getIssue: typeof getIssue;
+      postComment: typeof postComment;
+    };
+  }
+
+  /** One ledger row for `phase` of run `runId`. */
+  async function ledger(
+    runId: string,
+    phase: string,
+    result: { success: boolean; error?: string; stopReason?: string; costUsd?: number },
+  ) {
+    const id = `${runId}-${phase}-${Math.random().toString(36).slice(2)}`;
+    await db.executions.recordStart({
+      id,
+      triggerType: "webhook",
+      triggerId: `${REPO}#${ISSUE}`,
+      skill: `build:${phase}`,
+      owner: OWNER,
+      repo: NAME,
+      issueNumber: ISSUE,
+      startedAt: new Date().toISOString(),
+      workflowRunId: runId,
+    });
+    await db.executions.recordFinish(id, { durationMs: 1, ...result });
+  }
+
+  /** A failed autonomous attempt whose executor phase failed. */
+  async function failedExecutorRun(id: string, context: Record<string, unknown> = {}) {
+    await seedStageRun(db, id, { _stage: "build", _autonomous: true, ...context });
+    await ledger(id, "architect", { success: true, costUsd: 0.25 });
+    await ledger(id, "executor", { success: false, error: "boom", stopReason: "error_exit_1", costUsd: 1.5 });
+  }
+
+  it("a failed autonomous build at attempt 1 dispatches the retry and does not apply agent-blocked", async () => {
+    const github = escGithub();
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    installStageObserver(db, { github, dispatchEscalation });
+    await failedExecutorRun("run-esc");
+
+    await db.runs.finishRun("run-esc", "failed", { error: "boom" });
+    await vi.waitFor(() => expect(dispatchEscalation).toHaveBeenCalledTimes(1));
+
+    const [workflow, ctx] = dispatchEscalation.mock.calls[0] as unknown as [string, Record<string, unknown>];
+    expect(workflow).toBe("build");
+    expect(ctx).toMatchObject({
+      repo: REPO,
+      issueNumber: ISSUE,
+      title: "Add a dark-mode toggle",
+      labels: [STAGE_AGENT_BUILDING],
+      _stage: "build",
+      _attempt: 2,
+      _buildRoute: "escalation",
+      _senderIsBot: true,
+      _escalatedFrom: "run-esc",
+      triggerActorType: "system",
+    });
+    // The issue stays on `agent-building`: no terminal label, nothing removed.
+    expect(github.addLabels).not.toHaveBeenCalled();
+    expect(github.removeLabel).not.toHaveBeenCalled();
+  });
+
+  it("carries a human's hint forward onto the retry", async () => {
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    installStageObserver(db, { github: escGithub(), dispatchEscalation });
+    await failedExecutorRun("run-hint", { _hint: "fix the import" });
+
+    await db.runs.finishRun("run-hint", "failed");
+    await vi.waitFor(() => expect(dispatchEscalation).toHaveBeenCalledTimes(1));
+    const ctx = (dispatchEscalation.mock.calls[0] as unknown as [string, Record<string, unknown>])[1];
+    expect(ctx._hint).toBe("fix the import");
+  });
+
+  it("records the attempt's cost in the run's scratch", async () => {
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    installStageObserver(db, { github: escGithub(), dispatchEscalation });
+    await failedExecutorRun("run-cost");
+
+    await db.runs.finishRun("run-cost", "failed");
+    await vi.waitFor(async () => {
+      const run = await db.runs.getRun("run-cost");
+      expect(run?.scratch?.attemptCost).toEqual({ attempt: 1, costUsd: 1.75 });
+    });
+  });
+
+  it("a gate skip of the retry lands the issue on agent-blocked — it never strands on building", async () => {
+    const github = escGithub();
+    const dispatchEscalation = vi.fn(async () => "skipped" as const);
+    installStageObserver(db, { github, dispatchEscalation });
+    await failedExecutorRun("run-skip");
+
+    await db.runs.finishRun("run-skip", "failed");
+    await vi.waitFor(() =>
+      expect(github.addLabels).toHaveBeenCalledWith(OWNER, NAME, ISSUE, [STAGE_AGENT_BLOCKED]),
+    );
+    expect(github.removeLabel).toHaveBeenCalledWith(OWNER, NAME, ISSUE, STAGE_AGENT_BUILDING);
+  });
+
+  it("a dispatch that throws is a skip too", async () => {
+    const github = escGithub();
+    const dispatchEscalation = vi.fn(async () => {
+      throw new Error("dispatch broke");
+    });
+    installStageObserver(db, { github, dispatchEscalation });
+    await failedExecutorRun("run-throw");
+
+    await db.runs.finishRun("run-throw", "failed");
+    await vi.waitFor(() =>
+      expect(github.addLabels).toHaveBeenCalledWith(OWNER, NAME, ISSUE, [STAGE_AGENT_BLOCKED]),
+    );
+  });
+
+  it("firing twice for one run dispatches ONE retry", async () => {
+    const github = escGithub();
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    installStageObserver(db, { github, dispatchEscalation });
+    await failedExecutorRun("run-twice-esc");
+
+    // The runner, the scheduler and `simple.ts` can each finish a failed run.
+    await db.runs.finishRun("run-twice-esc", "failed", { error: "boom" });
+    await db.runs.finishRun("run-twice-esc", "failed", { error: "workflow failed" });
+    await db.runs.finishRun("run-twice-esc", "failed", { error: "boom" });
+    await vi.waitFor(() => expect(dispatchEscalation).toHaveBeenCalled());
+    await settle();
+    await settle();
+    expect(dispatchEscalation).toHaveBeenCalledTimes(1);
+    expect(github.addLabels).not.toHaveBeenCalled();
+  });
+
+  it("attempt 2 failing hands off to agent-blocked, no retry", async () => {
+    const github = escGithub();
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    installStageObserver(db, { github, dispatchEscalation });
+    await failedExecutorRun("run-a2", { _attempt: 2 });
+
+    await db.runs.finishRun("run-a2", "failed");
+    await vi.waitFor(() =>
+      expect(github.addLabels).toHaveBeenCalledWith(OWNER, NAME, ISSUE, [STAGE_AGENT_BLOCKED]),
+    );
+    expect(dispatchEscalation).not.toHaveBeenCalled();
+  });
+
+  it("a hand-off class (gate blocked before any change) lands on agent-blocked, no retry", async () => {
+    const github = escGithub();
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    installStageObserver(db, { github, dispatchEscalation });
+    await seedStageRun(db, "run-gate");
+    await ledger("run-gate", "guardrails", { success: true });
+    await ledger("run-gate", "guardrails_gate", {
+      success: false,
+      error: "Guardrails check: BLOCKED — full test suite gate",
+    });
+
+    await db.runs.finishRun("run-gate", "failed", { error: "Guardrails check: BLOCKED — full test suite gate" });
+    await vi.waitFor(() =>
+      expect(github.addLabels).toHaveBeenCalledWith(OWNER, NAME, ISSUE, [STAGE_AGENT_BLOCKED]),
+    );
+    expect(dispatchEscalation).not.toHaveBeenCalled();
+  });
+
+  it("a cancelled build is never retried", async () => {
+    const github = escGithub();
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    installStageObserver(db, { github, dispatchEscalation });
+    await failedExecutorRun("run-cancel");
+
+    await db.runs.finishRun("run-cancel", "cancelled");
+    await vi.waitFor(() =>
+      expect(github.addLabels).toHaveBeenCalledWith(OWNER, NAME, ISSUE, [STAGE_AGENT_BLOCKED]),
+    );
+    expect(dispatchEscalation).not.toHaveBeenCalled();
+  });
+
+  it("an `@bot build` (no stage) is never escalated and gets no stage label", async () => {
+    const github = escGithub();
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    installStageObserver(db, { github, dispatchEscalation });
+    await seedStageRun(db, "run-human", { repo: REPO, issueNumber: ISSUE });
+    await ledger("run-human", "executor", { success: false, error: "boom", stopReason: "error_exit_1" });
+
+    await db.runs.finishRun("run-human", "failed");
+    await settle();
+    await settle();
+    expect(dispatchEscalation).not.toHaveBeenCalled();
+    expect(github.addLabels).not.toHaveBeenCalled();
+  });
+
+  it("a provider-account failure holds: agent-blocked and ONE comment, however often it fires", async () => {
+    const github = escGithub();
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    installStageObserver(db, { github, dispatchEscalation });
+    await seedStageRun(db, "run-auth");
+    await ledger("run-auth", "executor", {
+      success: false,
+      error: "Claude Code sign-in failed or expired",
+      stopReason: "error_auth",
+    });
+
+    await db.runs.finishRun("run-auth", "failed");
+    await db.runs.finishRun("run-auth", "failed");
+    await vi.waitFor(() => expect(github.postComment).toHaveBeenCalledTimes(1));
+    await settle();
+    expect(github.postComment).toHaveBeenCalledTimes(1);
+    expect(github.addLabels).toHaveBeenCalledWith(OWNER, NAME, ISSUE, [STAGE_AGENT_BLOCKED]);
+    const body = (github.postComment.mock.calls[0] as unknown as [string, string, number, string])[3];
+    expect(body).toMatch(/retry/i);
+    expect(body).toContain("@last-light retry");
+    expect(dispatchEscalation).not.toHaveBeenCalled();
+  });
+
+  it("without an escalation port the observer behaves exactly as before", async () => {
+    const github = escGithub();
+    installStageObserver(db, { github });
+    await failedExecutorRun("run-noport");
+
+    await db.runs.finishRun("run-noport", "failed");
+    await settle();
+    expect(github.addLabels).toHaveBeenCalledWith(OWNER, NAME, ISSUE, [STAGE_AGENT_BLOCKED]);
+  });
+});
+
+describe("escalationDispatchPort — settles on run start, not run end", () => {
+  it("is dispatched the moment the run starts, though the run is still going", async () => {
+    let finish: (v: { success: boolean }) => void = () => {};
+    const port = escalationDispatchPort(async (_w, _c, onRunStart) => {
+      await onRunStart?.("run-new");
+      return new Promise((r) => { finish = r; });
+    });
+    await expect(port("build", {})).resolves.toBe("dispatched");
+    finish({ success: false });
+  });
+
+  it("is skipped when the gate refused: the dispatch returned with no run", async () => {
+    const port = escalationDispatchPort(async () => ({ success: true }));
+    await expect(port("build", {})).resolves.toBe("skipped");
+  });
+
+  it("a queued run counts as dispatched", async () => {
+    const port = escalationDispatchPort(async () => ({ success: true, queued: true }));
+    await expect(port("build", {})).resolves.toBe("dispatched");
+  });
+
+  it("a refusal (success false, no run) and a throw are both skips", async () => {
+    await expect(escalationDispatchPort(async () => ({ success: false }))("build", {})).resolves.toBe("skipped");
+    await expect(
+      escalationDispatchPort(async () => {
+        throw new Error("x");
+      })("build", {}),
+    ).resolves.toBe("skipped");
   });
 });

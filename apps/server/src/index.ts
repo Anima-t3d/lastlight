@@ -91,7 +91,7 @@ import {
   installReviewCheckObserver,
   openAndBindReviewCheck,
 } from "./engine/review-check.js";
-import { installStageObserver } from "./engine/stage-observer.js";
+import { escalationDispatchPort, installStageObserver } from "./engine/stage-observer.js";
 import { installWebhooks } from "./notify/webhook/emitter.js";
 import { configureUsageGate } from "./engine/usage-runtime.js";
 import { configureBuildMerge } from "./engine/build-merge.js";
@@ -431,6 +431,12 @@ async function main() {
     // TTL lapses — the run read is live, the label read is cached, and the card
     // disagrees with itself in the meantime.
     onAdvanced: (repo) => invalidateBoard(repo),
+    // L3 escalation: a failed autonomous build is retried once through the
+    // SAME choke point every dispatch crosses, so the build gate (route
+    // `escalation`) decides it. Late-bound: `dispatchWorkflow` is declared
+    // below, and is only called once a run finishes.
+    dispatchEscalation: (workflow, context) =>
+      escalationDispatchPort((w, c, onRunStart) => dispatchWorkflow(w, c, onRunStart))(workflow, context),
   });
 
   // Outgoing webhooks (`webhooks:`): run started, approval requested, finished.
@@ -622,10 +628,18 @@ async function main() {
           issueNumber: typeof context.issueNumber === "number" ? context.issueNumber : 0,
           labels: Array.isArray(context.labels) ? (context.labels as string[]) : [],
           addedLabel: typeof context._addedLabel === "string" ? context._addedLabel : undefined,
-          // The label route is the only surface that exists today. The sweep and
-          // `/api/run` will name themselves here.
-          route: context._triggerType === "api" ? "api" : context._triggerType === "cron" ? "sweep" : "labeled",
+          // `_buildRoute` names a route the trigger type cannot: the observer's
+          // escalation retry, and `@bot retry` (a human request, so `api`).
+          route:
+            context._buildRoute === "escalation"
+              ? "escalation"
+              : context._buildRoute === "api" || context._triggerType === "api"
+                ? "api"
+                : context._triggerType === "cron"
+                  ? "sweep"
+                  : "labeled",
           senderIsBot: context._senderIsBot === true,
+          attempt: typeof context._attempt === "number" ? context._attempt : undefined,
           stage: stageName ?? "",
         },
         { db, github },

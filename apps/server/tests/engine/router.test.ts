@@ -1920,3 +1920,102 @@ describe('routeEvent — issue.labeled (the autonomy pipeline)', () => {
     expect(result.action).toBe('ignore');
   });
 });
+
+/**
+ * `@<bot> retry [hint]` on an ISSUE — restart a build the pipeline handed to a
+ * human (`agent-blocked`), with the maintainer's hint for the architect.
+ */
+describe('routeEvent — @bot retry on a blocked issue', () => {
+  const STAGES = {
+    build: {
+      enter: 'ready-for-agent',
+      running: 'agent-building',
+      on_success: 'ready-for-human',
+      on_failure: 'agent-blocked',
+      workflow: 'build',
+      gates: { post_architect: true, post_reviewer: true },
+      on_merge: 'none',
+    },
+  };
+  beforeEach(() => {
+    setRuntimeConfig({
+      managedRepos: ['cliftonc/drizzle-cube'],
+      autonomy: {
+        repos: ['cliftonc/drizzle-cube'],
+        stages: STAGES,
+        budget: { maxConcurrentBuilds: 2, maxBuildsPerRepoPerDay: 3, dailyUsd: 25, repoDailyUsd: 10 },
+      },
+    } as unknown as LastLightConfig);
+    mockClassifyComment.mockResolvedValue({ intent: 'chat' });
+  });
+
+  const retry = (over: Partial<EventEnvelope> = {}) =>
+    makeEnvelope({
+      type: 'comment.created',
+      body: '@last-light retry fix the import',
+      authorAssociation: 'COLLABORATOR',
+      issueNumber: 42,
+      title: 'Add a dark-mode toggle',
+      labels: ['agent-blocked'],
+      ...over,
+    });
+
+  it('dispatches the build stage with the hint, attempt 1, on the api route', async () => {
+    const result = await routeEvent(retry());
+    expect(result.action).toBe('handler');
+    if (result.action === 'handler') {
+      expect(result.handler).toBe('build');
+      expect(result.context).toMatchObject({
+        repo: 'cliftonc/drizzle-cube',
+        issueNumber: 42,
+        labels: ['agent-blocked'],
+        _stage: 'build',
+        _attempt: 1,
+        _hint: 'fix the import',
+        _buildRoute: 'api',
+        _senderIsBot: false,
+      });
+    }
+    expect(mockClassifyComment).not.toHaveBeenCalled();
+  });
+
+  it('a bare retry carries no hint', async () => {
+    const result = await routeEvent(retry({ body: '@last-light retry' }));
+    if (result.action === 'handler') expect(result.context._hint).toBeUndefined();
+  });
+
+  it('caps the hint at 2000 characters and defuses code fences', async () => {
+    const result = await routeEvent(retry({ body: `@last-light retry \`\`\`${'x'.repeat(3000)}` }));
+    if (result.action !== 'handler') throw new Error('expected a handler');
+    const hint = result.context._hint as string;
+    expect(hint.length).toBeLessThanOrEqual(2000);
+    expect(hint).not.toContain('```');
+  });
+
+  it('ignores the bot itself', async () => {
+    const result = await routeEvent(retry({ senderIsBot: true, sender: 'last-light[bot]' }));
+    expect(result.action).not.toBe('handler');
+  });
+
+  it('is maintainer-gated like every @-mention command', async () => {
+    const result = await routeEvent(retry({ authorAssociation: 'NONE' }));
+    expect(result.action).toBe('reply');
+  });
+
+  it('on an issue that is not at agent-blocked it is not a build retry', async () => {
+    const result = await routeEvent(retry({ labels: ['agent-building'] }));
+    if (result.action === 'handler') {
+      expect(result.handler).not.toBe('build');
+      expect(result.context._stage).toBeUndefined();
+    }
+  });
+
+  it('on a repo off the autonomy list it is not a build retry', async () => {
+    setRuntimeConfig({
+      managedRepos: ['cliftonc/drizzle-cube'],
+      autonomy: { repos: [], stages: STAGES, budget: {} },
+    } as unknown as LastLightConfig);
+    const result = await routeEvent(retry());
+    if (result.action === 'handler') expect(result.context._stage).toBeUndefined();
+  });
+});

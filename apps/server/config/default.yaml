@@ -40,6 +40,8 @@ models:
   #   screener: anthropic/claude-haiku-5-5              # the prompt-injection screener
   #   diagnose: anthropic/claude-haiku-5-5              # the CI-failure classifier
   #   pr-fix-retry: anthropic/claude-opus-4-8           # used above fix.escalateModelAfterAttempt
+  #   executor-retry: anthropic/claude-opus-4-8         # build executor above build.escalateAfterAttempt
+  #   fix-retry: anthropic/claude-opus-4-8              # build reviewer-fix above build.escalateAfterAttempt
   #   review-summary: openai/gpt-5.4-mini                # post-review's summary, written after the caps
   #   review-falsify: anthropic/claude-haiku-5-5         # the probe oracle
   #   review-site: anthropic/claude-haiku-5-5            # a site investigator
@@ -939,6 +941,17 @@ merge:
     - "**/CODEOWNERS"
   holdLabels:                  # a PR carrying any of these is never gate-merged
     - do-not-merge
+
+# L3 escalation of a failed AUTONOMOUS build (a `_stage` run; never an
+# `@bot build`). A retryable failure (executor failed, truncated, reviewer
+# rejected, gate blocked after a change) is retried once, then handed to a
+# human on `agent-blocked`. Attempts ABOVE `escalateAfterAttempt` swap the
+# `executor` / `fix` models for `models.executor-retry` / `models.fix-retry`
+# when those are set in your overlay; unset means no swap. A maintainer can
+# restart a blocked build with `@<bot> retry [hint]`.
+build:
+  escalateAfterAttempt: 1      # attempts above this use the -retry models (when set)
+  maxAttempts: 2               # attempts per failure chain, the first included
 
 # Which crons participate (issue #180). The SAME block is valid here, in your
 # overlay's config.yaml, and in a managed repo's .lastlight/lastlight.yml — the

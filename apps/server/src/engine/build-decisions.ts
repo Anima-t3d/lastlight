@@ -52,8 +52,11 @@ export interface BuildTriggerInputs {
   labels: readonly string[];
   /** The label whose application triggered this, when one did (the `labeled` route). */
   addedLabel?: string;
-  /** Which surface this dispatch arrived on. */
-  route: "labeled" | "sweep" | "api";
+  /**
+   * Which surface this dispatch arrived on. `escalation` is the terminal
+   * observer's own retry of a failed autonomous build (`stage-observer.ts`).
+   */
+  route: "labeled" | "sweep" | "api" | "escalation";
   /** Did OUR bot apply the label (vs a human)? Drives the already-built asymmetry. */
   senderIsBot: boolean;
   /** Is this repo on the operator's autonomy allow-list? */
@@ -63,6 +66,19 @@ export interface BuildTriggerInputs {
   /** A live (queued/running/paused) run exists for this trigger. */
   runInFlight: boolean;
   holdLabel: string;
+  /**
+   * Which attempt this dispatch is (`_attempt` on the context, default 1). Read
+   * only on the `escalation` route, against {@link maxAttempts}.
+   */
+  attempt?: number;
+  /** `build.maxAttempts`: the most attempts an escalation may reach. */
+  maxAttempts?: number;
+  /**
+   * A build run for this trigger already carries an `_attempt` at or above
+   * {@link attempt}: this escalation was dispatched once already. The dedupe
+   * key is (triggerId, attempt).
+   */
+  escalationDispatched?: boolean;
 
   // ── The budget inputs (Phase 2) ────────────────────────────────────────
   //
@@ -133,6 +149,9 @@ export function resolveBuildTrigger(
     alreadyBuilt: inputs.alreadyBuilt,
     runInFlight: inputs.runInFlight,
     holdLabel: inputs.holdLabel,
+    attempt: inputs.attempt ?? null,
+    maxAttempts: inputs.maxAttempts ?? null,
+    escalationDispatched: inputs.escalationDispatched ?? null,
     concurrentAutonomousBuilds: inputs.concurrentAutonomousBuilds,
     buildsForRepoToday: inputs.buildsForRepoToday,
     spendTodayUsd: inputs.spendTodayUsd,
@@ -229,8 +248,33 @@ export function resolveBuildTrigger(
   // bounds that spend. That is deliberate — an explicit human instruction is not
   // a loop — but it does mean the cost ceiling for this path is a person, not a
   // counter. The Phase 2 budget branches below are where that gets a number.
-  const humanRetry = inputs.alreadyBuilt && !inputs.senderIsBot;
-  if (inputs.alreadyBuilt && inputs.senderIsBot) {
+  // THE ESCALATION ROUTE — the one bot dispatch that may re-spend, and only a
+  // bounded number of times. The terminal observer asked for exactly one retry
+  // of a failed autonomous build; `already-built` is true by construction (the
+  // failed run IS the prior build), so the bot rule above would always refuse
+  // it. What bounds it instead is the attempt counter, and the dedupe key
+  // (triggerId, attempt) so one failed run can never buy two retries.
+  const escalation = inputs.route === "escalation";
+  if (escalation) {
+    const attempt = inputs.attempt ?? 1;
+    const maxAttempts = inputs.maxAttempts ?? 1;
+    if (attempt > maxAttempts) {
+      return {
+        decision: "skip",
+        reason: `attempts-exhausted: escalation attempt ${attempt} for ${triggerId} is past \`build.maxAttempts\` (${maxAttempts})`,
+        inputs: record,
+      };
+    }
+    if (inputs.escalationDispatched) {
+      return {
+        decision: "skip",
+        reason: `already-escalated: attempt ${attempt} for ${triggerId} was already dispatched`,
+        inputs: record,
+      };
+    }
+  }
+  const humanRetry = inputs.alreadyBuilt && !inputs.senderIsBot && !escalation;
+  if (inputs.alreadyBuilt && inputs.senderIsBot && !escalation) {
     return {
       decision: "skip",
       reason: `already-built: a build run already exists for ${triggerId} and the label was re-applied by us, not by a human`,
@@ -389,9 +433,165 @@ export function resolveBuildTrigger(
   // fact instead of indistinguishable from a first run.
   return {
     decision: "dispatch",
-    reason: humanRetry
+    reason: escalation
+      ? `escalation: attempt ${inputs.attempt ?? 1} of ${inputs.maxAttempts ?? 1} for ${triggerId}, retrying a failed autonomous build`
+      : humanRetry
       ? `retry: a maintainer re-applied \`${inputs.addedLabel ?? "the build label"}\` to ${triggerId}, which already has a build run — treating it as an explicit retry`
       : `ready: ${triggerId} is labelled for the agent and nothing blocks the build`,
     inputs: record,
+  };
+}
+
+// ── L3 escalation ──────────────────────────────────────────────────────────
+
+/**
+ * Why a build run failed, as far as OUR OWN persisted writes can tell. Never
+ * read from agent prose: only the prefixes and stop reasons the harness and
+ * the engine stamp on the run row and its ledger rows.
+ */
+export type FailureClass =
+  | "executor-failed"
+  | "truncated"
+  | "review-rejected"
+  | "gate-blocked-after-change"
+  | "gate-blocked-before-change"
+  | "provider-account"
+  | "cancelled"
+  | "other";
+
+/** What {@link classifyBuildFailure} reads: the run row and its ledger rows. */
+export interface BuildFailureFacts {
+  status: "failed" | "cancelled";
+  /** `workflow_runs.context.error` — the first failed phase's error. */
+  error?: string;
+  /** The run's `executions` rows, oldest first. `phase` is the `<workflow>:<phase>` key. */
+  phases: ReadonlyArray<{ phase: string; success?: boolean; error?: string; stopReason?: string }>;
+}
+
+/**
+ * The engine's reviewer-rejection class (`REVIEW_REJECTED_FAILURE_CLASS` in
+ * `lastlight-workflow-engine`'s phase executor, not exported from its index).
+ * The run error and the ledger row both start with `review-rejected: `.
+ */
+const REVIEW_REJECTED_PREFIX = "review-rejected:";
+/**
+ * The `contains_BLOCKED` failure message both guardrails phases declare in
+ * `workflows/build.yaml` (`Guardrails check: BLOCKED…`).
+ */
+const GATE_BLOCKED_PREFIX = "Guardrails check: BLOCKED";
+/**
+ * Stop reasons the executors stamp for an account-level provider failure: the
+ * Claude Code sign-in (`error_auth`) and usage window (`usage_limit`), and the
+ * k8s quota (`error_quota`).
+ */
+const PROVIDER_STOP_REASONS = new Set(["error_auth", "usage_limit", "error_quota"]);
+
+/** The build workflow's reviewer loop phase, and the labels its cycles mint. */
+function isReviewerLoopPhase(name: string): boolean {
+  return name === "reviewer" || /^reviewer_(fix|recheck)_\d+$/.test(name);
+}
+
+function phaseName(key: string): string {
+  const colon = key.lastIndexOf(":");
+  return colon >= 0 ? key.slice(colon + 1) : key;
+}
+
+/**
+ * Classify a failed build run. Pure. The order is the design: an account
+ * failure outranks everything (no retry can help a dead key), then the
+ * reviewer's rejection, then truncation, then the guardrails gate, then a
+ * failed executor. Anything else is `other`, which hands off to a human.
+ */
+export function classifyBuildFailure(facts: BuildFailureFacts): FailureClass {
+  if (facts.status === "cancelled") return "cancelled";
+  // A genuine failure row. `skipped` rows (a `when:` that was false) and
+  // `stale:` rows (stamped on a restart) say nothing about the work.
+  const failed = facts.phases.filter(
+    (p) =>
+      p.success === false &&
+      p.stopReason !== "skipped" &&
+      !(p.error ?? "").startsWith("stale:"),
+  );
+
+  // `shared.ts` returns a failed result whose stop reason is still `success`
+  // only on its account-error path, so that shape is our marker.
+  if (failed.some((p) => PROVIDER_STOP_REASONS.has(p.stopReason ?? "") || p.stopReason === "success")) {
+    return "provider-account";
+  }
+  // The engine stamps the class on a REVIEWER-LOOP ledger row (`reviewer`,
+  // `reviewer_fix_N`, `reviewer_recheck_N`) and on the run error. A failed
+  // phase's error can be the agent's own final text, so the prefix counts only
+  // where a reviewer-loop row backs it — an architect that writes
+  // "review-rejected:" as its answer does not buy a retry.
+  const reviewerRows = facts.phases.filter((p) => isReviewerLoopPhase(phaseName(p.phase)));
+  const rejectedRow = failed.some(
+    (p) => isReviewerLoopPhase(phaseName(p.phase)) && (p.error ?? "").startsWith(REVIEW_REJECTED_PREFIX),
+  );
+  const rejectedRun =
+    (facts.error ?? "").startsWith(REVIEW_REJECTED_PREFIX) &&
+    reviewerRows.length > 0 &&
+    !failed.some((p) => !isReviewerLoopPhase(phaseName(p.phase)));
+  if (rejectedRow || rejectedRun) return "review-rejected";
+  if (failed.some((p) => p.stopReason === "error_truncated")) return "truncated";
+
+  const gateFailed = failed.some(
+    (p) =>
+      (phaseName(p.phase) === "guardrails" || phaseName(p.phase) === "guardrails_gate") &&
+      (p.error ?? "").startsWith(GATE_BLOCKED_PREFIX),
+  ) || (facts.error ?? "").startsWith(GATE_BLOCKED_PREFIX);
+  if (gateFailed) {
+    // After-change only when the ledger proves the executor already ran in this
+    // run. Anything less is before-change, which hands off: fail safe.
+    const executorRan = facts.phases.some((p) => phaseName(p.phase) === "executor" && p.success === true);
+    return executorRan ? "gate-blocked-after-change" : "gate-blocked-before-change";
+  }
+  if (failed.some((p) => phaseName(p.phase) === "executor")) return "executor-failed";
+  return "other";
+}
+
+/** The failures a second attempt on stronger models can plausibly fix. */
+const RETRYABLE_FAILURES: ReadonlySet<FailureClass> = new Set([
+  "executor-failed",
+  "truncated",
+  "review-rejected",
+  "gate-blocked-after-change",
+]);
+
+/**
+ * One retry on the retry models, then a human. Pure.
+ *
+ * `hold` is "do not retry now, and do not blame the code": an account failure,
+ * or a retryable failure while the usage windows say no. The issue still goes
+ * to `on_failure` with a comment; a human (or `@bot retry`) restarts it.
+ */
+export function resolveBuildEscalation(
+  i: { failure: FailureClass; attempt: number; usageAllows: boolean },
+  cfg: { maxAttempts: number },
+): Decision<"retry" | "hand-off" | "hold"> {
+  const inputs: Record<string, unknown> = { ...i, maxAttempts: cfg.maxAttempts };
+  if (i.failure === "provider-account") {
+    return {
+      decision: "hold",
+      reason: "provider-account: the run failed on a provider account, quota or sign-in error, which a retry cannot fix",
+      inputs,
+    };
+  }
+  if (!RETRYABLE_FAILURES.has(i.failure)) {
+    return { decision: "hand-off", reason: `not-retryable: a \`${i.failure}\` failure goes to a human`, inputs };
+  }
+  if (i.attempt >= cfg.maxAttempts) {
+    return {
+      decision: "hand-off",
+      reason: `attempts-exhausted: attempt ${i.attempt} of ${cfg.maxAttempts} failed (${i.failure})`,
+      inputs,
+    };
+  }
+  if (!i.usageAllows) {
+    return { decision: "hold", reason: `usage-held: the usage windows refuse a retry of this \`${i.failure}\` failure now`, inputs };
+  }
+  return {
+    decision: "retry",
+    reason: `retry: attempt ${i.attempt} of ${cfg.maxAttempts} failed (${i.failure}); retrying on the retry models`,
+    inputs,
   };
 }

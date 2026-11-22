@@ -52,7 +52,15 @@
  */
 
 import { advanceStage } from "./stage-advance.js";
-import { getAutonomyConfig, type AutonomyStageConfig } from "../config/config.js";
+import {
+  getAutonomyConfig,
+  getBotName,
+  getBuildConfig,
+  stageWorkflow,
+  type AutonomyStageConfig,
+} from "../config/config.js";
+import { classifyBuildFailure, resolveBuildEscalation } from "./build-decisions.js";
+import { currentUsage } from "./usage-runtime.js";
 import { logger } from "../logging/logger.js";
 import type { StateDb } from "../state/db.js";
 import type { WorkflowRun } from "../state/workflow-run-store.js";
@@ -79,6 +87,19 @@ export interface StageObserverDeps {
    * spend a GitHub request to show the same wrong thing.
    */
   onAdvanced?: (repo: string) => void;
+  /**
+   * L3 escalation: dispatch a retry of a failed autonomous build through the
+   * `dispatchWorkflow` choke point (which runs the build gate on route
+   * `escalation`). Resolves `"dispatched"` once a run exists for it, and
+   * `"skipped"` when the gate (or any choke-point guard) refused it.
+   *
+   * INJECTED for the same reason as {@link onAdvanced}. Absent = no escalation:
+   * every failure lands on `on_failure`, exactly as before.
+   */
+  dispatchEscalation?: (
+    workflow: string,
+    context: Record<string, unknown>,
+  ) => Promise<"dispatched" | "skipped">;
 }
 
 /**
@@ -244,6 +265,182 @@ async function advanceTerminalStage(
   }
 }
 
+// ── L3 escalation ──────────────────────────────────────────────────────────
+
+/** The attempt a run was dispatched as (`_attempt` on its context), default 1. */
+function readAttempt(run: WorkflowRun): number {
+  const raw = run.context?._attempt;
+  return typeof raw === "number" && Number.isInteger(raw) && raw >= 1 ? raw : 1;
+}
+
+/**
+ * Is this failed run one the escalation decides? Only an AUTONOMOUS stage run
+ * (`readStageName` already said so) of a stage whose workflow is `build`, and
+ * only when an escalation port is wired. Synchronous: one config lookup.
+ */
+function escalates(run: WorkflowRun, stageName: string, deps: StageObserverDeps): boolean {
+  if (!deps.dispatchEscalation) return false;
+  const stage = getAutonomyConfig().stages[stageName];
+  return !!stage && stageWorkflow(stage) === "build" && run.workflowName === "build";
+}
+
+/**
+ * The once-per-run claim. The observer fires once per `finishRun`, and a failed
+ * run is finished up to three times (the phase executor, the scheduler and
+ * `simple.ts` each call it), so the FIRST firing decides and the rest return.
+ * In-process and synchronous, which is what makes it race-free: the claim is
+ * taken before any await. The gate's (triggerId, attempt) key is the durable
+ * half (`build-gate.ts`). Entries age out after an hour; a run does not re-fail.
+ */
+const CLAIM_TTL_MS = 60 * 60_000;
+const claimsByDb = new WeakMap<StateDb, Map<string, number>>();
+
+function claimFailure(db: StateDb, runId: string): boolean {
+  let claims = claimsByDb.get(db);
+  if (!claims) {
+    claims = new Map();
+    claimsByDb.set(db, claims);
+  }
+  const now = Date.now();
+  for (const [id, at] of claims) if (now - at > CLAIM_TTL_MS) claims.delete(id);
+  if (claims.has(runId)) return false;
+  claims.set(runId, now);
+  return true;
+}
+
+/**
+ * The hold comment. Fixed text: it is posted once per failed run, and the
+ * usage gate itself never comments on an issue (`noteUsageHold` records an
+ * activity row and a webhook only), so this is the one place a human hears it.
+ */
+export function renderEscalationHoldComment(botName: string): string {
+  return (
+    "This build failed, and I'm not retrying it automatically: either the model provider " +
+    "refused the account (quota, billing or sign-in), or the usage limits are close, so a " +
+    "retry now would most likely fail the same way.\n\n" +
+    `Once that has cleared, comment \`@${botName} retry\` (optionally followed by a hint) to run it again.`
+  );
+}
+
+/**
+ * Best-effort: record what this attempt cost on the run's scratch, as
+ * `attemptCost: { attempt, costUsd }` — the same sum the run panel shows (the
+ * run's ledger rows). Never throws.
+ */
+async function recordAttemptCost(
+  db: StateDb,
+  run: WorkflowRun,
+  rows: ReadonlyArray<{ costUsd?: number }>,
+): Promise<void> {
+  try {
+    const costUsd = rows.reduce((sum, r) => sum + (typeof r.costUsd === "number" ? r.costUsd : 0), 0);
+    await db.runs.mergeScratch(run.id, { attemptCost: { attempt: readAttempt(run), costUsd } });
+  } catch (err: unknown) {
+    log.debug("Could not record the attempt's cost", { runId: run.id, err });
+  }
+}
+
+/**
+ * A failed autonomous build: classify it from the persisted rows, ask
+ * {@link resolveBuildEscalation}, and act. `retry` keeps the issue on
+ * `running` and dispatches attempt n+1; a refused dispatch, a `hold` and a
+ * `hand-off` all land on `on_failure` exactly as before (a `hold` also
+ * comments once).
+ */
+async function escalateFailedBuild(
+  db: StateDb,
+  run: WorkflowRun,
+  stageName: string,
+  deps: StageObserverDeps,
+): Promise<void> {
+  const where = locate(run);
+  if (!where) return advanceTerminalStage(run, "failed", stageName, deps);
+
+  const rows = await db.executions.getExecutionsForWorkflowRun(run.id, run.triggerId, run.workflowName);
+  await recordAttemptCost(db, run, rows);
+
+  const failure = classifyBuildFailure({
+    status: "failed",
+    error: typeof run.context?.error === "string" ? run.context.error : undefined,
+    phases: rows.map((r) => ({ phase: r.skill, success: r.success, error: r.error, stopReason: r.stopReason })),
+  });
+  const usage = await currentUsage(db).then(
+    (u) => u.verdict,
+    () => null,
+  );
+  const attempt = readAttempt(run);
+  const decision = resolveBuildEscalation(
+    { failure, attempt, usageAllows: usage?.held !== true },
+    { maxAttempts: getBuildConfig().maxAttempts },
+  );
+  log.info("Build escalation decision", {
+    runId: run.id,
+    ...where,
+    failure,
+    attempt,
+    decision: decision.decision,
+    reason: decision.reason,
+  });
+
+  if (decision.decision === "hand-off") return advanceTerminalStage(run, "failed", stageName, deps);
+
+  if (decision.decision === "hold") {
+    await advanceTerminalStage(run, "failed", stageName, deps);
+    if (!deps.github) return;
+    try {
+      await deps.github.postComment(where.owner, where.repo, where.issueNumber, renderEscalationHoldComment(getBotName()));
+    } catch (err: unknown) {
+      log.warn("Escalation hold comment failed", { runId: run.id, err });
+    }
+    return;
+  }
+
+  // RETRY. The issue's current title, body and labels come from GitHub: the
+  // gate's hold check must read the labels as they are NOW, and the run row
+  // does not keep the title. A read that fails hands off — toward a human.
+  type IssueRead = { title?: string; body?: string | null; state?: string; labels?: unknown[] };
+  let issue: IssueRead | null = null;
+  if (deps.github) {
+    try {
+      issue = (await deps.github.getIssue(where.owner, where.repo, where.issueNumber)) as IssueRead;
+    } catch (err: unknown) {
+      log.warn("Could not read the issue for an escalation retry — handing off", { runId: run.id, err });
+      return advanceTerminalStage(run, "failed", stageName, deps);
+    }
+    if (issue?.state === "closed") return advanceTerminalStage(run, "failed", stageName, deps);
+  }
+  const labels = (issue?.labels ?? [])
+    .map((l: unknown) => (typeof l === "string" ? l : (l as { name?: unknown } | null)?.name))
+    .filter((l): l is string => typeof l === "string" && l.length > 0);
+  const ctx = run.context ?? {};
+  const context: Record<string, unknown> = {
+    repo: `${where.owner}/${where.repo}`,
+    issueNumber: where.issueNumber,
+    title: issue?.title ?? "",
+    body: issue?.body ?? "",
+    labels,
+    sender: run.triggeredBy ?? getBotName(),
+    // Nobody asked for this attempt: the pipeline retried itself.
+    triggerActorType: "system",
+    _stage: stageName,
+    _attempt: attempt + 1,
+    _buildRoute: "escalation",
+    _senderIsBot: true,
+    _escalatedFrom: run.id,
+    ...(typeof ctx._addedLabel === "string" ? { _addedLabel: ctx._addedLabel } : {}),
+    ...(typeof ctx._hint === "string" && ctx._hint ? { _hint: ctx._hint } : {}),
+  };
+
+  let outcome: "dispatched" | "skipped" = "skipped";
+  try {
+    outcome = await deps.dispatchEscalation!(stageWorkflow(getAutonomyConfig().stages[stageName]!), context);
+  } catch (err: unknown) {
+    log.warn("Escalation dispatch threw — handing off", { runId: run.id, err });
+  }
+  // A refused retry must not strand the issue on `running`.
+  if (outcome === "skipped") return advanceTerminalStage(run, "failed", stageName, deps);
+}
+
 /**
  * Wire {@link advanceTerminalStage} onto every terminal run transition. Called
  * once, at boot, beside `installReviewCheckObserver`.
@@ -252,11 +449,54 @@ export function installStageObserver(db: StateDb, deps: StageObserverDeps): void
   db.runs.addTerminalObserver((run, status) => {
     const stageName = readStageName(run);
     if (!stageName) return;
-    advanceTerminalStage(run, status, stageName, deps).catch((err: unknown) => {
-      // The observer contract's "never throws" end of the bargain. The run is
-      // already persisted as terminal; no projection of it may undo that, and
-      // one failing must not cost the other observers their notification.
+    // The observer contract's "never throws" end of the bargain. The run is
+    // already persisted as terminal; no projection of it may undo that, and
+    // one failing must not cost the other observers their notification.
+    const onError = (err: unknown) =>
       log.warn("Terminal stage advance failed for run", { runId: run.id, stage: stageName, err });
-    });
+    if (status === "failed" && escalates(run, stageName, deps)) {
+      // First firing decides; the repeats of the same failure return here.
+      if (!claimFailure(db, run.id)) return;
+      escalateFailedBuild(db, run, stageName, deps).catch(onError);
+      return;
+    }
+    advanceTerminalStage(run, status, stageName, deps).catch(onError);
+    if (deps.dispatchEscalation && run.workflowName === "build") {
+      db.executions
+        .getExecutionsForWorkflowRun(run.id, run.triggerId, run.workflowName)
+        .then((rows) => recordAttemptCost(db, run, rows))
+        .catch(onError);
+    }
   });
+}
+
+/**
+ * The {@link StageObserverDeps.dispatchEscalation} port over `dispatchWorkflow`.
+ *
+ * `dispatchWorkflow` resolves only when the run ENDS, which for a build is
+ * hours; the observer needs to know only whether a run exists. So this settles
+ * `"dispatched"` the moment `onRunStart` fires (or the run was queued, or a
+ * live run already owns the trigger), and `"skipped"` when the dispatch
+ * returned without either — the gate's skip, or a choke-point refusal.
+ */
+export function escalationDispatchPort(
+  dispatch: (
+    workflow: string,
+    context: Record<string, unknown>,
+    onRunStart?: (runId: string) => Promise<void>,
+  ) => Promise<{ success: boolean; queued?: boolean; paused?: boolean }>,
+): NonNullable<StageObserverDeps["dispatchEscalation"]> {
+  return (workflow, context) =>
+    new Promise((resolve) => {
+      let started = false;
+      dispatch(workflow, context, async () => {
+        started = true;
+        resolve("dispatched");
+      })
+        .then((r) => resolve(started || r.queued || r.paused ? "dispatched" : "skipped"))
+        .catch((err: unknown) => {
+          log.warn("Escalation run threw", { workflow, err });
+          resolve(started ? "dispatched" : "skipped");
+        });
+    });
 }
