@@ -13,6 +13,10 @@
  *   and logs, and the 20-minute sweep is the retry.
  * - `fromBuildRun` is true only when a succeeded build run of THIS instance
  *   recorded this PR number in its `buildReview` scratch.
+ * - The repo's `.lastlight/` `merge:` layer is refreshed before every decision.
+ *   It can only tighten, so a refresh that fails waits rather than deciding on
+ *   the operator's policy alone.
+ * - The instance hold label stops a merge from the PR or the build's issue.
  *
  * Three triggers call {@link evaluateBuildMerge}: the green-settle webhook
  * (`checks-settled`), the build's own finish hook after an APPROVED record
@@ -27,23 +31,36 @@ import type { WebhookEmitter } from "../notify/webhook/emitter.js";
 import { buildRunPayload } from "../notify/webhook/payload.js";
 import {
   getAutonomyConfig,
-  getMergeConfig,
+  getHoldLabel,
   isAutonomousRepo,
   isMergeRepo,
+  mergeConfigForLayer,
 } from "../config/config.js";
+import { refreshRepoLayer, type RepoLayer } from "../config/repo-config.js";
 import { resolveAutonomyMerge } from "../workflows/autonomy-merge.js";
 import { BUILD_WORKFLOW, readBuildReview, type BuildReviewRecord } from "./build-review.js";
 import { issueTriggerId } from "./build-decisions.js";
 import { mayMergeBuild, type BuildMergeDecision } from "./merge-decisions.js";
 import { emptyPrState, type PrState } from "./pr-state.js";
 import type { MergeTrigger } from "./build-merge-route.js";
+import {
+  appendDecision,
+  hasCommented,
+  priorEntries,
+  reasonCase,
+  type MergeOutcome,
+} from "./build-merge-ledger.js";
 import { logger } from "../logging/logger.js";
 
 const log = logger("build-merge");
 
 export { BUILD_MERGE_HANDLER, type MergeTrigger } from "./build-merge-route.js";
-
-export type MergeOutcome = "merged" | "head-moved" | "already-merged" | "not-mergeable";
+export {
+  MERGE_DECISIONS_MAX,
+  MERGE_DECISIONS_SCRATCH_KEY,
+  type MergeDecisionEntry,
+  type MergeOutcome,
+} from "./build-merge-ledger.js";
 
 export interface BuildMergeDeps {
   github: GitHubClient;
@@ -56,23 +73,6 @@ export interface BuildMergeResult {
   decision: BuildMergeDecision;
   outcome?: MergeOutcome;
   reason: string;
-}
-
-/** `workflow_runs.scratch` key holding the build run's merge-decision ledger. */
-export const MERGE_DECISIONS_SCRATCH_KEY = "mergeDecisions";
-
-/** How many ledger entries a build run keeps. */
-export const MERGE_DECISIONS_MAX = 50;
-
-export interface MergeDecisionEntry {
-  at: string;
-  trigger: MergeTrigger;
-  decision: BuildMergeDecision;
-  reason: string;
-  headSha: string;
-  outcome?: MergeOutcome;
-  /** Set (true) only when this evaluation posted a PR comment. */
-  commented?: boolean;
 }
 
 // ── Notifier wiring ──────────────────────────────────────────────────────────
@@ -125,12 +125,6 @@ export function evaluateBuildMerge(
 
 // ── One evaluation ───────────────────────────────────────────────────────────
 
-/** The reason's case: the text before the first `:`. */
-function reasonCase(reason: string): string {
-  const i = reason.indexOf(":");
-  return i === -1 ? reason : reason.slice(0, i);
-}
-
 async function evaluateOnce(
   deps: BuildMergeDeps,
   repo: string,
@@ -150,13 +144,17 @@ async function evaluateOnce(
   }
 
   const { github } = deps;
-  const run = await findBuildRun(deps, owner, name, prNumber);
-  if (!run) {
+  const found = await findBuildRun(deps, owner, name, prNumber);
+  if (!found) {
+    // Silent by design: a PR no build run recorded is not the gate's (a human's
+    // `@bot build`, an older run, another tool's PR). No run, so no ledger.
+    log.debug("Not a gate build PR", { repo, prNumber, trigger });
     return {
       decision: "wait",
       reason: "not-from-build: no build run of this instance recorded this PR",
     };
   }
+  const { run, issueNumber } = found;
   const review = readBuildReview(run);
 
   const pr = await github.getPullRequest(owner, name, prNumber);
@@ -171,12 +169,30 @@ async function evaluateOnce(
     return result;
   }
 
-  const [checks, changedPaths, defaultBranch] = await Promise.all([
+  // The repo layer, fresh. `getCachedRepoLayer` is memory-only and empty after
+  // every restart, and the layer can only tighten: a cold cache is the looser
+  // policy. A refresh that fails is not "no layer", so it waits.
+  let layer: RepoLayer | undefined;
+  try {
+    layer = await refreshRepoLayer(repo, { client: github, throwOnFetchError: true });
+  } catch (err: unknown) {
+    const result: BuildMergeResult = {
+      decision: "wait",
+      reason: "repo-config-unknown: the repo's .lastlight/ merge policy could not be read",
+    };
+    log.warn("Not merging: the repo merge policy could not be refreshed", { repo, prNumber, runId: run.id, trigger, err });
+    await appendDecision(deps.db, run, { trigger, ...result, headSha });
+    return result;
+  }
+
+  const [checks, changedPaths, defaultBranch, issue] = await Promise.all([
     headSha
       ? github.getChecksSummary(owner, name, headSha, { excludeApp: appSlug(deps.botLogin), strict: true })
       : Promise.resolve(null),
     github.listAllPullRequestFilePaths(owner, name, prNumber),
     github.getDefaultBranch(owner, name),
+    // Live: a hold label put on the issue after the build must still stop the merge.
+    github.getIssue(owner, name, issueNumber),
   ]);
 
   const state = snapshot(repo, prNumber, pr, deps.botLogin, checks);
@@ -187,33 +203,31 @@ async function evaluateOnce(
       review,
       changedPaths,
       prLabels: state.labels,
+      issueLabels: labelNames(issue?.labels),
+      holdLabel: getHoldLabel(),
       mergeEnabled,
       fromBuildRun: true,
       mergeableState: typeof pr.mergeable_state === "string" ? pr.mergeable_state : null,
       baseIsDefault: !!defaultBranch && pr.base?.ref === defaultBranch,
     },
-    getMergeConfig(repo),
+    mergeConfigForLayer(layer),
   );
   const { decision, reason } = decided;
   const ctx = { repo, prNumber, runId: run.id, trigger, decision, reason };
 
   /**
    * Hand the PR to a human: one comment per (reason case, head), deduped
-   * against the ledger's `commented` entries, then one ledger entry.
+   * against the ledger's `commented` entries, then one ledger entry. `body`
+   * null hands off without a comment.
    */
   const handOff = async (
     handReason: string,
-    body: string,
+    body: string | null,
     outcome?: MergeOutcome,
   ): Promise<BuildMergeResult> => {
-    const already = priorEntries(run).some(
-      (e) =>
-        e.decision === "hand-off" &&
-        e.headSha === headSha &&
-        e.commented === true &&
-        reasonCase(e.reason) === reasonCase(handReason),
-    );
-    const commented = already ? false : await comment(github, owner, name, prNumber, body, ctx);
+    const already = hasCommented(run, headSha, handReason);
+    const commented =
+      already || body === null ? false : await comment(github, owner, name, prNumber, body, ctx);
     log.info("Build PR handed off to a human", { ...ctx, reason: handReason, outcome, commented, alreadyCommented: already });
     await appendDecision(deps.db, run, {
       trigger,
@@ -265,6 +279,8 @@ async function evaluateOnce(
     return { decision, outcome: res.outcome, reason };
   }
 
+  // The hold label means "stop acting on this subject", commenting included.
+  if (decision === "hand-off" && reasonCase(reason) === ON_HOLD_CASE) return handOff(reason, null);
   if (decision === "hand-off") return handOff(reason, handOffComment(reason, review));
 
   log.debug("Build PR not merged yet", ctx);
@@ -276,8 +292,19 @@ async function evaluateOnce(
 const NOT_MERGEABLE_REASON =
   "not-mergeable: GitHub refused the squash merge of this head; the gate will not retry it";
 
+/** `mayMergeBuild`'s reason case for the instance hold label. */
+const ON_HOLD_CASE = "on-hold";
+
+/** Label names off a REST issue's `labels` (strings or `{ name }`). */
+function labelNames(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((l) => (typeof l === "string" ? l : (l as { name?: unknown } | null)?.name))
+    .filter((n): n is string => typeof n === "string" && n !== "");
+}
+
 /**
- * The succeeded build run that recorded THIS PR, or null.
+ * The succeeded build run that recorded THIS PR, and the issue it ran for, or null.
  *
  * A build run is keyed by its issue (`owner/repo#N`), so the PR's closing
  * issues are the lookup key: the latest succeeded `build` run for each, kept
@@ -290,15 +317,15 @@ async function findBuildRun(
   owner: string,
   name: string,
   prNumber: number,
-): Promise<WorkflowRun | null> {
+): Promise<{ run: WorkflowRun; issueNumber: number } | null> {
   const repo = `${owner}/${name}`;
   const issues = await deps.github.listPullRequestClosingIssues(owner, name, prNumber);
-  let best: WorkflowRun | null = null;
+  let best: { run: WorkflowRun; issueNumber: number } | null = null;
   for (const issue of issues) {
     const run = await deps.db.runs.latestSucceededForTrigger(BUILD_WORKFLOW, issueTriggerId(repo, issue.number));
     if (!run || run.status !== "succeeded" || run.workflowName !== BUILD_WORKFLOW) continue;
     if (readBuildReview(run)?.prNumber !== prNumber) continue;
-    if (!best || run.startedAt > best.startedAt) best = run;
+    if (!best || run.startedAt > best.run.startedAt) best = { run, issueNumber: issue.number };
   }
   return best;
 }
@@ -337,46 +364,6 @@ function snapshot(
 /** The App slug behind `<slug>[bot]`: our own `last-light/review` check is excluded from the count. */
 function appSlug(botLogin: string): string | undefined {
   return botLogin.replace(/\[bot\]$/, "") || undefined;
-}
-
-// ── The ledger ───────────────────────────────────────────────────────────────
-
-function priorEntries(run: WorkflowRun): MergeDecisionEntry[] {
-  const raw = (run.scratch ?? {})[MERGE_DECISIONS_SCRATCH_KEY];
-  if (!Array.isArray(raw)) return [];
-  return raw.filter(
-    (e): e is MergeDecisionEntry =>
-      !!e && typeof e === "object" && typeof e.reason === "string" && typeof e.decision === "string",
-  );
-}
-
-/**
- * Append one entry to the run's ledger, keeping the last
- * {@link MERGE_DECISIONS_MAX}. An evaluation that changed nothing (same
- * decision, reason, head and outcome as the last entry, and no comment posted)
- * is not recorded, so the sweep does not fill the ledger with repeats.
- */
-async function appendDecision(
-  db: StateDb,
-  run: WorkflowRun,
-  entry: Omit<MergeDecisionEntry, "at">,
-): Promise<void> {
-  const prior = priorEntries(run);
-  const last = prior[prior.length - 1];
-  if (
-    last &&
-    !entry.commented &&
-    last.decision === entry.decision &&
-    last.reason === entry.reason &&
-    last.headSha === entry.headSha &&
-    last.outcome === entry.outcome
-  ) {
-    return;
-  }
-  const next = [...prior, { at: new Date().toISOString(), ...entry }].slice(-MERGE_DECISIONS_MAX);
-  await db.runs.mergeScratch(run.id, { [MERGE_DECISIONS_SCRATCH_KEY]: next });
-  // Keep the in-memory row current for a later step of this same evaluation.
-  run.scratch = { ...(run.scratch ?? {}), [MERGE_DECISIONS_SCRATCH_KEY]: next };
 }
 
 // ── Comments and events ──────────────────────────────────────────────────────

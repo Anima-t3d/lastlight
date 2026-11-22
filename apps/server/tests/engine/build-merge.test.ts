@@ -3,7 +3,8 @@
  * run store and a fake GitHub that models the PR's state.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 vi.mock("#src/logging/logger.js", () => {
@@ -27,6 +28,7 @@ import {
   setAutonomyReposOverride,
   type LastLightConfig,
 } from "#src/config/config.js";
+import { resetRepoConfigForTests } from "#src/config/repo-config.js";
 import type { StateDb } from "#src/state/db.js";
 import { makeTestDb } from "../helpers/state-db.js";
 
@@ -35,8 +37,11 @@ const REPO = "acme/widgets";
 const PR = 12;
 const ISSUE = 3;
 
+let stateDir = "";
+
 function config(onMerge: "gate" | "none" = "gate"): LastLightConfig {
   return {
+    stateDir,
     autonomy: {
       repos: [REPO],
       stages: {
@@ -48,7 +53,9 @@ function config(onMerge: "gate" | "none" = "gate"): LastLightConfig {
 }
 
 /** A GitHub fake whose PR is a mutable object, so a merge is visible to the next read. */
-function fakeGithub(over: { files?: string[] | null; mergeOutcome?: string; labels?: string[] } = {}) {
+function fakeGithub(
+  over: { files?: string[] | null; mergeOutcome?: string; labels?: string[]; issueLabels?: string[] } = {},
+) {
   const pr = {
     number: PR,
     state: "open",
@@ -69,6 +76,9 @@ function fakeGithub(over: { files?: string[] | null; mergeOutcome?: string; labe
     getChecksSummary: vi.fn(async () => ({ state: "passing", settledCount: 2, pendingCount: 0 })),
     listAllPullRequestFilePaths: vi.fn(async () => (over.files === undefined ? ["src/a.ts"] : over.files)),
     getDefaultBranch: vi.fn(async () => "main"),
+    getIssue: vi.fn(async () => ({ number: ISSUE, state: "open", labels: (over.issueLabels ?? []).map((name) => ({ name })) })),
+    // The repo's `.lastlight/` layer, refreshed before every decision. Default: none.
+    fetchRepoConfigTree: vi.fn(async (): Promise<unknown> => ({ status: "absent", defaultBranch: "main" })),
     postComment: vi.fn(async () => 1),
     mergePullRequest: vi.fn(async () => {
       // Yield, so a concurrent evaluation would get the chance to overlap.
@@ -126,6 +136,8 @@ async function ledger(db: StateDb, id = "run-1"): Promise<any[]> {
 const emit = vi.fn();
 
 beforeEach(() => {
+  stateDir = mkdtempSync(join(tmpdir(), "lastlight-build-merge-"));
+  resetRepoConfigForTests();
   setRuntimeConfig(config());
   setAutonomyReposOverride([REPO]);
   setMergeReposOverride([REPO]);
@@ -135,6 +147,8 @@ beforeEach(() => {
 
 afterEach(() => {
   resetRuntimeConfigForTests();
+  resetRepoConfigForTests();
+  rmSync(stateDir, { recursive: true, force: true });
   setMergeReposOverride(null);
   configureBuildMerge({ emitter: null });
 });
@@ -247,6 +261,7 @@ describe("evaluateBuildMerge — merge path", () => {
     ["getDefaultBranch"],
     ["listAllPullRequestFilePaths"],
     ["listPullRequestClosingIssues"],
+    ["getIssue"],
   ] as const)("a rejected %s read propagates: no merge, no comment, no merge entry", async (method) => {
     const db = await makeTestDb();
     await seedBuildRun(db);
@@ -362,6 +377,134 @@ describe("evaluateBuildMerge — hand-off", () => {
     const deps = { github: github as any, db, botLogin: BOT };
     await evaluateBuildMerge(deps, REPO, PR, "sweep");
     await evaluateBuildMerge(deps, REPO, PR, "sweep");
+    await evaluateBuildMerge(deps, REPO, PR, "sweep");
+    expect(github.postComment).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("evaluateBuildMerge — the hold label (C1)", () => {
+  it("lastlight-ignore on an approved, green, clean PR: no merge, and no comment", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub({ labels: ["lastlight-ignore"] });
+    const deps = { github: github as any, db, botLogin: BOT };
+    const res = await evaluateBuildMerge(deps, REPO, PR, "checks-settled");
+    await evaluateBuildMerge(deps, REPO, PR, "sweep");
+    expect(res.decision).toBe("hand-off");
+    expect(res.reason).toMatch(/^on-hold:/);
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+    // The hold label means "stop acting on this subject": no comment either.
+    expect(github.postComment).not.toHaveBeenCalled();
+    const entries = await ledger(db);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ decision: "hand-off", headSha: "B" });
+    expect(entries[0].commented).toBeUndefined();
+  });
+
+  it("the hold label on the closing issue only: no merge", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub({ issueLabels: ["lastlight-ignore"] });
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(res.decision).toBe("hand-off");
+    expect(res.reason).toMatch(/^on-hold: the closing issue/);
+    expect(github.getIssue).toHaveBeenCalledWith("acme", "widgets", ISSUE);
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+  });
+
+  it("the hold label in mixed case: no merge", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub({ labels: ["LastLight-IGNORE"] });
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(res.reason).toMatch(/^on-hold:/);
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+  });
+
+  it("a merge hold label on the closing issue hands off with one comment", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub({ issueLabels: ["Do-Not-Merge"] });
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(res.reason).toMatch(/^hold-label:/);
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+    expect(github.postComment).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("evaluateBuildMerge — the repo merge layer (I3)", () => {
+  const layerTree = (yml: string) => ({
+    status: "ok",
+    defaultBranch: "main",
+    treeSha: "tree-1",
+    files: [{ path: "lastlight.yml", mode: "100644", size: Buffer.byteLength(yml), content: Buffer.from(yml) }],
+    truncated: false,
+  });
+
+  it("a repo layer that adds a protected path is honoured on a cold cache", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub({ files: ["src/a.ts", "migrations/001.sql"] });
+    github.fetchRepoConfigTree.mockResolvedValue(layerTree("merge:\n  protectedPaths: [\"migrations/**\"]\n"));
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(github.fetchRepoConfigTree).toHaveBeenCalledTimes(1);
+    expect(res.decision).toBe("hand-off");
+    expect(res.reason).toBe("protected-path: migrations/001.sql is protected");
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+  });
+
+  it("a repo with no .lastlight/ is a successful refresh: the operator policy merges", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub();
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(github.fetchRepoConfigTree).toHaveBeenCalledTimes(1);
+    expect(res).toMatchObject({ decision: "merge", outcome: "merged" });
+  });
+
+  it("a failed refresh waits: no merge on the operator-only policy, no comment", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub();
+    github.fetchRepoConfigTree.mockRejectedValue(Object.assign(new Error("tree 502"), { status: 502 }));
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(res.decision).toBe("wait");
+    expect(res.reason).toMatch(/^repo-config-unknown:/);
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+    expect(github.postComment).not.toHaveBeenCalled();
+    expect((await ledger(db))[0]).toMatchObject({ decision: "wait", headSha: "B" });
+  });
+
+  it("a failed refresh waits even when an earlier layer is cached", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub({ files: ["src/a.ts"] });
+    github.fetchRepoConfigTree.mockResolvedValueOnce(layerTree("merge:\n  minSettledChecks: 1\n"));
+    github.getChecksSummary.mockResolvedValueOnce({ state: "pending", settledCount: 0, pendingCount: 1 });
+    const deps = { github: github as any, db, botLogin: BOT };
+    expect((await evaluateBuildMerge(deps, REPO, PR, "sweep")).reason).toMatch(/^checks-pending:/);
+    github.fetchRepoConfigTree.mockRejectedValue(new Error("tree 502"));
+    const res = await evaluateBuildMerge(deps, REPO, PR, "sweep");
+    expect(res.reason).toMatch(/^repo-config-unknown:/);
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+  });
+});
+
+describe("evaluateBuildMerge — a stale review (I4b)", () => {
+  it("hands off with one comment per head when the head moved past the reviewed commit", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db, { review: { reviewedSha: "A" } });
+    const github = fakeGithub();
+    const deps = { github: github as any, db, botLogin: BOT };
+    const first = await evaluateBuildMerge(deps, REPO, PR, "checks-settled");
+    await evaluateBuildMerge(deps, REPO, PR, "sweep");
+    expect(first.decision).toBe("hand-off");
+    expect(first.reason).toMatch(/^stale-review:/);
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+    expect(github.postComment).toHaveBeenCalledTimes(1);
+    expect(github.postComment.mock.calls[0][3]).toContain("stale-review");
+
+    github.pr.head.sha = "C";
     await evaluateBuildMerge(deps, REPO, PR, "sweep");
     expect(github.postComment).toHaveBeenCalledTimes(2);
   });

@@ -5,6 +5,7 @@ import { tmpdir } from "os";
 import {
   loadConfig,
   getMergeConfig,
+  mergeConfigForLayer,
   defaultMergeConfig,
   resolveMergeConfig,
   resetRuntimeConfigForTests,
@@ -28,6 +29,20 @@ describe("defaultMergeConfig / getMergeConfig defaults", () => {
   it("getMergeConfig() answers the defaults with no boot config", () => {
     expect(getMergeConfig()).toEqual(defaultMergeConfig());
     expect(getMergeConfig("o/r")).toEqual(defaultMergeConfig());
+  });
+});
+
+describe("mergeConfigForLayer — the gate's policy from a refreshed layer", () => {
+  afterEach(() => resetRuntimeConfigForTests());
+
+  it("folds the layer's merge: node onto the operator block, tighten only", () => {
+    const cfg = mergeConfigForLayer({ config: { merge: { protectedPaths: ["migrations/**"], minSettledChecks: 3 } } });
+    expect(cfg.protectedPaths).toEqual([...DEFAULT_PROTECTED, "migrations/**"]);
+    expect(cfg.minSettledChecks).toBe(3);
+  });
+
+  it("no layer is the operator block", () => {
+    expect(mergeConfigForLayer(undefined)).toEqual(defaultMergeConfig());
   });
 });
 

@@ -91,6 +91,14 @@ export interface FetchRepoLayerOptions {
   force?: boolean;
   /** Cache root override. Defaults to `<stateDir>/repo-config`. */
   cacheRoot?: string;
+  /**
+   * Rethrow a GitHub fetch failure instead of degrading to the last cached
+   * layer (or to none), leaving the cache as it was. For a caller that must not
+   * act on a policy it could not confirm: the merge gate, where the repo layer
+   * can only tighten, so a missing layer is the LOOSER answer. "No
+   * `.lastlight/`" is still a successful `undefined`.
+   */
+  throwOnFetchError?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,8 +217,8 @@ interface RepoLayerSidecar {
 /**
  * Fetch (or serve from cache) a repo's `.lastlight/` layer.
  *
- * Never throws and never rejects: a GitHub failure degrades to the last good
- * cached layer, or to `undefined`. `undefined` means "no repo layer applies" —
+ * Never throws and never rejects (unless `throwOnFetchError` asks it to): a
+ * GitHub failure degrades to the last good cached layer, or to `undefined`. `undefined` means "no repo layer applies" —
  * the feature is off, the repo has no `.lastlight/`, there's no GitHub auth, or
  * the fetch failed with nothing cached.
  *
@@ -260,6 +268,7 @@ export async function fetchRepoLayer(
       includePath: (p) => repoLayerPathKind(p) !== null || isRepoWorkflowPath(p),
     });
   } catch (err: unknown) {
+    if (options.throwOnFetchError) throw err;
     // Warn, keep the last good layer, run anyway.
     const message = err instanceof Error ? err.message : String(err);
     log.warn(".lastlight/ fetch failed — using the cached layer if any", { repo, err });

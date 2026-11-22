@@ -28,6 +28,13 @@ export interface BuildMergeInputs {
   /** Changed paths incl. previous names; `null` = completeness unconfirmed. */
   changedPaths: readonly string[] | null;
   prLabels: readonly string[];
+  /** Live labels of the closing issue the build ran for. A hold there holds the PR too. */
+  issueLabels: readonly string[];
+  /**
+   * The instance hold label (`getHoldLabel()`, default `lastlight-ignore`). On
+   * the PR or the issue it stops the merge like every other action.
+   */
+  holdLabel: string;
   /** `resolveAutonomyMerge(...).gate` */
   mergeEnabled: boolean;
   /** The PR was opened by a build run of this instance. */
@@ -62,6 +69,17 @@ export function globToRegExp(glob: string): RegExp {
   return new RegExp(`^${re}$`);
 }
 
+/** GitHub label names are case-insensitive. */
+function labelKey(label: string): string {
+  return label.trim().toLowerCase();
+}
+
+/** The first of `wanted` that `labels` carries, compared case-insensitively. */
+function findLabel(labels: readonly string[], wanted: readonly string[]): string | undefined {
+  const have = new Set(labels.map(labelKey));
+  return wanted.find((w) => w.trim() !== "" && have.has(labelKey(w)));
+}
+
 export function mayMergeBuild(
   i: BuildMergeInputs,
   cfg: MergeConfig,
@@ -94,9 +112,16 @@ export function mayMergeBuild(
   if (state.isDraft) return out("wait", "draft: the PR is still a draft");
   if (!i.baseIsDefault) return out("wait", "not-default-base: the PR does not target the default branch");
 
-  // 2. Needs a human.
-  const hold = cfg.holdLabels.find((l) => i.prLabels.includes(l));
-  if (hold !== undefined) return out("hand-off", `hold-label: PR carries "${hold}"`);
+  // 2. Needs a human. The instance hold label first: it means "stop acting on
+  // this subject", so the executor hands off without a comment.
+  const onHoldPr = findLabel(i.prLabels, [i.holdLabel]);
+  const onHoldIssue = onHoldPr === undefined ? findLabel(i.issueLabels, [i.holdLabel]) : undefined;
+  if (onHoldPr !== undefined) return out("hand-off", `on-hold: PR carries "${onHoldPr}"`);
+  if (onHoldIssue !== undefined) return out("hand-off", `on-hold: the closing issue carries "${onHoldIssue}"`);
+  const holdPr = findLabel(i.prLabels, cfg.holdLabels);
+  if (holdPr !== undefined) return out("hand-off", `hold-label: PR carries "${holdPr}"`);
+  const holdIssue = findLabel(i.issueLabels, cfg.holdLabels);
+  if (holdIssue !== undefined) return out("hand-off", `hold-label: the closing issue carries "${holdIssue}"`);
 
   if (i.changedPaths === null) {
     return out("hand-off", "paths-unknown: the changed-file list could not be confirmed complete");
@@ -115,12 +140,20 @@ export function mayMergeBuild(
     return out("hand-off", "changes-requested: the build review requested changes on this head");
   }
   if (i.mergeableState === "dirty") return out("hand-off", "conflict: the PR has merge conflicts");
+  // The head moved past the reviewed commit (a pr-fix push, a human push).
+  // Only a build run records a review, so nothing will ever re-record this
+  // head: waiting would be permanent and silent.
+  if (review && review.reviewedSha !== state.headSha) {
+    return out("hand-off", `stale-review: reviewed ${review.reviewedSha}, head is ${state.headSha}`);
+  }
+  // Only an explicit approval authorises an unattended merge, whatever other
+  // verdict a record may carry one day.
+  if (review && review.verdict !== "APPROVED") {
+    return out("hand-off", `not-approved: the build review verdict is "${String(review.verdict)}"`);
+  }
 
   // 3. Waits.
   if (!review) return out("wait", "no-review: no build review is recorded for this PR");
-  if (review.reviewedSha !== state.headSha) {
-    return out("wait", `stale-review: reviewed ${review.reviewedSha}, head is ${state.headSha}`);
-  }
   if (state.checksState === "pending") return out("wait", "checks-pending: CI has not settled yet");
   const noneOk = cfg.minSettledChecks === 0 && state.checksState === "none";
   if (!noneOk && (state.checksState === "none" || state.settledCheckCount < cfg.minSettledChecks)) {

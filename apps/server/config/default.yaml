@@ -939,8 +939,9 @@ merge:
     - ".github/**"
     - ".lastlight/**"
     - "**/CODEOWNERS"
-  holdLabels:                  # a PR carrying any of these is never gate-merged
-    - do-not-merge
+  holdLabels:                  # a PR (or its build's issue) carrying any of these is never
+    - do-not-merge             # gate-merged, matched case-insensitively. The hold label
+                               # (`hold.label`) always counts too, and the gate stays silent on it.
 
 # L3 escalation of a failed AUTONOMOUS build (a `_stage` run; never an
 # `@bot build`). A retryable failure (executor failed, truncated, reviewer

@@ -1148,6 +1148,29 @@ describe("fetchRepoLayer", () => {
     expect(codes(layer!.warnings)).toContain("fetch-failed");
   });
 
+  it("throwOnFetchError rethrows a fetch error and leaves the cached layer as it was", async () => {
+    const fake = fakeClient(okResult());
+    const before = await fetchRepoLayer("acme/widget", { client: fake.client, policy: policy(), cacheRoot });
+    const broken = {
+      async fetchRepoConfigTree() {
+        throw new Error("boom");
+      },
+    } as unknown as GitHubClient;
+
+    await expect(
+      refreshRepoLayer("acme/widget", { client: broken, policy: policy(), cacheRoot, throwOnFetchError: true }),
+    ).rejects.toThrow("boom");
+    expect(getCachedRepoLayer("acme/widget")).toBe(before);
+    expect(codes(getCachedRepoLayer("acme/widget")!.warnings)).not.toContain("fetch-failed");
+  });
+
+  it("throwOnFetchError still answers an absent .lastlight/ with no layer", async () => {
+    const fake = fakeClient({ status: "absent", defaultBranch: "trunk" });
+    expect(
+      await refreshRepoLayer("acme/widget", { client: fake.client, policy: policy(), cacheRoot, throwOnFetchError: true }),
+    ).toBeUndefined();
+  });
+
   it("does nothing at all when the policy is disabled", async () => {
     const fake = fakeClient(okResult());
     expect(

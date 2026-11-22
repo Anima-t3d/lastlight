@@ -799,16 +799,28 @@ function normalizeMergeConfig(raw: unknown): MergeConfig {
 }
 
 /**
- * The merge gate's effective policy for `repo` ("owner/name"): the operator's
- * block with the repo's cached `.lastlight/` `merge:` node folded on, tighten
- * only. No network — a repo whose layer is not cached yet gets the operator's
- * policy, which is the stricter-or-equal answer by construction.
+ * The merge policy for read-only surfaces: the operator's block with the repo's
+ * CACHED `.lastlight/` `merge:` node folded on, tighten only. No network.
+ *
+ * The cache is in-memory only and empty after every restart. A repo layer can
+ * only tighten, so a repo whose layer is not cached gets the operator's policy,
+ * which is the LOOSER answer. Never decide a merge on this: the gate refreshes
+ * the layer and uses {@link mergeConfigForLayer} (`engine/build-merge.ts`).
  */
 export function getMergeConfig(repo?: string): MergeConfig {
+  if (!repo) return currentConfig?.merge ?? defaultMergeConfig();
+  return mergeConfigForLayer(getCachedRepoLayer(repo));
+}
+
+/**
+ * The merge gate's effective policy: the operator's block with `layer`'s
+ * `merge:` node folded on, tighten only. `layer` is the repo layer the caller
+ * just refreshed; `undefined` means the repo has no `.lastlight/` (or the
+ * feature is off), not "unknown".
+ */
+export function mergeConfigForLayer(layer: { config?: Record<string, unknown> } | undefined): MergeConfig {
   const operator = currentConfig?.merge ?? defaultMergeConfig();
-  if (!repo) return operator;
-  const layer = getCachedRepoLayer(repo)?.config?.merge;
-  return resolveMergeConfig(operator, layer);
+  return resolveMergeConfig(operator, layer?.config?.merge);
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,11 +1222,12 @@ function applySiteConcurrencyAlias(layer: Record<string, unknown> | null, label:
  * The configured HOLD label, with the packaged default when config isn't loaded
  * yet (unit tests) — see {@link LastLightConfig.holdLabel} and {@link HOLD_LABEL}.
  *
- * Read in exactly two places, both of which are choke points rather than
- * policies: `resolveDispatchDisposition` (every PR-scoped route) and the
- * router's subject-level ignore (every other workflow, PRs and issues alike).
- * Nothing else may branch on it — a hold that some routes honour and others do
- * not is worse than no hold at all.
+ * Read at the choke points rather than in policies: `resolveDispatchDisposition`
+ * (every PR-scoped route), the router's subject-level ignore (every other
+ * workflow, PRs and issues alike), and the merge gate (`mayMergeBuild`, on the
+ * PR and the build's issue), whose `build-finished` and `sweep` triggers never
+ * cross the router. Nothing else may branch on it — a hold that some routes
+ * honour and others do not is worse than no hold at all.
  */
 export function getHoldLabel(): string {
   return currentConfig?.holdLabel || HOLD_LABEL;
