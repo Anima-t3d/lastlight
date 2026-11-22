@@ -11,7 +11,6 @@ import {
   effectiveGate,
   getAutonomyConfig,
   getBuildConfig,
-  isApprovalSkipRepo,
   isAutonomousRepo,
   isMergeRepo,
   getBotName,
@@ -32,6 +31,13 @@ import type { ConfigSource } from "../config/config-resolve.js";
 import type { GitHubClient } from "../engine/github/github.js";
 import { finalizeBuildReviewForRun } from "../engine/build-review.js";
 import { resolveAutonomyMerge } from "./autonomy-merge.js";
+import {
+  STAGE_GATES_KEY,
+  decideStageGates,
+  storedStageGates,
+  withRunApproval,
+  withStageGates,
+} from "./stage-approval.js";
 import { resolveReviewGitHubClient } from "./handlers/post-review.js";
 import {
   fetchRepoLayer,
@@ -865,25 +871,6 @@ export function artifactIssueDir(
  * Read a numeric leaf off the untyped dispatch `extra`. Anything else — absent,
  * a string, a stale shape — reads as "no snapshot", which is the inert case.
  */
-/**
- * The `true` leaves of an autonomy stage's gate map, off the untyped dispatch
- * `extra`. Anything else — absent, a non-object, a non-boolean leaf, or an
- * explicit `false` — yields nothing for that key.
- *
- * `false` is dropped rather than carried because the union this feeds is
- * ADD-ONLY: a `false` spread over an operator's `true` would clear a gate the
- * operator asked for, and dropping it lets the base map answer instead. See the
- * union in `runWorkflow`.
- */
-function enabledGatesFrom(raw: unknown): Record<string, boolean> {
-  const out: Record<string, boolean> = {};
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
-  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
-    if (value === true) out[name] = true;
-  }
-  return out;
-}
-
 // `resolveAutonomyMerge` lives in `./autonomy-merge.ts` (a module with no
 // runtime edges) so the merge executor can read it without importing this one.
 export { resolveAutonomyMerge, type AutonomyMergeContext } from "./autonomy-merge.js";
@@ -1172,40 +1159,25 @@ async function runSimpleWorkflowBody(
   const repoConfig = request.repoConfig;
   const effectiveVariants = repoConfig?.variants ?? variants;
   // The autonomy stage's approval gates, stashed on the dispatch context by the
-  // build gate (`engine/build-gate.ts`) and read back through the untyped
-  // `extra` — hence defensively, and hence `true` leaves ONLY.
-  //
-  // Why that filter is the whole safety argument: the union is
-  // **positive-enable only**. `gateEnabled` (runner.ts) tests `=== true`, so a
-  // `true` leaf can RAISE a gate the operator left off — but a `false` leaf
-  // spread over an operator's `true` would CLEAR it, which is precisely the
-  // thing the add-only rule forbids. Dropping the `false` IS the clamp: the base
-  // map underneath carries the operator's value, so the leaf resolves straight
-  // back to it — the same shape the repo layer's policy blocks already use.
-  //
-  // The effect is that an autonomous build pauses at `post_architect` while an
-  // `@bot build` on the same repo does not: same workflow, same repo, different
-  // dispatch, and only the autonomous one carries the stage's gates.
+  // build gate (`engine/build-gate.ts`) as `_autonomyGates`, and unioned
+  // add-only onto the base map below (`true` leaves only — see
+  // `stage-approval.ts`). The effect is that an autonomous build pauses at
+  // `post_architect` while an `@bot build` on the same repo does not: same
+  // workflow, same repo, different dispatch, and only the autonomous one
+  // carries the stage's gates.
   //
   // The per-repo Approvals toggle (Config → Managed repos, `approval-skip-repos`)
-  // drops ONLY these stage-added gates: the base map below (operator ⊕ repo
-  // layer) still applies untouched. Read once, here, when the run starts — so a
-  // toggle flipped mid-run does not change a running build. Every stage
-  // dispatch reaches this line, including the observer's escalation retry and
-  // `@bot retry`, which carry `_stage` and so `_autonomyGates`; a human
-  // `@bot build` carries none, so the toggle cannot touch it. Like the merge
-  // list, a skip entry counts only while the repo is on the autonomy list.
+  // drops ONLY these stage-added gates: the base map (operator ⊕ repo layer)
+  // still applies untouched. The toggle is read HERE, once, for a run being
+  // created, and the decision is persisted on the run (`_stageGates`); a run
+  // that already exists — admitted from the queue, or re-dispatched after an
+  // approval — reads that decision back instead (see `stageGates` below), so a
+  // toggle flipped while a run is queued or paused does not change it. Every
+  // stage dispatch reaches this line, including the observer's escalation
+  // retry and `@bot retry`, which carry `_stage` and so `_autonomyGates`; a
+  // human `@bot build` carries none, so the toggle cannot touch it.
   const mergeRepo = `${owner}/${repo}`;
-  const skipStageGates = isApprovalSkipRepo(mergeRepo) && isAutonomousRepo(mergeRepo);
-  const stageGates = enabledGatesFrom(request.extra?._autonomyGates);
-  const autonomyGates = skipStageGates ? {} : stageGates;
-  if (skipStageGates && Object.keys(stageGates).length > 0) {
-    simpleLog.info("Approvals off for this repo — running the stage build without its approval gates", {
-      workflowName,
-      repo: mergeRepo,
-      skippedGates: Object.keys(stageGates),
-    });
-  }
+  const stageDecision = decideStageGates(request.extra, mergeRepo);
   // The same stage, its OTHER projection: what becomes of the PR this build
   // opens. Read from the operator's config (the gate hands back gates, not a
   // merge policy) and keyed on the same dispatch markers, so an `@bot build`
@@ -1227,10 +1199,9 @@ async function runSimpleWorkflowBody(
     });
   }
   const baseApproval = repoConfig?.approval ?? approvalConfig;
-  // No gates ⇒ the caller's own map by identity, exactly as the maps above —
-  // so a run that crossed no stage behaves as it did before the gate existed.
-  const effectiveApproval =
-    Object.keys(autonomyGates).length > 0 ? { ...baseApproval, ...autonomyGates } : baseApproval;
+  // The stage gates this run adds. A NEW run uses the decision just made; a run
+  // being reused below swaps in the decision persisted when it was created.
+  let stageGates = stageDecision.gates;
   // The policy blocks have no caller-supplied counterpart (they aren't runner
   // parameters — `runWorkflow.length` is frozen at 9), so the un-overridden case
   // reads the operator's boot config directly. `review` gets no substitution
@@ -1351,9 +1322,21 @@ async function runSimpleWorkflowBody(
       issueTitle: request.issueTitle,
       workflowName,
     }));
+    // The approval policy the run was CREATED with, not this dispatch's: an
+    // approval re-dispatch carries a fresh context with no `_autonomyGates`, so
+    // reading the request here dropped `post_reviewer` after `post_architect`
+    // was approved.
+    stageGates = storedStageGates(stored, mergeRepo);
     const handled = await handleExistingRun(existingRun, definition, notify, db);
     if (handled) return handled;
   } else {
+    if (stageDecision.skipped.length > 0) {
+      simpleLog.info("Approvals off for this repo — running the stage build without its approval gates", {
+        workflowName,
+        repo: mergeRepo,
+        skippedGates: stageDecision.skipped,
+      });
+    }
     workflowId = randomUUID();
     // A fresh id cannot be live anywhere yet; register it before `createRun`
     // makes the row visible to `getByTrigger`, so a duplicate trigger that
@@ -1409,6 +1392,10 @@ async function runSimpleWorkflowBody(
         // model, the repo's default branch may have moved on.
         repoConfig: repoConfig ? repoConfigRunRecord(repoConfig) : undefined,
         ...request.extra,
+        // The stage-gate decision (after the Approvals skip check), pinned for
+        // every later start of this run: admission, boot recovery, Retry and the
+        // re-dispatch after an approval. See `stage-approval.ts`.
+        ...(stageDecision.isStageRun ? { [STAGE_GATES_KEY]: stageDecision.gates } : {}),
       },
       startedAt: new Date().toISOString(),
     });
@@ -1652,6 +1639,10 @@ async function runSimpleWorkflowBody(
         ? { ...config, notesDir: issueDir }
         : config;
 
+  // operator ⊕ repo layer ⊕ stage gates — the same map `resumeSimpleRun` hands
+  // the runner for an admitted or recovered run.
+  const effectiveApproval = withStageGates(baseApproval, stageGates);
+
   try {
     const result = await runWorkflow(
       definition,
@@ -1665,8 +1656,10 @@ async function runSimpleWorkflowBody(
       effectiveVariants,
       // 10th arg: the repo layer itself, for the per-run asset resolver. The
       // merged config above is already effective; this carries the on-disk
-      // layer root the runner appends to the asset stack.
-      repoConfig,
+      // layer root the runner appends to the asset stack. It carries the
+      // effective approval map too: the runner prefers the layer's map over the
+      // 7th argument, which would otherwise drop the stage gates.
+      withRunApproval(repoConfig, effectiveApproval),
     );
 
     if (result.success && !result.paused) {

@@ -12,6 +12,7 @@ import {
   type RunRepoConfig,
 } from "./simple.js";
 import { slugify, type TemplateContext } from "./templates.js";
+import { storedStageGates, withRunApproval, withStageGates } from "./stage-approval.js";
 import { harvestFixMarkers } from "../engine/fix-harvest.js";
 import { harvestReviewTriage } from "../engine/review-triage.js";
 import {
@@ -343,6 +344,11 @@ export async function resumeSimpleRun(run: WorkflowRun, opts: ResumeOptions): Pr
   // variants, gates and repo asset layer, not whatever the operator/repo config
   // says right now. See `resumedRunConfig`.
   const effective = await resumedRunConfig(run, opts);
+  // …plus the stage gates it was CREATED with (after the Approvals skip check),
+  // read back off the row — the same `operator ⊕ repo ⊕ stage` map a direct
+  // start hands the runner. Without it an admitted stage build (queued at the
+  // concurrency cap) ran on the base map alone and passed its stage gates.
+  const approval = withStageGates(effective.approval, storedStageGates(stored, `${owner}/${repo}`));
 
   // Reconstruct the template context using the bits we stored on creation +
   // refreshed issue data. taskId/branch/issueDir were saved on the original
@@ -503,13 +509,14 @@ export async function resumeSimpleRun(run: WorkflowRun, opts: ResumeOptions): Pr
       callbacks,
       opts.db,
       effective.models,
-      effective.approval,
+      approval,
       run.id,           // <-- key bit: reuse the existing workflow run id
       effective.variants,
       // 10th arg: the repo layer, restored from the run row rather than
       // re-resolved, so a resumed run keeps the prompts/skills/agent-context
-      // (and the models above) it started with.
-      effective.repoConfig,
+      // (and the models above) it started with. It carries the effective
+      // approval map too — the runner prefers the layer's map over the 7th arg.
+      withRunApproval(effective.repoConfig, approval),
     );
 
     // `paused` FIRST: a run that stopped at an approval gate reports
