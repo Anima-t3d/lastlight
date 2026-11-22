@@ -9,10 +9,7 @@ import {
   defaultFixConfig,
   defaultReviewConfig,
   effectiveGate,
-  getAutonomyConfig,
   getBuildConfig,
-  isAutonomousRepo,
-  isMergeRepo,
   getBotName,
   getGateConfig,
   getRuntimeConfig,
@@ -30,10 +27,12 @@ import {
 import type { ConfigSource } from "../config/config-resolve.js";
 import type { GitHubClient } from "../engine/github/github.js";
 import { finalizeBuildReviewForRun } from "../engine/build-review.js";
-import { resolveAutonomyMerge } from "./autonomy-merge.js";
+import { NO_AUTONOMY_MERGE } from "./autonomy-merge.js";
 import {
   STAGE_GATES_KEY,
+  decideAutonomyMerge,
   decideStageGates,
+  storedAutonomyMerge,
   storedStageGates,
   withRunApproval,
   withStageGates,
@@ -1181,12 +1180,12 @@ async function runSimpleWorkflowBody(
   // The same stage, its OTHER projection: what becomes of the PR this build
   // opens. Read from the operator's config (the gate hands back gates, not a
   // merge policy) and keyed on the same dispatch markers, so an `@bot build`
-  // and an autonomous build of the same issue differ here too.
-  const autonomyMerge = resolveAutonomyMerge(
-    request.extra,
-    getAutonomyConfig().stages,
-    isMergeRepo(mergeRepo) && isAutonomousRepo(mergeRepo),
-  );
+  // and an autonomous build of the same issue differ here too. Decided here for
+  // a NEW run and persisted on it; a reused run (an approval re-dispatch, whose
+  // context carries no `_stage`) swaps in the persisted value below — otherwise
+  // a gate run resumed after an approval rendered `{{autonomyMerge.gate}}` false
+  // and parked its PR instead of handing it to the merge gate.
+  let autonomyMerge = decideAutonomyMerge(request.extra, mergeRepo);
   if (autonomyMerge.configured !== autonomyMerge.effective) {
     // The one case where the two disagree. Logged rather than silently
     // downgraded: an operator who asked for `auto-low-impact` and got a parked
@@ -1327,6 +1326,7 @@ async function runSimpleWorkflowBody(
     // reading the request here dropped `post_reviewer` after `post_architect`
     // was approved.
     stageGates = storedStageGates(stored, mergeRepo);
+    autonomyMerge = storedAutonomyMerge(stored, mergeRepo);
     const handled = await handleExistingRun(existingRun, definition, notify, db);
     if (handled) return handled;
   } else {
@@ -1396,6 +1396,10 @@ async function runSimpleWorkflowBody(
         // every later start of this run: admission, boot recovery, Retry and the
         // re-dispatch after an approval. See `stage-approval.ts`.
         ...(stageDecision.isStageRun ? { [STAGE_GATES_KEY]: stageDecision.gates } : {}),
+        // …and its merge policy, for the same reason (`isGateRun`, the
+        // reviewer's `fail_on_reject: "{{autonomyMerge.gate}}"`, `prompts/pr.md`).
+        // A human build's inert policy is not stored: it resolves to the same.
+        ...(autonomyMerge !== NO_AUTONOMY_MERGE ? { autonomyMerge } : {}),
       },
       startedAt: new Date().toISOString(),
     });

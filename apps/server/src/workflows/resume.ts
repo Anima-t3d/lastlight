@@ -12,7 +12,7 @@ import {
   type RunRepoConfig,
 } from "./simple.js";
 import { slugify, type TemplateContext } from "./templates.js";
-import { storedStageGates, withRunApproval, withStageGates } from "./stage-approval.js";
+import { storedAutonomyMerge, storedStageGates, withRunApproval, withStageGates } from "./stage-approval.js";
 import { harvestFixMarkers } from "../engine/fix-harvest.js";
 import { harvestReviewTriage } from "../engine/review-triage.js";
 import {
@@ -397,6 +397,10 @@ export async function resumeSimpleRun(run: WorkflowRun, opts: ResumeOptions): Pr
     // EFFECTIVE maps — the repo layer this run started under is already folded
     // in, so `{{models.<phase>}}` renders exactly what the first dispatch did.
     models: effective.models as unknown as Record<string, unknown>,
+    // The stage's merge policy as the run was CREATED with it (persisted), else
+    // resolved from the stored dispatch markers — never left unset, which
+    // rendered `{{autonomyMerge.gate}}` empty on every admitted or recovered run.
+    autonomyMerge: storedAutonomyMerge(stored, `${owner}/${repo}`) as unknown as Record<string, unknown>,
     triggerIdOverride: isSlack ? run.triggerId : undefined,
   };
 

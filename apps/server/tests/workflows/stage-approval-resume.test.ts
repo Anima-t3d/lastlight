@@ -36,8 +36,13 @@ import {
   defaultFixConfig,
   defaultNotificationsConfig,
   defaultReviewConfig,
+  getRuntimeConfig,
+  loadConfig,
   resetRuntimeConfigForTests,
   setAutonomyReposOverride,
+  setMergeReposOverride,
+  setRuntimeConfig,
+  type LastLightConfig,
 } from "#src/config/config.js";
 import { resetApprovalSkipReposForTests, setStoredApprovalSkipRepos } from "#src/approval-skip-repos.js";
 import type { StateDb } from "#src/state/db.js";
@@ -72,6 +77,7 @@ phases:
   - name: pr
     label: PR
     prompt: prompts/pr.md
+    approval_gate: pre_pr
 `;
 
 function makeConfig(): ExecutorConfig {
@@ -132,7 +138,9 @@ describe("a stage build keeps its creation-time approval policy across queue and
     mkdirSync(join(builtIn, "workflows", "prompts"), { recursive: true });
     writeFileSync(join(builtIn, "workflows", "build.yaml"), BUILD_YAML);
     for (const p of ["architect", "reviewer", "pr"]) {
-      writeFileSync(join(builtIn, "workflows", "prompts", `${p}.md`), p);
+      // Each prompt renders the run's merge policy, so a test can read what
+      // `{{autonomyMerge.gate}}` resolved to on whichever start ran the phase.
+      writeFileSync(join(builtIn, "workflows", "prompts", `${p}.md`), `${p} gate={{autonomyMerge.gate}}`);
     }
     configureWorkflowAssets({ builtInRoot: builtIn });
     clearWorkflowCache();
@@ -146,6 +154,7 @@ describe("a stage build keeps its creation-time approval policy across queue and
     clearWorkflowCache();
     resetApprovalSkipReposForTests();
     setAutonomyReposOverride(null);
+    setMergeReposOverride(null);
     resetRuntimeConfigForTests();
     vi.clearAllMocks();
   });
@@ -297,5 +306,107 @@ describe("a stage build keeps its creation-time approval policy across queue and
     expect(await state(gated)).toEqual({ status: "paused", pending: "post_architect" });
     await approveAndRedispatch(gated, operator);
     expect(await state(gated)).toEqual({ status: "succeeded", pending: undefined });
+  });
+
+  // ── The Approvals skip list turns the stage's gate names OFF (controller ruling) ──
+  //
+  // vps-sg sets `APPROVAL_GATES=post_architect,post_reviewer`, which makes both
+  // stage gates OPERATOR gates too. A skip-listed repo's stage build must still
+  // run without them, whichever layer turned them on; a human build keeps them,
+  // and any other operator gate stays on.
+  const ENV_GATES = { post_architect: true, post_reviewer: true };
+
+  /** The prompts the stubbed executor was handed, phase name first. */
+  const prompts = (): string[] => mockExecuteAgent.mock.calls.map((c) => String(c[0]));
+
+  it("env-style operator gates + skip-listed repo: the stage build does not pause, direct or queued", async () => {
+    setStoredApprovalSkipRepos({ repos: [REPO] });
+    issue++;
+    await dispatch(STAGE_BUILD, ENV_GATES, 5);
+    const [direct] = await db.runs.listRecent(1);
+    expect(await state(direct!.id)).toEqual({ status: "succeeded", pending: undefined });
+
+    const queued = await queueBuild(STAGE_BUILD, ENV_GATES);
+    await admit(queued, ENV_GATES);
+    expect(await state(queued)).toEqual({ status: "succeeded", pending: undefined });
+  });
+
+  it("env-style operator gates + skip-listed repo: a human build still pauses at post_architect", async () => {
+    setStoredApprovalSkipRepos({ repos: [REPO] });
+    issue++;
+    await dispatch({}, ENV_GATES, 5);
+    const [direct] = await db.runs.listRecent(1);
+    expect(await state(direct!.id)).toEqual({ status: "paused", pending: "post_architect" });
+
+    const queued = await queueBuild({}, ENV_GATES);
+    await admit(queued, ENV_GATES);
+    expect(await state(queued)).toEqual({ status: "paused", pending: "post_architect" });
+  });
+
+  it("env-style operator gates + unlisted repo: the stage build pauses at both, re-armed after approval", async () => {
+    const runId = await queueBuild(STAGE_BUILD, ENV_GATES);
+    await admit(runId, ENV_GATES);
+    expect(await state(runId)).toEqual({ status: "paused", pending: "post_architect" });
+    await approveAndRedispatch(runId, ENV_GATES);
+    expect(await state(runId)).toEqual({ status: "paused", pending: "post_reviewer" });
+    await approveAndRedispatch(runId, ENV_GATES);
+    expect(await state(runId)).toEqual({ status: "succeeded", pending: undefined });
+  });
+
+  it("skip-listed repo: an unrelated operator gate stays on, direct, queued and after approval", async () => {
+    setStoredApprovalSkipRepos({ repos: [REPO] });
+    const operator = { ...ENV_GATES, pre_pr: true };
+    issue++;
+    await dispatch(STAGE_BUILD, operator, 5);
+    const [direct] = await db.runs.listRecent(1);
+    expect(await state(direct!.id)).toEqual({ status: "paused", pending: "pre_pr" });
+
+    const queued = await queueBuild(STAGE_BUILD, operator);
+    await admit(queued, operator);
+    expect(await state(queued)).toEqual({ status: "paused", pending: "pre_pr" });
+    await approveAndRedispatch(queued, operator);
+    expect(await state(queued)).toEqual({ status: "succeeded", pending: undefined });
+  });
+
+  // ── The merge policy (`autonomyMerge`) is the run's, not the start's ──
+
+  /** Boot config with the build stage handing its PR to the merge gate. */
+  function mergeGateConfig(): void {
+    const base = getRuntimeConfig() ?? loadConfig();
+    setRuntimeConfig({
+      ...base,
+      autonomy: {
+        ...base.autonomy,
+        repos: [REPO],
+        stages: { build: { ...base.autonomy.stages.build, on_merge: "gate" } },
+      },
+    } as LastLightConfig);
+    setMergeReposOverride([REPO]);
+  }
+
+  it("a queued stage build in a merge repo runs with autonomyMerge.gate on admission and after approval", async () => {
+    mergeGateConfig();
+    const runId = await queueBuild(STAGE_BUILD, {});
+    await admit(runId, {});
+    expect(await state(runId)).toEqual({ status: "paused", pending: "post_architect" });
+    expect(prompts()).toEqual(["architect gate=true"]);
+    // Persisted at creation: the run's own policy, whatever the Merges list says now.
+    expect((await db.runs.getRun(runId))?.context?.autonomyMerge).toMatchObject({ effective: "gate", gate: true });
+
+    setMergeReposOverride(null);
+    await approveAndRedispatch(runId, {});
+    await approveAndRedispatch(runId, {});
+    expect(await state(runId)).toEqual({ status: "succeeded", pending: undefined });
+    expect(prompts()).toEqual(["architect gate=true", "reviewer gate=true", "pr gate=true"]);
+  });
+
+  it("a human build in a merge repo has the inert merge policy, queued or resumed", async () => {
+    mergeGateConfig();
+    const operator = { post_architect: true };
+    const runId = await queueBuild({}, operator);
+    await admit(runId, operator);
+    await approveAndRedispatch(runId, operator);
+    expect(await state(runId)).toEqual({ status: "succeeded", pending: undefined });
+    expect(prompts()).toEqual(["architect gate=false", "reviewer gate=false", "pr gate=false"]);
   });
 });

@@ -111,9 +111,15 @@ describe("the Approvals toggle reaches the run's effective approval map", () => 
     expect(approval?.post_reviewer).not.toBe(true);
   });
 
-  it("a listed repo still keeps the operator's own approval map", async () => {
+  it("a listed repo turns the stage's gate names off in the operator's map, and keeps every other gate", async () => {
     setStoredApprovalSkipRepos({ repos: [REPO] });
-    expect(await approvalFor(STAGE_BUILD, { post_reviewer: true })).toEqual({ post_reviewer: true });
+    // The operator (or `APPROVAL_GATES`) gating post_reviewer does not survive the
+    // skip list for a stage build; an unrelated operator gate does.
+    expect(await approvalFor(STAGE_BUILD, { post_reviewer: true, pre_pr: true })).toEqual({
+      post_architect: false,
+      post_reviewer: false,
+      pre_pr: true,
+    });
   });
 
   it("an escalation retry in a listed repo has no stage gates", async () => {

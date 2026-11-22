@@ -26,7 +26,7 @@ export interface AutonomyMergeContext {
 }
 
 /** The inert answer: park the PR, say nothing about merging. */
-const NO_AUTONOMY_MERGE: AutonomyMergeContext = {
+export const NO_AUTONOMY_MERGE: AutonomyMergeContext = {
   configured: "none",
   effective: "none",
   auto: false,
@@ -89,4 +89,19 @@ export function resolveAutonomyMerge(
   const effective: AutonomyMerge =
     configured === "auto" ? "auto" : configured === "gate" && mergeListed ? "gate" : "none";
   return { configured, effective, auto: effective === "auto", gate: effective === "gate" };
+}
+
+/**
+ * A persisted {@link AutonomyMergeContext} read back off a run row, or
+ * undefined when the value is absent or not well-formed. Strict on purpose: the
+ * value decides whether the merge gate owns a PR, so anything that is not
+ * exactly the shape {@link resolveAutonomyMerge} writes is ignored and the
+ * caller resolves from the run's dispatch markers instead.
+ */
+export function parseAutonomyMerge(raw: unknown): AutonomyMergeContext | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const v = raw as Record<string, unknown>;
+  if (!isAutonomyMerge(v.configured) || !isAutonomyMerge(v.effective)) return undefined;
+  if (v.auto !== (v.effective === "auto") || v.gate !== (v.effective === "gate")) return undefined;
+  return { configured: v.configured, effective: v.effective, auto: v.auto, gate: v.gate };
 }
