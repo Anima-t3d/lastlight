@@ -23,15 +23,17 @@ describe("build: — the L3 escalation budget", () => {
     resetRuntimeConfigForTests();
   });
 
-  it("ships escalateAfterAttempt 1 and maxAttempts 2", () => {
-    expect(defaultBuildConfig()).toEqual({ escalateAfterAttempt: 1, maxAttempts: 2 });
+  // Escalation is off unless an operator opts in with `maxAttempts: 2` (I1):
+  // nothing retries a failed build on upgrade.
+  it("ships escalateAfterAttempt 1 and maxAttempts 1 (escalation off)", () => {
+    expect(defaultBuildConfig()).toEqual({ escalateAfterAttempt: 1, maxAttempts: 1 });
     expect(getBuildConfig()).toEqual(defaultBuildConfig());
   });
 
   it("boots the packaged defaults from config/default.yaml", () => {
     const cfg = boot("managedRepos: []\n");
-    expect(cfg.build).toEqual({ escalateAfterAttempt: 1, maxAttempts: 2 });
-    expect(getBuildConfig()).toEqual({ escalateAfterAttempt: 1, maxAttempts: 2 });
+    expect(cfg.build).toEqual({ escalateAfterAttempt: 1, maxAttempts: 1 });
+    expect(getBuildConfig()).toEqual({ escalateAfterAttempt: 1, maxAttempts: 1 });
   });
 
   it("an overlay may change both; garbage falls back to the default", () => {
@@ -41,8 +43,10 @@ describe("build: — the L3 escalation budget", () => {
     });
     expect(boot("build:\n  escalateAfterAttempt: -1\n  maxAttempts: nope\n").build).toEqual({
       escalateAfterAttempt: 1,
-      maxAttempts: 2,
+      maxAttempts: 1,
     });
+    // The opt-in an operator writes to turn escalation on.
+    expect(boot("build:\n  maxAttempts: 2\n").build).toEqual({ escalateAfterAttempt: 1, maxAttempts: 2 });
   });
 
   it("ships no executor-retry / fix-retry model, so an unset key means no swap", () => {

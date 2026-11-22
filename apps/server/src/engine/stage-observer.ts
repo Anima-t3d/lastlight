@@ -488,16 +488,22 @@ export function installStageObserver(db: StateDb, deps: StageObserverDeps): void
     // one failing must not cost the other observers their notification.
     const onError = (err: unknown) =>
       log.warn("Terminal stage advance failed for run", { runId: run.id, stage: stageName, err });
+    // The escalation and cost paths read the store, and the contract says the
+    // observer never re-enters it before returning: both start on a microtask.
+    // `claimFailure` is in-memory and stays synchronous, so the first firing
+    // still wins.
     if (status === "failed" && escalates(run, stageName, deps)) {
       // First firing decides; the repeats of the same failure return here.
       if (!claimFailure(db, run.id)) return;
-      escalateFailedBuild(db, run, stageName, deps).catch(onError);
+      Promise.resolve()
+        .then(() => escalateFailedBuild(db, run, stageName, deps))
+        .catch(onError);
       return;
     }
     advanceTerminalStage(run, status, stageName, deps).catch(onError);
     if (deps.dispatchEscalation && run.workflowName === "build") {
-      db.executions
-        .getExecutionsForWorkflowRun(run.id, run.triggerId, run.workflowName)
+      Promise.resolve()
+        .then(() => db.executions.getExecutionsForWorkflowRun(run.id, run.triggerId, run.workflowName))
         .then((rows) => recordAttemptCost(db, run, rows))
         .catch(onError);
     }

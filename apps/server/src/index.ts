@@ -431,8 +431,9 @@ async function main() {
     // TTL lapses — the run read is live, the label read is cached, and the card
     // disagrees with itself in the meantime.
     onAdvanced: (repo) => invalidateBoard(repo),
-    // L3 escalation: a failed autonomous build is retried once through the
-    // SAME choke point every dispatch crosses, so the build gate (route
+    // L3 escalation: with `build.maxAttempts: 2` (the shipped 1 is off), a
+    // failed autonomous build is retried once through the SAME choke point
+    // every dispatch crosses, so the build gate (route
     // `escalation`) decides it. Late-bound: `dispatchWorkflow` is declared
     // below, and is only called once a run finishes.
     dispatchEscalation: (workflow, context) =>

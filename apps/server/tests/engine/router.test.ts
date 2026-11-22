@@ -1981,7 +1981,10 @@ describe('routeEvent — @bot retry on a blocked issue', () => {
 
   it('a bare retry carries no hint', async () => {
     const result = await routeEvent(retry({ body: '@last-light retry' }));
-    if (result.action === 'handler') expect(result.context._hint).toBeUndefined();
+    if (result.action !== 'handler') throw new Error(`expected a handler, got ${result.action}`);
+    expect(result.handler).toBe('build');
+    expect(result.context._stage).toBe('build');
+    expect(result.context._hint).toBeUndefined();
   });
 
   it('caps the hint at 2000 characters and defuses code fences', async () => {
@@ -2004,10 +2007,9 @@ describe('routeEvent — @bot retry on a blocked issue', () => {
 
   it('on an issue that is not at agent-blocked it is not a build retry', async () => {
     const result = await routeEvent(retry({ labels: ['agent-building'] }));
-    if (result.action === 'handler') {
-      expect(result.handler).not.toBe('build');
-      expect(result.context._stage).toBeUndefined();
-    }
+    if (result.action !== 'handler') throw new Error(`expected a handler, got ${result.action}`);
+    expect(result.handler).toBe('issue-comment');
+    expect(result.context._stage).toBeUndefined();
   });
 
   it('on a repo off the autonomy list it is not a build retry', async () => {
@@ -2016,6 +2018,8 @@ describe('routeEvent — @bot retry on a blocked issue', () => {
       autonomy: { repos: [], stages: STAGES, budget: {} },
     } as unknown as LastLightConfig);
     const result = await routeEvent(retry());
-    if (result.action === 'handler') expect(result.context._stage).toBeUndefined();
+    if (result.action !== 'handler') throw new Error(`expected a handler, got ${result.action}`);
+    expect(result.handler).toBe('issue-comment');
+    expect(result.context._stage).toBeUndefined();
   });
 });

@@ -104,13 +104,13 @@ describe("applyBuildDispatchGate", () => {
    * through `getAutonomyConfig()`, and a stubbed value would let the block's
    * shape drift from what a deployment actually gets.
    */
-  function useBudget(budget: Partial<AutonomyBudgetConfig> = {}): void {
+  function useBudget(budget: Partial<AutonomyBudgetConfig> = {}, extraYaml = ""): void {
     const lines = Object.entries(budget)
       .map(([k, v]) => `    ${k}: ${v}`)
       .join("\n");
     writeFileSync(
       join(overlayDir, "config.yaml"),
-      `autonomy:\n  repos:\n    - "${REPO}"\n` + (lines ? `  budget:\n${lines}\n` : ""),
+      `autonomy:\n  repos:\n    - "${REPO}"\n` + (lines ? `  budget:\n${lines}\n` : "") + extraYaml,
     );
     loadConfig();
   }
@@ -232,6 +232,19 @@ describe("applyBuildDispatchGate", () => {
     const escalate = (attempt: number) =>
       args({ route: "escalation", senderIsBot: true, addedLabel: undefined, labels: [STAGE_AGENT_BUILDING], attempt });
 
+    // Escalation ships off (`build.maxAttempts: 1`); these cases opt in.
+    beforeEach(() => {
+      useBudget({}, "build:\n  maxAttempts: 2\n");
+    });
+
+    it("with the packaged maxAttempts of 1, attempt 2 is not dispatched", async () => {
+      useBudget();
+      await seedAttempt("run-a1", 1);
+      const result = await applyBuildDispatchGate(escalate(2), { db, github: fakeGithub() });
+      expect(result.decision).toBe("skip");
+      expect(result.reason).toMatch(/^attempts-exhausted:/);
+    });
+
     it("dispatches attempt 2 although a build already ran — and keeps the issue on running", async () => {
       await seedAttempt("run-a1", 1);
       const github = fakeGithub();
@@ -244,7 +257,7 @@ describe("applyBuildDispatchGate", () => {
       expect(github.addLabels).toHaveBeenCalledWith("cliftonc", "lastlight", ISSUE, [STAGE_AGENT_BUILDING]);
     });
 
-    it("skips attempt 3 with the packaged maxAttempts of 2", async () => {
+    it("skips attempt 3 with maxAttempts 2", async () => {
       await seedAttempt("run-a1", 1);
       await seedAttempt("run-a2", 2);
       const result = await applyBuildDispatchGate(escalate(3), { db, github: fakeGithub() });
@@ -273,7 +286,7 @@ describe("applyBuildDispatchGate", () => {
     it("a human restart opens a fresh chain: an OLDER attempt-2 run does not block it", async () => {
       // Chain 1 ran attempts 1 and 2 and handed off; `@bot retry` started a new
       // attempt 1, which has now failed. Only the LATEST run is the key.
-      useBudget({ maxBuildsPerRepoPerDay: 10 });
+      useBudget({ maxBuildsPerRepoPerDay: 10 }, "build:\n  maxAttempts: 2\n");
       await seedAttempt("run-old-a1", 1);
       await seedAttempt("run-old-a2", 2);
       await db.runs.createRun({
@@ -388,13 +401,13 @@ describe("applyBuildDispatchGate — budget skip consequences", () => {
   let db: StateDb;
   let overlayDir: string;
 
-  function useBudget(budget: Partial<AutonomyBudgetConfig> = {}): void {
+  function useBudget(budget: Partial<AutonomyBudgetConfig> = {}, extraYaml = ""): void {
     const lines = Object.entries(budget)
       .map(([k, v]) => `    ${k}: ${v}`)
       .join("\n");
     writeFileSync(
       join(overlayDir, "config.yaml"),
-      `autonomy:\n  repos:\n    - "${REPO}"\n` + (lines ? `  budget:\n${lines}\n` : ""),
+      `autonomy:\n  repos:\n    - "${REPO}"\n` + (lines ? `  budget:\n${lines}\n` : "") + extraYaml,
     );
     loadConfig();
   }

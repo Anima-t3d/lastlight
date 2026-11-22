@@ -841,9 +841,13 @@ export interface BuildConfig {
   maxAttempts: number;
 }
 
-/** The shipped `build:` block. Mirrors `build:` in `config/default.yaml`. */
+/**
+ * The shipped `build:` block. Mirrors `build:` in `config/default.yaml`.
+ * `maxAttempts: 1` is escalation OFF: a failed build goes to a human, and
+ * nothing retries (and spends) unless the operator sets `maxAttempts: 2`.
+ */
 export function defaultBuildConfig(): BuildConfig {
-  return { escalateAfterAttempt: 1, maxAttempts: 2 };
+  return { escalateAfterAttempt: 1, maxAttempts: 1 };
 }
 
 function normalizeBuildConfig(raw: unknown): BuildConfig {

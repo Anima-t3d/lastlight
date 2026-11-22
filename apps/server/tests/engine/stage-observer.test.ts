@@ -342,10 +342,13 @@ describe("installStageObserver — L3 escalation", () => {
       vi.stubEnv(k, "");
     }
     const dir = mkdtempSync(join(tmpdir(), "stage-observer-esc-"));
-    writeFileSync(join(dir, "config.yaml"), `autonomy:\n  repos:\n    - "${REPO}"\n`);
+    overlayDir = dir;
+    // Escalation ships off (`build.maxAttempts: 1`); these cases opt in.
+    writeFileSync(join(dir, "config.yaml"), `autonomy:\n  repos:\n    - "${REPO}"\nbuild:\n  maxAttempts: 2\n`);
     vi.stubEnv("LASTLIGHT_OVERLAY_DIR", dir);
     loadConfig();
   });
+  let overlayDir = "";
 
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -489,6 +492,72 @@ describe("installStageObserver — L3 escalation", () => {
     await settle();
     expect(dispatchEscalation).toHaveBeenCalledTimes(1);
     expect(github.addLabels).not.toHaveBeenCalled();
+  });
+
+  /** Install the observer and hand back its callback, to call it directly. */
+  function captureObserver(deps: Parameters<typeof installStageObserver>[1]) {
+    const add = vi.spyOn(db.runs, "addTerminalObserver");
+    installStageObserver(db, deps);
+    const observer = add.mock.calls.at(-1)![0] as (run: unknown, status: string) => void;
+    add.mockRestore();
+    return observer;
+  }
+
+  // The observer contract (M2): synchronous, never throws, never re-enters the
+  // store before it returns. The store reads are deferred to a microtask.
+  it("a failed build's escalation reads the store only after the observer returned", async () => {
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    const observer = captureObserver({ github: escGithub(), dispatchEscalation });
+    await failedExecutorRun("run-defer");
+    const run = await db.runs.getRun("run-defer");
+    const read = vi.spyOn(db.executions, "getExecutionsForWorkflowRun");
+
+    observer({ ...run!, status: "failed" }, "failed");
+    expect(read).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(dispatchEscalation).toHaveBeenCalledTimes(1));
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  it("a succeeded build's cost read happens only after the observer returned", async () => {
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    const observer = captureObserver({ github: escGithub(), dispatchEscalation });
+    await seedStageRun(db, "run-ok");
+    await ledger("run-ok", "executor", { success: true, costUsd: 0.5 });
+    const run = await db.runs.getRun("run-ok");
+    const read = vi.spyOn(db.executions, "getExecutionsForWorkflowRun");
+
+    observer({ ...run!, status: "succeeded" }, "succeeded");
+    expect(read).not.toHaveBeenCalled();
+    await vi.waitFor(async () =>
+      expect((await db.runs.getRun("run-ok"))?.scratch?.attemptCost).toEqual({ attempt: 1, costUsd: 0.5 }),
+    );
+  });
+
+  it("a store read that throws synchronously never throws out of the observer", async () => {
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    const observer = captureObserver({ github: escGithub(), dispatchEscalation });
+    await seedStageRun(db, "run-throw");
+    const run = await db.runs.getRun("run-throw");
+    vi.spyOn(db.executions, "getExecutionsForWorkflowRun").mockImplementation(() => {
+      throw new Error("store gone");
+    });
+    expect(() => observer({ ...run!, status: "succeeded" }, "succeeded")).not.toThrow();
+    await settle();
+  });
+
+  it("with the packaged maxAttempts of 1, a failed build hands off and is never retried", async () => {
+    writeFileSync(join(overlayDir, "config.yaml"), `autonomy:\n  repos:\n    - "${REPO}"\n`);
+    loadConfig();
+    const github = escGithub();
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    installStageObserver(db, { github, dispatchEscalation });
+    await failedExecutorRun("run-default");
+
+    await db.runs.finishRun("run-default", "failed");
+    await vi.waitFor(() =>
+      expect(github.addLabels).toHaveBeenCalledWith(OWNER, NAME, ISSUE, [STAGE_AGENT_BLOCKED]),
+    );
+    expect(dispatchEscalation).not.toHaveBeenCalled();
   });
 
   it("attempt 2 failing hands off to agent-blocked, no retry", async () => {
