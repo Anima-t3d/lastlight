@@ -67,6 +67,14 @@ export interface BuildTriggerInputs {
   runInFlight: boolean;
   holdLabel: string;
   /**
+   * The issue currently carries `autonomy.queuedLabel` (matched
+   * case-insensitively by the caller): it is parked behind unresolved blockers
+   * and `promotion.ts` releases it, so no route may build it meanwhile.
+   */
+  queued: boolean;
+  /** `autonomy.queuedLabel`, named in the skip reason. */
+  queuedLabel: string;
+  /**
    * Which attempt this dispatch is (`_attempt` on the context, default 1). Read
    * only on the `escalation` route, against {@link maxAttempts}.
    */
@@ -149,6 +157,8 @@ export function resolveBuildTrigger(
     alreadyBuilt: inputs.alreadyBuilt,
     runInFlight: inputs.runInFlight,
     holdLabel: inputs.holdLabel,
+    queued: inputs.queued,
+    queuedLabel: inputs.queuedLabel,
     attempt: inputs.attempt ?? null,
     maxAttempts: inputs.maxAttempts ?? null,
     escalationDispatched: inputs.escalationDispatched ?? null,
@@ -213,6 +223,22 @@ export function resolveBuildTrigger(
     return {
       decision: "skip",
       reason: `not-autonomous: ${inputs.repo} is not on the autonomy allow-list, so a labelled issue does not dispatch a build`,
+      inputs: record,
+    };
+  }
+
+  // ── 2b. STILL QUEUED ─────────────────────────────────────────────────────
+  //
+  // An issue carrying the queued label is parked behind unresolved blockers;
+  // `promotion.ts` moves it to the stage's `enter` label once they close. Any
+  // other actor adding `ready-for-agent` meanwhile (the triage agent did, live)
+  // must not start a build, on ANY route, so this sits on every route alike:
+  // below the hold and autonomy checks, above already-built and the budget.
+  // Silent, and it touches no label: the issue keeps what it has.
+  if (inputs.queued) {
+    return {
+      decision: "skip",
+      reason: `queued: ${triggerId} carries ${inputs.queuedLabel}; it builds once promotion clears it`,
       inputs: record,
     };
   }

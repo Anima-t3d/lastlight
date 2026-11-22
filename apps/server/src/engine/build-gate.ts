@@ -109,6 +109,7 @@ export async function applyBuildDispatchGate(
   // counts runs of the workflow that actually runs.
   const workflow = stageWorkflow(stage);
   const budget = getAutonomyConfig().budget;
+  const queuedLabel = getAutonomyConfig().queuedLabel;
   const [owner, name] = args.repo.split("/");
   // The usage-window verdict (`autonomy.budget.usage`; undefined = gate off),
   // read BEFORE the lock: it touches no state the lock protects, and an
@@ -190,6 +191,10 @@ export async function applyBuildDispatchGate(
       alreadyBuilt,
       runInFlight: !!inFlight,
       holdLabel: getHoldLabel(),
+      // The same live label snapshot the hold check reads, matched
+      // case-insensitively (GitHub label names are).
+      queued: args.labels.some((l) => l.toLowerCase() === queuedLabel.toLowerCase()),
+      queuedLabel,
       concurrentAutonomousBuilds,
       // A reserved dispatch for this repo has not STARTED a run yet, but it will.
       buildsForRepoToday: buildsForRepoToday + pending.filter((r) => r.repo === args.repo).length,
@@ -451,7 +456,7 @@ function caseOf(reason: string): string {
  * issue is still going to be built, just not today. Only the spend ceiling is
  * terminal for the day in a way the issue itself should carry.
  *
- * Every skip NOT in that table (`on-hold`, `not-autonomous`, `already-built`,
+ * Every skip NOT in that table (`on-hold`, `not-autonomous`, `queued`, `already-built`,
  * `run-in-flight`) is silent here by design, as it was in Phase 1.
  *
  * Never throws: `recordActivity` swallows its own failures, and the GitHub half

@@ -68,6 +68,7 @@ function runtimeConfig(over: Record<string, unknown> = {}): LastLightConfig {
     disabled: { workflows: [], crons: [], prompts: [], skills: [], agentContext: [] },
     autonomy: {
       repos: [REPO],
+      queuedLabel: "lastlight:queued",
       stages: { build: BUILD_STAGE },
       budget: { maxConcurrentBuilds: 2, maxBuildsPerRepoPerDay: 3, dailyUsd: 25, repoDailyUsd: 10 },
     },
@@ -537,6 +538,7 @@ describe("POST /issues/:owner/:repo/:number/stage — dispatch", () => {
       runtimeConfig({
         autonomy: {
           repos: [REPO],
+          queuedLabel: "lastlight:queued",
           stages: { build: { ...BUILD_STAGE, workflow: "build-ui" } },
           budget: { maxConcurrentBuilds: 2, maxBuildsPerRepoPerDay: 3, dailyUsd: 25, repoDailyUsd: 10 },
         },
@@ -561,6 +563,7 @@ describe("POST /issues/:owner/:repo/:number/stage — dispatch", () => {
       runtimeConfig({
         autonomy: {
           repos: [REPO],
+          queuedLabel: "lastlight:queued",
           stages: {
             build: BUILD_STAGE,
             review: { ...BUILD_STAGE, enter: STAGE_AGENT_BUILDING },

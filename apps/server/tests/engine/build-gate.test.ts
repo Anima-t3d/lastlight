@@ -179,6 +179,46 @@ describe("applyBuildDispatchGate", () => {
     );
   });
 
+  it("skips an issue carrying the queued label on every route, and never advances its label", async () => {
+    for (const route of ["labeled", "sweep", "api"] as const) {
+      const github = fakeGithub();
+      const result = await applyBuildDispatchGate(
+        args({ route, labels: [STAGE_READY_FOR_AGENT, "lastlight:queued"] }),
+        { db, github },
+      );
+      expect(result.decision).toBe("skip");
+      expect(result.reason).toBe(
+        `queued: ${REPO}#${ISSUE} carries lastlight:queued; it builds once promotion clears it`,
+      );
+      expect(result.gates).toBeUndefined();
+      expect(github.addLabels).not.toHaveBeenCalled();
+      expect(github.removeLabel).not.toHaveBeenCalled();
+    }
+  });
+
+  it("matches the queued label case-insensitively", async () => {
+    const github = fakeGithub();
+    const result = await applyBuildDispatchGate(
+      args({ labels: [STAGE_READY_FOR_AGENT, "LastLight:QUEUED"] }),
+      { db, github },
+    );
+    expect(result.decision).toBe("skip");
+    expect(result.reason).toMatch(/^queued:/);
+    expect(github.addLabels).not.toHaveBeenCalled();
+  });
+
+  it("skips a queued issue on the escalation route", async () => {
+    await seedBuildRun(db, "succeeded");
+    const github = fakeGithub();
+    const result = await applyBuildDispatchGate(
+      args({ route: "escalation", senderIsBot: true, attempt: 2, labels: [STAGE_AGENT_BLOCKED, "lastlight:queued"] }),
+      { db, github },
+    );
+    expect(result.decision).toBe("skip");
+    expect(result.reason).toMatch(/^queued:/);
+    expect(github.addLabels).not.toHaveBeenCalled();
+  });
+
   it("hands back the stage's gates, for the run's approval map to union", async () => {
     const result = await applyBuildDispatchGate(args(), { db, github: fakeGithub() });
 

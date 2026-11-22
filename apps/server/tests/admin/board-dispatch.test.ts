@@ -62,6 +62,7 @@ function runtimeConfig(over: Record<string, unknown> = {}): LastLightConfig {
       // switch, and every dispatch would otherwise refuse `not-autonomous`
       // before reaching the branch under test.
       repos: [REPO],
+      queuedLabel: "lastlight:queued",
       stages: { build: BUILD_STAGE },
       budget: { maxConcurrentBuilds: 2, maxBuildsPerRepoPerDay: 3, dailyUsd: 25, repoDailyUsd: 10 },
     },
@@ -248,6 +249,7 @@ describe("POST /issues/:owner/:repo/:number/dispatch", () => {
       runtimeConfig({
         autonomy: {
           repos: [REPO],
+          queuedLabel: "lastlight:queued",
           stages: { build: { ...BUILD_STAGE, workflow: "build-ui" } },
           budget: { maxConcurrentBuilds: 2, maxBuildsPerRepoPerDay: 3, dailyUsd: 25, repoDailyUsd: 10 },
         },

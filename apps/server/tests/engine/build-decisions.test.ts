@@ -64,6 +64,8 @@ function inputs(over: Partial<BuildTriggerInputs> = {}): BuildTriggerInputs {
     alreadyBuilt: false,
     runInFlight: false,
     holdLabel: "lastlight-ignore",
+    queued: false,
+    queuedLabel: "lastlight:queued",
     // Comfortably inside every ceiling, so a case that does not mention budgets
     // is not secretly about one.
     concurrentAutonomousBuilds: 0,
@@ -149,6 +151,33 @@ describe("resolveBuildTrigger", () => {
  * above the per-head dedup, because a dedup aimed at machines looping should
  * bind machines.
  */
+describe("resolveBuildTrigger — an issue still carrying the queued label", () => {
+  const QUEUED_REASON = /^queued: cliftonc\/lastlight#190 carries lastlight:queued; it builds once promotion clears it$/;
+  const queuedLabels = ["ready-for-agent", "lastlight:queued"];
+
+  it.each(["labeled", "sweep", "api", "escalation"] as const)("skips on the %s route", (route) => {
+    const d = decide(inputs({ queued: true, queuedLabel: "lastlight:queued", labels: queuedLabels, route,
+      // escalation reaches past already-built, so make it a legitimate retry
+      ...(route === "escalation" ? { senderIsBot: true, alreadyBuilt: true, attempt: 2, maxAttempts: 3 } : {}) }));
+    expect(d.decision).toBe("skip");
+    expect(d.reason).toMatch(QUEUED_REASON);
+  });
+
+  it("is unchanged when the queued label is absent", () => {
+    const d = decide(inputs({ queued: false }));
+    expect(d.decision).toBe("dispatch");
+  });
+
+  it("ranks below the hold label and not-autonomous, above already-built", () => {
+    const held = decide(inputs({ queued: true, queuedLabel: "lastlight:queued", labels: [...queuedLabels, "lastlight-ignore"] }));
+    expect(held.reason).toMatch(/^on-hold:/);
+    const off = decide(inputs({ queued: true, queuedLabel: "lastlight:queued", autonomyEnabled: false }));
+    expect(off.reason).toMatch(/^not-autonomous:/);
+    const built = decide(inputs({ queued: true, queuedLabel: "lastlight:queued", alreadyBuilt: true, senderIsBot: true }));
+    expect(built.reason).toMatch(/^queued:/);
+  });
+});
+
 describe("resolveBuildTrigger — the already-built asymmetry", () => {
   it("already-built + senderIsBot: true → skip (an automated re-label can never re-spend)", () => {
     const d = decide(inputs({ alreadyBuilt: true, senderIsBot: true }));
