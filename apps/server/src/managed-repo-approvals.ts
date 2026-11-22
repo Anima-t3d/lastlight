@@ -11,6 +11,11 @@ import {
   setStoredMergeRepos,
 } from "./merge-repos.js";
 import {
+  APPROVAL_SKIP_REPOS_SETTING_KEY,
+  normalizeApprovalSkipRepos,
+  setStoredApprovalSkipRepos,
+} from "./approval-skip-repos.js";
+import {
   REPO_APPROVAL_SETTING_KEY,
   getInstallationDiscoveryFailures,
   getInstallationRepos,
@@ -92,15 +97,36 @@ async function pruneMerge(db: SettingsDb, keep: (repo: string) => boolean, actor
   if (kept.length !== merge.length) await saveMerge(db, kept, actor);
 }
 
+/** The approval skip list a write starts from: the STORED row, else empty (there is no YAML list). */
+async function currentApprovalSkip(db: SettingsDb): Promise<string[]> {
+  const row = await db.getSetting<unknown>(APPROVAL_SKIP_REPOS_SETTING_KEY);
+  return row ? normalizeApprovalSkipRepos(row.value).repos : [];
+}
+
+async function saveApprovalSkip(db: SettingsDb, repos: string[], actor?: string): Promise<void> {
+  await db.setSetting(APPROVAL_SKIP_REPOS_SETTING_KEY, { repos }, actor);
+  setStoredApprovalSkipRepos({ repos });
+}
+
+/** Drop skip entries `keep` rejects; writes the row only when something was dropped. */
+async function pruneApprovalSkip(db: SettingsDb, keep: (repo: string) => boolean, actor?: string): Promise<void> {
+  const skip = await currentApprovalSkip(db);
+  const kept = skip.filter(keep);
+  if (kept.length !== skip.length) await saveApprovalSkip(db, kept, actor);
+}
+
 /**
  * Drop autonomy entries `keep` rejects; writes the row only when something was
- * dropped. Merges sit on top of Builds, so the same repos leave the merge list.
+ * dropped. Merges and the approval skip sit on top of Builds, so the same repos
+ * leave those lists too: turning Builds back on later brings the approval
+ * gates back with it rather than a stale skip.
  */
 async function pruneAutonomy(db: SettingsDb, keep: (repo: string) => boolean, actor?: string): Promise<void> {
   const autonomy = await currentAutonomy(db);
   const kept = autonomy.filter(keep);
   if (kept.length !== autonomy.length) await saveAutonomy(db, kept, actor);
   await pruneMerge(db, keep, actor);
+  await pruneApprovalSkip(db, keep, actor);
 }
 
 /** Writes run one at a time in this process, so two requests cannot interleave a read-modify-write. */
@@ -240,8 +266,9 @@ export function setRepoAutonomy(
     if (!has) return { ok: true, repos };
     const next = repos.filter((a) => !sameRepo(a, repo));
     await saveAutonomy(db, next, actor);
-    // Turning Builds off also turns Merges off.
+    // Turning Builds off also turns Merges off, and approvals back on.
     await pruneMerge(db, (m) => !sameRepo(m, repo), actor);
+    await pruneApprovalSkip(db, (m) => !sameRepo(m, repo), actor);
     return { ok: true, repos: next };
   });
 }
@@ -274,6 +301,40 @@ export function setRepoMerge(
     if (!repos.some((m) => sameRepo(m, repo))) return { ok: true, repos };
     const next = repos.filter((m) => !sameRepo(m, repo));
     await saveMerge(db, next, actor);
+    return { ok: true, repos: next };
+  });
+}
+
+export type ApprovalsResult = { ok: true; repos: string[] } | { ok: false; status: 400; error: string };
+
+/**
+ * Turn the build stage's approval gates on or off for one repo's autonomous
+ * builds. `enabled` is the toggle's position: true = approvals on (the repo is
+ * NOT on the skip list). Turning them OFF is a step on top of Builds, so it
+ * needs the repo on the autonomy list (`approvals-requires-builds`); turning
+ * them back on is always allowed. The entry is stored as the autonomy list
+ * spells it (see {@link setRepoMerge}), because `isApprovalSkipRepo` is an
+ * exact match. A change that changes nothing stores no row. Returns the skip list.
+ */
+export function setRepoApprovals(
+  db: SettingsDb,
+  repo: string,
+  enabled: boolean,
+  actor?: string,
+): Promise<ApprovalsResult> {
+  return serialized(async () => {
+    const repos = await currentApprovalSkip(db);
+    if (!enabled) {
+      const canonical = (await currentAutonomy(db)).find((a) => sameRepo(a, repo));
+      if (!canonical) return { ok: false, status: 400, error: "approvals-requires-builds" };
+      if (repos.includes(canonical)) return { ok: true, repos };
+      const next = [...repos.filter((m) => !sameRepo(m, repo)), canonical];
+      await saveApprovalSkip(db, next, actor);
+      return { ok: true, repos: next };
+    }
+    if (!repos.some((m) => sameRepo(m, repo))) return { ok: true, repos };
+    const next = repos.filter((m) => !sameRepo(m, repo));
+    await saveApprovalSkip(db, next, actor);
     return { ok: true, repos: next };
   });
 }

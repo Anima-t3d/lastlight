@@ -1,7 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { approveRepos, removeRepos, setRepoAutonomy, setRepoMerge, setRequireApproval } from "#src/managed-repo-approvals.js";
+import {
+  approveRepos,
+  removeRepos,
+  setRepoApprovals,
+  setRepoAutonomy,
+  setRepoMerge,
+  setRequireApproval,
+} from "#src/managed-repo-approvals.js";
 import { AUTONOMY_REPOS_SETTING_KEY, resetAutonomyReposForTests } from "#src/autonomy-repos.js";
 import { MERGE_REPOS_SETTING_KEY, resetMergeReposForTests } from "#src/merge-repos.js";
+import { APPROVAL_SKIP_REPOS_SETTING_KEY, resetApprovalSkipReposForTests } from "#src/approval-skip-repos.js";
 import {
   getManagedRepos,
   getRepoApprovalState,
@@ -12,8 +20,10 @@ import {
 } from "#src/managed-repos.js";
 import {
   defaultAutonomyConfig,
+  getApprovalSkipRepos,
   getAutonomyRepos,
   getMergeRepos,
+  isApprovalSkipRepo,
   isAutonomousRepo,
   isMergeRepo,
   setRuntimeConfig,
@@ -382,5 +392,95 @@ describe("managed-repo approvals — merges", () => {
     config(["a/one", "a/two"], ["a/one", "a/two"]);
     await Promise.all([setRepoMerge(db, "a/one", true), setRepoMerge(db, "a/two", true)]);
     expect((await db.getSetting(MERGE_REPOS_SETTING_KEY))?.value).toEqual({ repos: ["a/one", "a/two"] });
+  });
+});
+
+describe("managed-repo approvals — the Approvals toggle (approval-skip-repos)", () => {
+  let db: StateDb;
+
+  function config(approved: string[], autonomy: string[]): void {
+    setRuntimeConfig({
+      managedRepos: approved,
+      requireRepoApproval: false,
+      autonomy: { ...defaultAutonomyConfig(), repos: autonomy },
+    } as unknown as LastLightConfig);
+  }
+
+  beforeEach(async () => {
+    db = await makeTestDb();
+    setInstallationRepos("1", ["a/one", "a/two", "a/three"]);
+  });
+
+  afterEach(() => {
+    resetAutonomyReposForTests();
+    resetMergeReposForTests();
+    resetApprovalSkipReposForTests();
+    resetRuntimeConfigForTests();
+    resetInstallationReposForTests();
+  });
+
+  it("is empty by default: approvals on everywhere", () => {
+    config(["a/one"], ["a/one"]);
+    expect(getApprovalSkipRepos()).toEqual([]);
+    expect(isApprovalSkipRepo("a/one")).toBe(false);
+  });
+
+  it("turning approvals off stores the autonomy list's spelling, by actor", async () => {
+    config(["a/one"], ["a/one"]);
+    const res = await setRepoApprovals(db, "A/One", false, "octocat");
+    expect(res).toEqual({ ok: true, repos: ["a/one"] });
+    const row = await db.getSetting(APPROVAL_SKIP_REPOS_SETTING_KEY);
+    expect(row?.value).toEqual({ repos: ["a/one"] });
+    expect(row?.updatedBy).toBe("octocat");
+    expect(isApprovalSkipRepo("a/one")).toBe(true);
+  });
+
+  it("turning approvals off for a repo not on the autonomy list is 400 approvals-requires-builds", async () => {
+    config(["a/one", "a/two"], ["a/one"]);
+    const res = await setRepoApprovals(db, "a/two", false);
+    expect(res).toEqual({ ok: false, status: 400, error: "approvals-requires-builds" });
+    expect(await db.getSetting(APPROVAL_SKIP_REPOS_SETTING_KEY)).toBeNull();
+  });
+
+  it("turning approvals back on is always allowed; a no-op writes nothing", async () => {
+    config(["a/one", "a/two"], ["a/one"]);
+    expect(await setRepoApprovals(db, "a/two", true)).toEqual({ ok: true, repos: [] });
+    expect(await db.getSetting(APPROVAL_SKIP_REPOS_SETTING_KEY)).toBeNull();
+    await setRepoApprovals(db, "a/one", false);
+    expect(await setRepoApprovals(db, "A/One", true)).toEqual({ ok: true, repos: [] });
+    expect(isApprovalSkipRepo("a/one")).toBe(false);
+  });
+
+  it("turning Builds off drops the repo from the skip list", async () => {
+    config(["a/one", "a/two"], ["a/one", "a/two"]);
+    await setRepoApprovals(db, "a/one", false);
+    await setRepoApprovals(db, "a/two", false);
+    await setRepoAutonomy(db, "a/two", false);
+    expect(getApprovalSkipRepos()).toEqual(["a/one"]);
+    expect((await db.getSetting(APPROVAL_SKIP_REPOS_SETTING_KEY))?.value).toEqual({ repos: ["a/one"] });
+    // Builds back on: the gates come back with it, not the old skip.
+    await setRepoAutonomy(db, "a/two", true);
+    expect(isApprovalSkipRepo("a/two")).toBe(false);
+  });
+
+  it("un-managing a repo drops it from the skip list", async () => {
+    config(["a/one", "a/two"], ["a/one", "a/two"]);
+    await setRepoApprovals(db, "a/two", false);
+    await removeRepos(db, ["a/two"], {});
+    expect(getApprovalSkipRepos()).toEqual([]);
+  });
+
+  it("turning approval on drops the skip for repos that are no longer managed", async () => {
+    config([], ["a/two"]);
+    await setRepoApprovals(db, "a/two", false);
+    expect(isApprovalSkipRepo("a/two")).toBe(true);
+    await setRequireApproval(db, true);
+    expect(getApprovalSkipRepos()).toEqual([]);
+  });
+
+  it("concurrent toggles do not lose updates", async () => {
+    config(["a/one", "a/two"], ["a/one", "a/two"]);
+    await Promise.all([setRepoApprovals(db, "a/one", false), setRepoApprovals(db, "a/two", false)]);
+    expect((await db.getSetting(APPROVAL_SKIP_REPOS_SETTING_KEY))?.value).toEqual({ repos: ["a/one", "a/two"] });
   });
 });

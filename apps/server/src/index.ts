@@ -98,6 +98,7 @@ import { configureBuildMerge } from "./engine/build-merge.js";
 import { invalidateBoard } from "./admin/board-cache.js";
 import { refreshAutonomyRepos } from "./autonomy-repos.js";
 import { refreshMergeRepos } from "./merge-repos.js";
+import { refreshApprovalSkipRepos } from "./approval-skip-repos.js";
 import { noteBoardRunChange } from "./admin/board-stream.js";
 import { runDashboardUrl } from "./notify/model.js";
 import { harvestFixMarkers } from "./engine/fix-harvest.js";
@@ -296,6 +297,7 @@ async function main() {
   await refreshRepoApproval(db);
   await refreshAutonomyRepos(db);
   await refreshMergeRepos(db);
+  await refreshApprovalSkipRepos(db);
   setInterval(() => {
     refreshRepoApproval(db).catch((err: unknown) =>
       configLog.warn("Repo approval refresh failed; keeping the last copy", {
@@ -309,6 +311,11 @@ async function main() {
     );
     refreshMergeRepos(db).catch((err: unknown) =>
       configLog.warn("Merge repos refresh failed; keeping the last copy", {
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    refreshApprovalSkipRepos(db).catch((err: unknown) =>
+      configLog.warn("Approval skip repos refresh failed; keeping the last copy", {
         error: err instanceof Error ? err.message : String(err),
       }),
     );

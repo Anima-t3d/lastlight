@@ -65,6 +65,26 @@ export function isMerging(data: ManagedRepos, repo: string): boolean {
   return data.merge.includes(repo);
 }
 
+/**
+ * The Approvals toggle for `repo`: checked = approvals on (the repo is NOT on
+ * the server's skip list, an exact match like `isApprovalSkipRepo`). Disabled
+ * while Builds is off, because skipping approvals is a step on top of Builds
+ * (the server refuses it with `approvals-requires-builds`), and while a write
+ * is in flight.
+ */
+export function approvalsToggle(
+  data: ManagedRepos,
+  repo: string,
+  busy: boolean,
+): { checked: boolean; disabled: boolean } {
+  return { checked: !data.approvalSkip.includes(repo), disabled: busy || !isAutonomous(data, repo) };
+}
+
+/** The confirm text for turning approvals OFF for `repo`. */
+export function approvalsOffConfirmText(repo: string): string {
+  return `Autonomous builds on ${repo} will run without stopping for approval after the architect and reviewer phases. Your own approval gates still apply, and an @bot build is unaffected. Turning Builds off turns approvals back on.`;
+}
+
 /** The confirm text for turning on autonomous merges for `repo`. */
 export function mergeConfirmText(repo: string): string {
   return `Last Light may merge pull requests on ${repo} on its own once the merge gate's checks pass. Needs Builds on; turning Builds off turns this off.`;

@@ -11,6 +11,7 @@ import {
   effectiveGate,
   getAutonomyConfig,
   getBuildConfig,
+  isApprovalSkipRepo,
   isAutonomousRepo,
   isMergeRepo,
   getBotName,
@@ -1185,12 +1186,30 @@ async function runSimpleWorkflowBody(
   // The effect is that an autonomous build pauses at `post_architect` while an
   // `@bot build` on the same repo does not: same workflow, same repo, different
   // dispatch, and only the autonomous one carries the stage's gates.
-  const autonomyGates = enabledGatesFrom(request.extra?._autonomyGates);
+  //
+  // The per-repo Approvals toggle (Config → Managed repos, `approval-skip-repos`)
+  // drops ONLY these stage-added gates: the base map below (operator ⊕ repo
+  // layer) still applies untouched. Read once, here, when the run starts — so a
+  // toggle flipped mid-run does not change a running build. Every stage
+  // dispatch reaches this line, including the observer's escalation retry and
+  // `@bot retry`, which carry `_stage` and so `_autonomyGates`; a human
+  // `@bot build` carries none, so the toggle cannot touch it. Like the merge
+  // list, a skip entry counts only while the repo is on the autonomy list.
+  const mergeRepo = `${owner}/${repo}`;
+  const skipStageGates = isApprovalSkipRepo(mergeRepo) && isAutonomousRepo(mergeRepo);
+  const stageGates = enabledGatesFrom(request.extra?._autonomyGates);
+  const autonomyGates = skipStageGates ? {} : stageGates;
+  if (skipStageGates && Object.keys(stageGates).length > 0) {
+    simpleLog.info("Approvals off for this repo — running the stage build without its approval gates", {
+      workflowName,
+      repo: mergeRepo,
+      skippedGates: Object.keys(stageGates),
+    });
+  }
   // The same stage, its OTHER projection: what becomes of the PR this build
   // opens. Read from the operator's config (the gate hands back gates, not a
   // merge policy) and keyed on the same dispatch markers, so an `@bot build`
   // and an autonomous build of the same issue differ here too.
-  const mergeRepo = `${owner}/${repo}`;
   const autonomyMerge = resolveAutonomyMerge(
     request.extra,
     getAutonomyConfig().stages,

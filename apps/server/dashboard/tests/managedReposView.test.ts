@@ -7,6 +7,8 @@
 import { describe, it, expect } from "vitest";
 import type { ManagedRepos } from "../src/api";
 import {
+  approvalsOffConfirmText,
+  approvalsToggle,
   autonomyConfirmText,
   followAppCount,
   followAppPhrase,
@@ -40,6 +42,7 @@ function view(over: Partial<ManagedRepos>): ManagedRepos {
     autonomous: [],
     autonomyStored: false,
     merge: [],
+    approvalSkip: [],
     ...over,
   };
 }
@@ -133,5 +136,31 @@ describe("autonomous merges", () => {
 
   it("the confirm text names the repo and what a merge needs", () => {
     expect(mergeConfirmText("a/one")).toContain("a/one");
+  });
+});
+
+describe("the Approvals toggle", () => {
+  it("is checked (approvals on) for a Builds repo that is not on the skip list", () => {
+    expect(approvalsToggle(view({ autonomous: ["a/one"] }), "a/one", false)).toEqual({
+      checked: true,
+      disabled: false,
+    });
+  });
+
+  it("is unchecked for a repo on the skip list; an exact match, like the server", () => {
+    const d = view({ autonomous: ["a/one"], approvalSkip: ["a/one"] });
+    expect(approvalsToggle(d, "a/one", false).checked).toBe(false);
+    expect(approvalsToggle(d, "A/One", false).checked).toBe(true);
+  });
+
+  it("is disabled when Builds is off, and while a write is in flight", () => {
+    expect(approvalsToggle(view({ autonomous: [] }), "a/one", false)).toEqual({ checked: true, disabled: true });
+    expect(approvalsToggle(view({ autonomous: ["a/one"] }), "a/one", true).disabled).toBe(true);
+  });
+
+  it("the turn-off confirm names the repo and says builds run with no approval clicks", () => {
+    const text = approvalsOffConfirmText("a/one");
+    expect(text).toContain("a/one");
+    expect(text).toMatch(/without stopping for approval/i);
   });
 });

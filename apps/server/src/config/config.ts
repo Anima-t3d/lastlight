@@ -915,6 +915,32 @@ export function isMergeRepo(repo: string): boolean {
   return getMergeRepos().includes(repo);
 }
 
+/**
+ * The dashboard's stored approval opt-out list (Config → Managed repos, the
+ * Approvals toggle), set by `approval-skip-repos.ts`. There is no YAML list:
+ * null = none stored = every repo keeps the build stage's approval gates.
+ */
+let approvalSkipReposOverride: string[] | null = null;
+
+/** Set (or clear, with null) the stored skip list. Only `approval-skip-repos.ts` calls this. */
+export function setApprovalSkipReposOverride(repos: string[] | null): void {
+  approvalSkipReposOverride = repos ? [...repos] : null;
+}
+
+/** The approval opt-out list in effect: the stored list, else empty. A copy. */
+export function getApprovalSkipRepos(): string[] {
+  return [...(approvalSkipReposOverride ?? [])];
+}
+
+/**
+ * Is `repo` ("owner/name") on the approval opt-out list, so its autonomous
+ * builds skip the stage's approval gates? EXACT match, case as GitHub spells
+ * it — the same rule as {@link isMergeRepo}.
+ */
+export function isApprovalSkipRepo(repo: string): boolean {
+  return getApprovalSkipRepos().includes(repo);
+}
+
 // ── Packaged defaults, derived from config/default.yaml (issue #385) ─────────
 //
 // Every timeout default lives in `config/default.yaml` and NOWHERE else. The

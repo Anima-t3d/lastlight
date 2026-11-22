@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { api, ApiError, type ManagedRepos, type WhenEmpty } from "../api";
 import {
+  approvalsOffConfirmText,
+  approvalsToggle,
   autonomyConfirmText,
   followAppPhrase,
   isAutonomous,
@@ -16,7 +18,9 @@ import {
  * switch, the approved list (remove) and the gap — repos the GitHub App can
  * see that are not approved (approve selected / all). Each approved repo also
  * has a Builds toggle (the autonomy allow-list: board + ready-for-agent builds)
- * and a Merges toggle (the merge opt-in list), which needs Builds on.
+ * a Merges toggle (the merge opt-in list) and an Approvals toggle (unchecked =
+ * the repo's autonomous builds skip the stage's approval gates); both need
+ * Builds on.
  *
  * Every write answers with the full `/managed-repos` view, which replaces the
  * pane's data via `onChange`, so what is shown is always the server's state.
@@ -44,6 +48,8 @@ export function RepoApprovalPanel({
   const [pendingAutonomy, setPendingAutonomy] = useState<string | null>(null);
   /** The repo whose autonomous merges are waiting on the enable confirm. */
   const [pendingMerge, setPendingMerge] = useState<string | null>(null);
+  /** The repo whose approvals are waiting on the turn-off confirm. */
+  const [pendingApprovalsOff, setPendingApprovalsOff] = useState<string | null>(null);
 
   /**
    * Send a write and adopt the view it answers with. A 409 means this pane was
@@ -58,6 +64,7 @@ export function RepoApprovalPanel({
     setPendingToggle(null);
     setPendingAutonomy(null);
     setPendingMerge(null);
+    setPendingApprovalsOff(null);
     try {
       const next = await write();
       onChange(next);
@@ -89,12 +96,18 @@ export function RepoApprovalPanel({
 
   function setAutonomy(repo: string, enabled: boolean) {
     if (enabled) setPendingAutonomy(repo);
-    else void run(() => api.setRepoAutonomy(repo, false)); // the server drops Merges with it
+    else void run(() => api.setRepoAutonomy(repo, false)); // the server drops Merges and the skip with it
   }
 
   function setMerge(repo: string, enabled: boolean) {
     if (enabled) setPendingMerge(repo);
     else void run(() => api.setRepoMerge(repo, false));
+  }
+
+  /** Turning approvals OFF is the widening direction, so it is the one that confirms. */
+  function setApprovals(repo: string, enabled: boolean) {
+    if (!enabled) setPendingApprovalsOff(repo);
+    else void run(() => api.setRepoApprovals(repo, true));
   }
 
   const gap = data.gap;
@@ -182,6 +195,19 @@ export function RepoApprovalPanel({
                         onChange={(e) => setMerge(r, e.target.checked)}
                       />
                       Merges
+                    </label>
+                    <label
+                      className="flex items-center gap-1 text-muted cursor-pointer"
+                      title="Approval gates on autonomous builds (needs Builds on to turn off)"
+                    >
+                      <input
+                        type="checkbox"
+                        className="toggle toggle-xs"
+                        checked={approvalsToggle(data, r, busy).checked}
+                        disabled={approvalsToggle(data, r, busy).disabled}
+                        onChange={(e) => setApprovals(r, e.target.checked)}
+                      />
+                      Approvals
                     </label>
                     <button className="btn btn-xs btn-ghost" disabled={busy} onClick={() => remove([r])}>
                       Remove
@@ -286,6 +312,22 @@ export function RepoApprovalPanel({
               label: "Turn on merges",
               className: "btn-primary",
               onClick: () => void run(() => api.setRepoMerge(pendingMerge, true)),
+            },
+          ]}
+        />
+      )}
+
+      {pendingApprovalsOff !== null && (
+        <Confirm
+          title={`Turn off approvals for ${pendingApprovalsOff}?`}
+          body={approvalsOffConfirmText(pendingApprovalsOff)}
+          busy={busy}
+          actions={[
+            { label: "Cancel", className: "btn-ghost", onClick: () => setPendingApprovalsOff(null) },
+            {
+              label: "Turn off approvals",
+              className: "btn-primary",
+              onClick: () => void run(() => api.setRepoApprovals(pendingApprovalsOff, false)),
             },
           ]}
         />

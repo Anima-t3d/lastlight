@@ -66,6 +66,7 @@ import {
 import {
   approveRepos,
   removeRepos,
+  setRepoApprovals,
   setRepoAutonomy,
   setRepoMerge,
   setRequireApproval,
@@ -204,6 +205,7 @@ import { buildBoard, type BoardStage, type BoardDegradation } from "./board.js";
 import { getBoardItems, invalidateBoard, BOARD_TTL_MS } from "./board-cache.js";
 import { getAutonomyReposState } from "../autonomy-repos.js";
 import { getMergeReposState } from "../merge-repos.js";
+import { getApprovalSkipReposState } from "../approval-skip-repos.js";
 import { boardSignature, BOARD_TICK_MS, BOARD_HEARTBEAT_MS } from "./board-stream.js";
 import { reapSandboxWorkspace } from "../sandbox/reap.js";
 import { artifactStore } from "../sandbox/artifact-store.js";
@@ -822,6 +824,7 @@ export function createAdminRoutes(
     const { state: approval, stored } = getRepoApprovalState();
     const autonomy = getAutonomyReposState();
     const merge = getMergeReposState();
+    const approvalSkip = getApprovalSkipReposState();
     const grant = getInstallationRepos();
     const discovered = getInstallationReposRefreshedAt() !== null;
     const gap = discovered ? grant.filter((g) => !approval.approved.some((a) => sameRepo(a, g))) : null;
@@ -890,6 +893,10 @@ export function createAdminRoutes(
       autonomyStored: autonomy.stored,
       // The merge opt-in list (autonomous merge gate), a subset of `autonomous`.
       merge: merge.state.repos,
+      // The approval opt-out list (the Approvals toggle, unchecked = listed):
+      // autonomous builds of these repos skip the stage's approval gates. A
+      // subset of `autonomous`.
+      approvalSkip: approvalSkip.state.repos,
       stored,
       gap,
       approvedNoAccess,
@@ -988,6 +995,25 @@ export function createAdminRoutes(
     if (!res.ok) return c.json({ error: res.error }, res.status);
     await recordActivityFor(c, db, {
       action: "managed-repos.merge",
+      targetType: "managed-repos",
+      detail: { repo, enabled },
+    });
+    return c.json(managedReposView());
+  });
+
+  // The Approvals toggle. `enabled` is the toggle's position: false puts the
+  // repo on the skip list, so its autonomous builds run with no stage gates.
+  app.post("/managed-repos/approvals", async (c) => {
+    const body = (await c.req.json().catch(() => null)) as { repo?: unknown; enabled?: unknown } | null;
+    const repo = body?.repo;
+    const enabled = body?.enabled;
+    if (typeof repo !== "string" || !/^[^/\s]+\/[^/\s]+$/.test(repo) || typeof enabled !== "boolean") {
+      return c.json({ error: "repo must be owner/repo and enabled true or false" }, 400);
+    }
+    const res = await setRepoApprovals(db, repo, enabled, actorFromContext(c));
+    if (!res.ok) return c.json({ error: res.error }, res.status);
+    await recordActivityFor(c, db, {
+      action: "managed-repos.approvals",
       targetType: "managed-repos",
       detail: { repo, enabled },
     });

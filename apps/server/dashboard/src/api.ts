@@ -186,6 +186,12 @@ export interface ManagedRepos {
   autonomyStored: boolean;
   /** The merge opt-in list (autonomous merge gate): always a subset of `autonomous`. */
   merge: string[];
+  /**
+   * The approval opt-out list (the Approvals toggle, unchecked = listed): these
+   * repos' autonomous builds skip the build stage's approval gates. Always a
+   * subset of `autonomous`; empty by default.
+   */
+  approvalSkip: string[];
   /** Accounts whose installation repo list failed to load; their repos are missing from `gap`. */
   discoveryFailedAccounts: string[];
 }
@@ -1644,6 +1650,13 @@ export const api = {
     }),
   setRepoMerge: (repo: string, enabled: boolean) =>
     reqAction<ManagedRepos>("/managed-repos/merge", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repo, enabled }),
+    }),
+  /** `enabled` is the Approvals toggle: false = this repo's autonomous builds skip the stage gates. */
+  setRepoApprovals: (repo: string, enabled: boolean) =>
+    reqAction<ManagedRepos>("/managed-repos/approvals", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ repo, enabled }),

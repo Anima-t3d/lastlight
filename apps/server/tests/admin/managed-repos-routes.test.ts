@@ -38,6 +38,7 @@ import {
 import { makeTestDb } from "../helpers/state-db.js";
 import { resetAutonomyReposForTests } from "#src/autonomy-repos.js";
 import { resetMergeReposForTests } from "#src/merge-repos.js";
+import { resetApprovalSkipReposForTests } from "#src/approval-skip-repos.js";
 
 const SECRET = "test-secret";
 /** A GitHub-OAuth session for `octocat` — carries a verified login. */
@@ -103,6 +104,7 @@ beforeEach(async () => {
 afterEach(() => {
   resetAutonomyReposForTests();
   resetMergeReposForTests();
+  resetApprovalSkipReposForTests();
   resetRuntimeConfigForTests();
   resetInstallationReposForTests();
   vi.restoreAllMocks();
@@ -391,5 +393,85 @@ describe("Managed repos — autonomous merges", () => {
       body: { repo: "a/one", enabled: false },
     });
     expect(res.body).toMatchObject({ autonomous: [], merge: [] });
+  });
+});
+
+describe("Managed repos — the Approvals toggle", () => {
+  function config(approved: string[], autonomy: string[]): void {
+    setRuntimeConfig({
+      botName: "last-light",
+      managedRepos: approved,
+      requireRepoApproval: false,
+      autonomy: { ...defaultAutonomyConfig(), repos: autonomy },
+    } as unknown as LastLightConfig);
+  }
+
+  beforeEach(() => {
+    setInstallationRepos("1", ["a/one", "a/two", "a/three"]);
+  });
+
+  it("view reports an empty skip list by default (approvals on everywhere)", async () => {
+    config(["a/one"], ["a/one"]);
+    const { body } = await send("GET", "/managed-repos", { token: GITHUB_TOKEN });
+    expect(body.approvalSkip).toEqual([]);
+  });
+
+  it("turning approvals off stores the repo, returns the view and writes one activity row", async () => {
+    config(["a/one", "a/two"], ["a/one"]);
+    const res = await send("POST", "/managed-repos/approvals", {
+      token: GITHUB_TOKEN,
+      body: { repo: "a/one", enabled: false },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ approvalSkip: ["a/one"], autonomous: ["a/one"] });
+    const { activity, total } = await db.activity.list();
+    expect(total).toBe(1);
+    expect(activity[0]).toMatchObject({
+      action: "managed-repos.approvals",
+      actorLogin: "octocat",
+      targetType: "managed-repos",
+      outcome: "ok",
+    });
+    expect(activity[0].detail).toEqual({ repo: "a/one", enabled: false });
+  });
+
+  it("turning approvals off for a repo not on the autonomy list is 400 approvals-requires-builds", async () => {
+    config(["a/one", "a/two"], ["a/one"]);
+    const res = await send("POST", "/managed-repos/approvals", {
+      token: GITHUB_TOKEN,
+      body: { repo: "a/two", enabled: false },
+    });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: "approvals-requires-builds" });
+    expect((await db.activity.list()).total).toBe(0);
+  });
+
+  it("turning approvals on for a repo without Builds is allowed", async () => {
+    config(["a/one", "a/two"], ["a/one"]);
+    const res = await send("POST", "/managed-repos/approvals", {
+      token: GITHUB_TOKEN,
+      body: { repo: "a/two", enabled: true },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.approvalSkip).toEqual([]);
+  });
+
+  it("approvals toggle with a malformed body is 400", async () => {
+    config(["a/one"], ["a/one"]);
+    for (const body of [{ repo: "nope", enabled: false }, { repo: "a/one" }, { repo: "a/one", enabled: "no" }]) {
+      const res = await send("POST", "/managed-repos/approvals", { token: GITHUB_TOKEN, body });
+      expect(res.status).toBe(400);
+    }
+    expect((await db.activity.list()).total).toBe(0);
+  });
+
+  it("turning Builds off drops the repo from the skip list in the view", async () => {
+    config(["a/one"], ["a/one"]);
+    await send("POST", "/managed-repos/approvals", { token: GITHUB_TOKEN, body: { repo: "a/one", enabled: false } });
+    const res = await send("POST", "/managed-repos/autonomy", {
+      token: GITHUB_TOKEN,
+      body: { repo: "a/one", enabled: false },
+    });
+    expect(res.body).toMatchObject({ autonomous: [], approvalSkip: [] });
   });
 });
