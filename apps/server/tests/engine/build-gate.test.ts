@@ -52,13 +52,15 @@ const ISSUE = 412;
 const HOLD = "lastlight-ignore";
 
 /** A GitHub stand-in that records the two label writes the advance is made of. */
-function fakeGithub(over: { addLabels?: () => Promise<void> } = {}) {
+function fakeGithub(over: { addLabels?: () => Promise<void>; live?: () => Promise<unknown> } = {}) {
   const addLabels = vi.fn(async (_o: string, _r: string, _n: number, _names: string[]) => {
     if (over.addLabels) await over.addLabels();
   });
   const removeLabel = vi.fn(async () => {});
   const postComment = vi.fn(async () => 1);
-  return { addLabels, removeLabel, postComment } as unknown as GitHubClient & {
+  const getIssue = vi.fn(async () => (over.live ? over.live() : { labels: [], state: "open" }));
+  return { addLabels, removeLabel, postComment, getIssue } as unknown as GitHubClient & {
+    getIssue: ReturnType<typeof vi.fn>;
     addLabels: ReturnType<typeof vi.fn>;
     removeLabel: ReturnType<typeof vi.fn>;
     postComment: ReturnType<typeof vi.fn>;
@@ -181,7 +183,7 @@ describe("applyBuildDispatchGate", () => {
 
   it("skips an issue carrying the queued label on every route, and never advances its label", async () => {
     for (const route of ["labeled", "sweep", "api"] as const) {
-      const github = fakeGithub();
+      const github = fakeGithub({ live: async () => ({ labels: [STAGE_READY_FOR_AGENT, "lastlight:queued"] }) });
       const result = await applyBuildDispatchGate(
         args({ route, labels: [STAGE_READY_FOR_AGENT, "lastlight:queued"] }),
         { db, github },
@@ -196,8 +198,42 @@ describe("applyBuildDispatchGate", () => {
     }
   });
 
+  describe("a just-promoted issue (stale webhook labels)", () => {
+    const stale = [STAGE_READY_FOR_AGENT, "lastlight:queued"];
+
+    it("dispatches when the live labels no longer carry queued", async () => {
+      const github = fakeGithub({ live: async () => ({ labels: [{ name: STAGE_READY_FOR_AGENT }], state: "open" }) });
+      const result = await applyBuildDispatchGate(args({ labels: stale }), { db, github });
+      expect(github.getIssue).toHaveBeenCalledTimes(1);
+      expect(result.decision).toBe("dispatch");
+    });
+
+    it("skips when the live labels still carry queued", async () => {
+      const github = fakeGithub({ live: async () => ({ labels: [STAGE_READY_FOR_AGENT, "LastLight:Queued"], state: "open" }) });
+      const result = await applyBuildDispatchGate(args({ labels: stale }), { db, github });
+      expect(result.decision).toBe("skip");
+      expect(result.reason).toMatch(/^queued:/);
+      expect(github.addLabels).not.toHaveBeenCalled();
+    });
+
+    it("treats the issue as queued when the live read throws", async () => {
+      const github = fakeGithub({ live: async () => { throw new Error("boom"); } });
+      const result = await applyBuildDispatchGate(args({ labels: stale }), { db, github });
+      expect(result.decision).toBe("skip");
+      expect(result.reason).toMatch(/^queued:/);
+      expect(github.addLabels).not.toHaveBeenCalled();
+    });
+
+    it("makes no extra GitHub read when the webhook labels carry no queued label", async () => {
+      const github = fakeGithub();
+      const result = await applyBuildDispatchGate(args(), { db, github });
+      expect(result.decision).toBe("dispatch");
+      expect(github.getIssue).not.toHaveBeenCalled();
+    });
+  });
+
   it("matches the queued label case-insensitively", async () => {
-    const github = fakeGithub();
+    const github = fakeGithub({ live: async () => ({ labels: [STAGE_READY_FOR_AGENT, "LastLight:QUEUED"] }) });
     const result = await applyBuildDispatchGate(
       args({ labels: [STAGE_READY_FOR_AGENT, "LastLight:QUEUED"] }),
       { db, github },

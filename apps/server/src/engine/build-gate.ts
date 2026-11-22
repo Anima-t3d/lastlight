@@ -111,6 +111,28 @@ export async function applyBuildDispatchGate(
   const budget = getAutonomyConfig().budget;
   const queuedLabel = getAutonomyConfig().queuedLabel;
   const [owner, name] = args.repo.split("/");
+  const hasQueued = (names: readonly string[]) =>
+    names.some((l) => l.toLowerCase() === queuedLabel.toLowerCase());
+  // Promotion ADDS the enter label before it removes `queued`, so the
+  // `issues.labeled` webhook for that add carries labels that still include
+  // `queued`. Only on that route, and only when the snapshot says queued, read
+  // the live labels. A failed read counts as queued: the sweep recovers it.
+  let queued = hasQueued(args.labels);
+  if (queued && args.route === "labeled" && deps.github) {
+    try {
+      const live = await deps.github.getIssue(owner ?? "", name ?? "", args.issueNumber);
+      const liveNames = (live.labels ?? []).map((l: string | { name?: string }) =>
+        typeof l === "string" ? l : (l.name ?? ""),
+      );
+      queued = hasQueued(liveNames);
+    } catch (err: unknown) {
+      log.warn("Build gate could not read live labels; treating the issue as queued", {
+        repo: args.repo,
+        issueNumber: args.issueNumber,
+        err,
+      });
+    }
+  }
   // The usage-window verdict (`autonomy.budget.usage`; undefined = gate off),
   // read BEFORE the lock: it touches no state the lock protects, and an
   // external source must never make every other gate call wait on it.
@@ -193,7 +215,7 @@ export async function applyBuildDispatchGate(
       holdLabel: getHoldLabel(),
       // The same live label snapshot the hold check reads, matched
       // case-insensitively (GitHub label names are).
-      queued: args.labels.some((l) => l.toLowerCase() === queuedLabel.toLowerCase()),
+      queued,
       queuedLabel,
       concurrentAutonomousBuilds,
       // A reserved dispatch for this repo has not STARTED a run yet, but it will.
