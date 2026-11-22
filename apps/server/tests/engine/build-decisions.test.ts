@@ -643,9 +643,21 @@ describe("classifyBuildFailure", () => {
       "provider-account",
     ],
     [
-      "a pi account error (failed row whose stop reason still reads success)",
-      facts({ phases: [row("architect", { success: false, stopReason: "success", error: "insufficient_quota" })] }),
+      "a pi account error on the executor (error_account, from finalizeFromRunResult)",
+      facts({
+        phases: [row("executor", { success: false, stopReason: "error_account", error: "insufficient_quota: You exceeded your current quota" })],
+      }),
       "provider-account",
+    ],
+    [
+      "a pi account error on the architect",
+      facts({ phases: [row("architect", { success: false, stopReason: "error_account", error: "insufficient_quota" })] }),
+      "provider-account",
+    ],
+    [
+      "a plain pi agent error on the executor is still executor-failed",
+      facts({ phases: [row("executor", { success: false, stopReason: "error_agent", error: "500 internal server error" })] }),
+      "executor-failed",
     ],
     [
       "a provider failure inside a rejected fix is provider-account, not review-rejected",
@@ -774,5 +786,20 @@ describe("resolveBuildTrigger — the escalation route", () => {
     const d = decide(inputs({ senderIsBot: true, alreadyBuilt: true, attempt: 2, maxAttempts: 2 }));
     expect(d.decision).toBe("skip");
     expect(d.reason).toMatch(/^already-built:/);
+  });
+});
+
+describe("classify → escalate: a pi account error holds, it does not spend a retry", () => {
+  it("an executor row carrying error_account resolves to hold", () => {
+    const failure = classifyBuildFailure({
+      status: "failed",
+      error: "insufficient_quota: You exceeded your current quota",
+      phases: [
+        { phase: "build:architect", success: true },
+        { phase: "build:executor", success: false, stopReason: "error_account", error: "insufficient_quota" },
+      ],
+    });
+    expect(failure).toBe("provider-account");
+    expect(resolveBuildEscalation({ failure, attempt: 1, usageAllows: true }, { maxAttempts: 2 }).decision).toBe("hold");
   });
 });

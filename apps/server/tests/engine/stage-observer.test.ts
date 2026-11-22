@@ -572,6 +572,39 @@ describe("installStageObserver — L3 escalation", () => {
     expect(dispatchEscalation).not.toHaveBeenCalled();
   });
 
+  it("a pi account error on the executor (error_account) holds instead of retrying", async () => {
+    const github = escGithub();
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    installStageObserver(db, { github, dispatchEscalation });
+    await seedStageRun(db, "run-pi-quota");
+    await ledger("run-pi-quota", "architect", { success: true });
+    await ledger("run-pi-quota", "executor", {
+      success: false,
+      error: "insufficient_quota: You exceeded your current quota",
+      stopReason: "error_account",
+    });
+
+    await db.runs.finishRun("run-pi-quota", "failed");
+    await vi.waitFor(() => expect(github.postComment).toHaveBeenCalledTimes(1));
+    expect(github.addLabels).toHaveBeenCalledWith(OWNER, NAME, ISSUE, [STAGE_AGENT_BLOCKED]);
+    expect(dispatchEscalation).not.toHaveBeenCalled();
+  });
+
+  it("a ledger read that fails lands on agent-blocked and dispatches nothing", async () => {
+    const github = escGithub();
+    const dispatchEscalation = vi.fn(async () => "dispatched" as const);
+    installStageObserver(db, { github, dispatchEscalation });
+    await failedExecutorRun("run-ledger-down");
+    vi.spyOn(db.executions, "getExecutionsForWorkflowRun").mockRejectedValue(new Error("database is locked"));
+
+    await db.runs.finishRun("run-ledger-down", "failed");
+    await vi.waitFor(() =>
+      expect(github.addLabels).toHaveBeenCalledWith(OWNER, NAME, ISSUE, [STAGE_AGENT_BLOCKED]),
+    );
+    expect(github.removeLabel).toHaveBeenCalledWith(OWNER, NAME, ISSUE, STAGE_AGENT_BUILDING);
+    expect(dispatchEscalation).not.toHaveBeenCalled();
+  });
+
   it("without an escalation port the observer behaves exactly as before", async () => {
     const github = escGithub();
     installStageObserver(db, { github });

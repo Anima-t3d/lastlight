@@ -586,6 +586,13 @@ export class RunResultAccumulator {
 /** See {@link RunResultAccumulator.outputCapStop}. */
 export type OutputCapStop = "none" | "partial" | "no-answer";
 
+/**
+ * The stop reason a run that failed on a provider ACCOUNT error is persisted
+ * under (see `finalizeFromRunResult`). Read by the build escalation's failure
+ * classifier and by the fan-out's provider-error retry.
+ */
+export const ACCOUNT_ERROR_STOP_REASON = "error_account";
+
 /** Provider account/billing/auth failures pi may surface as error text. */
 const ACCOUNT_ERROR_MARKERS = [
   "credit balance",
@@ -679,6 +686,21 @@ export function finalizeFromRunResult(
         : toolError.message
       : undefined;
 
+  // A provider ACCOUNT error (quota, billing, auth, rate limit) on a failed run
+  // is persisted under its own stop reason, `error_account`, instead of the
+  // `error_agent` / `error_tool` / `error_fatal` / `error_exit_N` it arrived as.
+  // That is the only marker the build escalation (`engine/build-decisions.ts`)
+  // can read off the ledger to HOLD such a run rather than spend a retry on it.
+  // Computed before the shim is finalised so the session log agrees.
+  const accountError = detectAccountError({
+    success,
+    fatalErrorMessage: result.fatalError?.message,
+    agentErrorMessage: agentError?.errorMessage,
+    finalText: result.finalText,
+    toolErrorText,
+  });
+  const persistedStopReason = accountError ? ACCOUNT_ERROR_STOP_REASON : stopReason;
+
   const inputTokens = stats?.tokens.input ?? 0;
   const outputTokens = stats?.tokens.output ?? 0;
   const cacheRead = stats?.tokens.cacheRead ?? 0;
@@ -687,7 +709,7 @@ export function finalizeFromRunResult(
   const turns = stats?.assistantMessages ?? 0;
 
   log.info("Result", {
-    stopReason,
+    stopReason: persistedStopReason,
     turns,
     durationSec: Math.round(durationMs / 1000),
     costUsd: costUsd > 0 ? costUsd : undefined,
@@ -702,21 +724,13 @@ export function finalizeFromRunResult(
     outputTokens,
     cacheReadInputTokens: cacheRead,
     cacheCreationInputTokens: cacheWrite,
-    stopReason,
+    stopReason: persistedStopReason,
     durationMs,
     apiErrorMessage:
       agentError?.errorMessage ??
       (success ? undefined : (toolErrorText ?? (truncated ? truncationMessage : undefined))),
   });
   void shim.flush();
-
-  const accountError = detectAccountError({
-    success,
-    fatalErrorMessage: result.fatalError?.message,
-    agentErrorMessage: agentError?.errorMessage,
-    finalText: result.finalText,
-    toolErrorText,
-  });
 
   const errorText =
     result.fatalError?.message ||
@@ -745,7 +759,7 @@ export function finalizeFromRunResult(
     outputTokens: outputTokens || undefined,
     cacheReadInputTokens: cacheRead || undefined,
     cacheCreationInputTokens: cacheWrite || undefined,
-    stopReason,
+    stopReason: persistedStopReason,
     extensions,
     skills,
   };

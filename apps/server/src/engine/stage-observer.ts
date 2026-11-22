@@ -340,12 +340,23 @@ async function recordAttemptCost(
   }
 }
 
+/** What {@link planEscalation} decided to do with a failed build. */
+type EscalationPlan =
+  | { kind: "hand-off" }
+  | { kind: "hold"; where: NonNullable<ReturnType<typeof locate>> }
+  | { kind: "retry"; workflow: string; context: Record<string, unknown> };
+
 /**
  * A failed autonomous build: classify it from the persisted rows, ask
  * {@link resolveBuildEscalation}, and act. `retry` keeps the issue on
  * `running` and dispatches attempt n+1; a refused dispatch, a `hold` and a
  * `hand-off` all land on `on_failure` exactly as before (a `hold` also
  * comments once).
+ *
+ * Everything up to the dispatch is planned inside one try: a ledger read, a
+ * usage read, a GitHub read or a config lookup that throws must NOT leave the
+ * issue on `running` — no live run remains to move it and the sweep never
+ * picks a `running` issue up again. Any failure there is a hand-off.
  */
 async function escalateFailedBuild(
   db: StateDb,
@@ -353,8 +364,47 @@ async function escalateFailedBuild(
   stageName: string,
   deps: StageObserverDeps,
 ): Promise<void> {
+  let plan: EscalationPlan;
+  try {
+    plan = await planEscalation(db, run, stageName, deps);
+  } catch (err: unknown) {
+    log.warn("Could not decide a build escalation — handing off", { runId: run.id, err });
+    plan = { kind: "hand-off" };
+  }
+
+  if (plan.kind === "hand-off") return advanceTerminalStage(run, "failed", stageName, deps);
+
+  if (plan.kind === "hold") {
+    await advanceTerminalStage(run, "failed", stageName, deps);
+    if (!deps.github) return;
+    const { where } = plan;
+    try {
+      await deps.github.postComment(where.owner, where.repo, where.issueNumber, renderEscalationHoldComment(getBotName()));
+    } catch (err: unknown) {
+      log.warn("Escalation hold comment failed", { runId: run.id, err });
+    }
+    return;
+  }
+
+  let outcome: "dispatched" | "skipped" = "skipped";
+  try {
+    outcome = await deps.dispatchEscalation!(plan.workflow, plan.context);
+  } catch (err: unknown) {
+    log.warn("Escalation dispatch threw — handing off", { runId: run.id, err });
+  }
+  // A refused retry must not strand the issue on `running`.
+  if (outcome === "skipped") return advanceTerminalStage(run, "failed", stageName, deps);
+}
+
+/** The read-and-decide half of {@link escalateFailedBuild}. May throw; the caller hands off. */
+async function planEscalation(
+  db: StateDb,
+  run: WorkflowRun,
+  stageName: string,
+  deps: StageObserverDeps,
+): Promise<EscalationPlan> {
   const where = locate(run);
-  if (!where) return advanceTerminalStage(run, "failed", stageName, deps);
+  if (!where) return { kind: "hand-off" };
 
   const rows = await db.executions.getExecutionsForWorkflowRun(run.id, run.triggerId, run.workflowName);
   await recordAttemptCost(db, run, rows);
@@ -382,18 +432,8 @@ async function escalateFailedBuild(
     reason: decision.reason,
   });
 
-  if (decision.decision === "hand-off") return advanceTerminalStage(run, "failed", stageName, deps);
-
-  if (decision.decision === "hold") {
-    await advanceTerminalStage(run, "failed", stageName, deps);
-    if (!deps.github) return;
-    try {
-      await deps.github.postComment(where.owner, where.repo, where.issueNumber, renderEscalationHoldComment(getBotName()));
-    } catch (err: unknown) {
-      log.warn("Escalation hold comment failed", { runId: run.id, err });
-    }
-    return;
-  }
+  if (decision.decision === "hand-off") return { kind: "hand-off" };
+  if (decision.decision === "hold") return { kind: "hold", where };
 
   // RETRY. The issue's current title, body and labels come from GitHub: the
   // gate's hold check must read the labels as they are NOW, and the run row
@@ -405,13 +445,15 @@ async function escalateFailedBuild(
       issue = (await deps.github.getIssue(where.owner, where.repo, where.issueNumber)) as IssueRead;
     } catch (err: unknown) {
       log.warn("Could not read the issue for an escalation retry — handing off", { runId: run.id, err });
-      return advanceTerminalStage(run, "failed", stageName, deps);
+      return { kind: "hand-off" };
     }
-    if (issue?.state === "closed") return advanceTerminalStage(run, "failed", stageName, deps);
+    if (issue?.state === "closed") return { kind: "hand-off" };
   }
   const labels = (issue?.labels ?? [])
     .map((l: unknown) => (typeof l === "string" ? l : (l as { name?: unknown } | null)?.name))
     .filter((l): l is string => typeof l === "string" && l.length > 0);
+  const stage = getAutonomyConfig().stages[stageName];
+  if (!stage) return { kind: "hand-off" };
   const ctx = run.context ?? {};
   const context: Record<string, unknown> = {
     repo: `${where.owner}/${where.repo}`,
@@ -430,15 +472,7 @@ async function escalateFailedBuild(
     ...(typeof ctx._addedLabel === "string" ? { _addedLabel: ctx._addedLabel } : {}),
     ...(typeof ctx._hint === "string" && ctx._hint ? { _hint: ctx._hint } : {}),
   };
-
-  let outcome: "dispatched" | "skipped" = "skipped";
-  try {
-    outcome = await deps.dispatchEscalation!(stageWorkflow(getAutonomyConfig().stages[stageName]!), context);
-  } catch (err: unknown) {
-    log.warn("Escalation dispatch threw — handing off", { runId: run.id, err });
-  }
-  // A refused retry must not strand the issue on `running`.
-  if (outcome === "skipped") return advanceTerminalStage(run, "failed", stageName, deps);
+  return { kind: "retry", workflow: stageWorkflow(stage), context };
 }
 
 /**

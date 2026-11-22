@@ -679,3 +679,67 @@ describe("resetVerifyScript", () => {
     }
   });
 });
+
+/**
+ * A provider ACCOUNT error (quota, billing, auth) gets its own persisted stop
+ * reason, `error_account`, so the build escalation can tell it from a failed
+ * agent and hold instead of spending a retry on it.
+ */
+describe("finalizeFromRunResult — provider account errors", () => {
+  const seen: string[] = [];
+  const shim = {
+    finalize(r: { stopReason?: string }) {
+      if (r.stopReason) seen.push(r.stopReason);
+    },
+    flush: () => Promise.resolve(),
+  } as unknown as Parameters<typeof finalizeFromRunResult>[2];
+  type Result = Parameters<typeof finalizeFromRunResult>[0];
+  const agentError = (errorMessage: string): Result =>
+    ({
+      ok: true,
+      exitCode: 0,
+      agentEnded: true,
+      finalText: "",
+      messages: [{ role: "assistant", stopReason: "error", errorMessage }],
+      sessionId: "s",
+    }) as unknown as Result;
+
+  it("persists error_account for a pi agent-error carrying an account marker", () => {
+    seen.length = 0;
+    const r = finalizeFromRunResult(agentError("insufficient_quota: You exceeded your current quota"), "p", shim, Date.now());
+    expect(r.success).toBe(false);
+    expect(r.stopReason).toBe("error_account");
+    expect(r.error).toContain("insufficient_quota");
+    // The session shim (the dashboard's phase log) records the same reason.
+    expect(seen).toEqual(["error_account"]);
+  });
+
+  it("persists error_account for a failed tool carrying an account marker", () => {
+    const r = finalizeFromRunResult(
+      { ok: true, exitCode: 0, agentEnded: false, finalText: "", lastToolErrored: true, messages: [], sessionId: "s" } as unknown as Result,
+      "p",
+      shim,
+      Date.now(),
+      undefined,
+      undefined,
+      { tool: "bash", message: "Your credit balance is too low" },
+    );
+    expect(r.stopReason).toBe("error_account");
+  });
+
+  it("leaves a non-account agent error as error_agent", () => {
+    const r = finalizeFromRunResult(agentError("500 internal server error"), "p", shim, Date.now());
+    expect(r.stopReason).toBe("error_agent");
+  });
+
+  it("leaves a successful run's account words alone (a curl probing a 401)", () => {
+    const r = finalizeFromRunResult(
+      { ok: true, exitCode: 0, agentEnded: true, finalText: "the endpoint returned 401 unauthorized as expected", messages: [], sessionId: "s" } as unknown as Result,
+      "p",
+      shim,
+      Date.now(),
+    );
+    expect(r.success).toBe(true);
+    expect(r.stopReason).toBe("success");
+  });
+});

@@ -480,11 +480,13 @@ const REVIEW_REJECTED_PREFIX = "review-rejected:";
  */
 const GATE_BLOCKED_PREFIX = "Guardrails check: BLOCKED";
 /**
- * Stop reasons the executors stamp for an account-level provider failure: the
- * Claude Code sign-in (`error_auth`) and usage window (`usage_limit`), and the
- * k8s quota (`error_quota`).
+ * Stop reasons the executors stamp for an account-level provider failure: a pi
+ * quota / billing / auth / rate-limit error (`error_account`, from
+ * `finalizeFromRunResult` in `executors/shared.ts`), the Claude Code sign-in
+ * (`error_auth`) and usage window (`usage_limit`), and the k8s quota
+ * (`error_quota`). Literals rather than an import: this module stays pure.
  */
-const PROVIDER_STOP_REASONS = new Set(["error_auth", "usage_limit", "error_quota"]);
+const PROVIDER_STOP_REASONS = new Set(["error_account", "error_auth", "usage_limit", "error_quota"]);
 
 /** The build workflow's reviewer loop phase, and the labels its cycles mint. */
 function isReviewerLoopPhase(name: string): boolean {
@@ -513,9 +515,7 @@ export function classifyBuildFailure(facts: BuildFailureFacts): FailureClass {
       !(p.error ?? "").startsWith("stale:"),
   );
 
-  // `shared.ts` returns a failed result whose stop reason is still `success`
-  // only on its account-error path, so that shape is our marker.
-  if (failed.some((p) => PROVIDER_STOP_REASONS.has(p.stopReason ?? "") || p.stopReason === "success")) {
+  if (failed.some((p) => PROVIDER_STOP_REASONS.has(p.stopReason ?? ""))) {
     return "provider-account";
   }
   // The engine stamps the class on a REVIEWER-LOOP ledger row (`reviewer`,

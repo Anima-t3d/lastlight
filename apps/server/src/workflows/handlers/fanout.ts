@@ -92,7 +92,13 @@ const BACKEND_MAX_CONCURRENT: Record<SandboxBackend, number> = {
  * attempt is cheap next to a lost site.
  */
 function isProviderError(r: { success: boolean; stopReason?: string; error?: string }): boolean {
-  return !r.success && r.stopReason === "error_agent" && !isTerminated(r.error);
+  // `error_account` is the same failed model call when its text names an
+  // account marker (a rate limit, a quota): still the provider's error.
+  return (
+    !r.success &&
+    (r.stopReason === "error_agent" || r.stopReason === "error_account") &&
+    !isTerminated(r.error)
+  );
 }
 
 /** Absent `on_branch_soft_failure` ⇒ no retry, and one soft branch never fails the phase. */

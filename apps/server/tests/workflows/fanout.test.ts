@@ -76,6 +76,8 @@ class CountingSandbox extends FakeSandbox {
        * what an endpoint 404/5xx looks like), before it runs normally.
        */
       providerErrorOn?: Record<string, number>;
+      /** The provider error text a `providerErrorOn` branch fails with. */
+      providerErrorMessage?: string;
       /** Prompt substring → ms to stall, so overlap is observable. */
       delayOn?: Record<string, number>;
       commandExit?: number;
@@ -134,7 +136,9 @@ class CountingSandbox extends FakeSandbox {
           agentEnded: true,
           finalText: "",
           toolErrors: false,
-          messages: [{ role: "assistant", stopReason: "error", errorMessage: "404 status code (no body)" }],
+          messages: [
+            { role: "assistant", stopReason: "error", errorMessage: this.opts.providerErrorMessage ?? "404 status code (no body)" },
+          ],
         } as unknown as RunResult;
       }
       return await super.runAgent(taskId, prompt, opts, onEvent);
@@ -448,6 +452,19 @@ describe("fanout — provider errors and the workflow verdict", () => {
     // a + b twice + c.
     expect(sandbox.agentPrompts.filter((p) => p.includes("prompts/b.md"))).toHaveLength(2);
     expect(outcome.status).toBe("succeeded");
+  });
+
+  it("still retries a branch whose provider error is an account marker (error_account)", async () => {
+    // A rate limit is an ACCOUNT marker, so it persists as `error_account`
+    // rather than `error_agent` — and is still the provider error a second
+    // branch attempt is cheap next to.
+    const sandbox = new CountingSandbox({
+      providerErrorOn: { "prompts/b.md": 1 },
+      providerErrorMessage: "429 rate limit exceeded",
+    });
+    const { outcome } = await runFanout(fanoutPhase(), sandbox);
+    expect(sandbox.agentPrompts.filter((p) => p.includes("prompts/b.md"))).toHaveLength(2);
+    expect(outcome.results.find((r) => r.phase === "survey_branch_enforcement")?.success).toBe(true);
   });
 
   it("retries a provider error only once", async () => {
