@@ -15,7 +15,8 @@
  *   recorded this PR number in its `buildReview` scratch.
  * - The repo's `.lastlight/` `merge:` layer is refreshed before every decision.
  *   It can only tighten, so a refresh that fails waits rather than deciding on
- *   the operator's policy alone.
+ *   the operator's policy alone, and so does a `lastlight.yml` that is present
+ *   but was not applied (bad YAML, not a mapping, cut by a cap).
  * - The instance hold label stops a merge from the PR or the build's issue.
  *
  * Three triggers call {@link evaluateBuildMerge}: the green-settle webhook
@@ -36,7 +37,7 @@ import {
   isMergeRepo,
   mergeConfigForLayer,
 } from "../config/config.js";
-import { refreshRepoLayer, type RepoLayer } from "../config/repo-config.js";
+import { refreshRepoLayer, unappliedRepoConfigFile, type RepoLayer } from "../config/repo-config.js";
 import { resolveAutonomyMerge } from "../workflows/autonomy-merge.js";
 import { BUILD_WORKFLOW, readBuildReview, type BuildReviewRecord } from "./build-review.js";
 import { issueTriggerId } from "./build-decisions.js";
@@ -181,6 +182,26 @@ async function evaluateOnce(
       reason: "repo-config-unknown: the repo's .lastlight/ merge policy could not be read",
     };
     log.warn("Not merging: the repo merge policy could not be refreshed", { repo, prNumber, runId: run.id, trigger, err });
+    await appendDecision(deps.db, run, { trigger, ...result, headSha });
+    return result;
+  }
+  // A `lastlight.yml` that is there but was dropped whole (bad YAML, not a
+  // mapping, over a cap) may have meant to tighten `merge:`. Deciding on the
+  // operator policy alone would be the looser answer, so wait for a fix.
+  const unapplied = unappliedRepoConfigFile(layer);
+  if (unapplied) {
+    const result: BuildMergeResult = {
+      decision: "wait",
+      reason: `repo-config-unknown: the repo's .lastlight/lastlight.yml was not applied (${unapplied.code})`,
+    };
+    log.warn("Not merging: the repo's lastlight.yml is present but was not applied", {
+      repo,
+      prNumber,
+      runId: run.id,
+      trigger,
+      code: unapplied.code,
+      message: unapplied.message,
+    });
     await appendDecision(deps.db, run, { trigger, ...result, headSha });
     return result;
   }

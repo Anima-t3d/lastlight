@@ -359,6 +359,44 @@ export function getCachedRepoLayer(repo: string): RepoLayer | undefined {
   return memoryCache.get(repo)?.layer;
 }
 
+/**
+ * Warning codes that, on {@link REPO_CONFIG_FILE}'s own path, mean the file was
+ * in the tree but dropped whole: it did not parse, was not a mapping, or was
+ * cut by a cap or a file-mode check. Key-level codes (`key-not-allowed`,
+ * `invalid-value`, …) are absent on purpose: they drop one key and the rest of
+ * the file still applies.
+ */
+const CONFIG_FILE_DROPPED_CODES: ReadonlySet<RepoConfigWarning["code"]> = new Set([
+  "invalid-yaml",
+  "not-a-mapping",
+  "size-cap",
+  "file-count-cap",
+  "symlink",
+  "path-escape",
+]);
+
+/**
+ * The warning showing that `.lastlight/lastlight.yml` may be present but was not
+ * applied, or `undefined` when the layer's config (or its absence) can be
+ * trusted. For the merge gate, where the repo layer can only tighten, so a
+ * dropped file is the looser answer, not "no policy".
+ *
+ * Two shapes count:
+ * - a file-level drop on `lastlight.yml` itself ({@link CONFIG_FILE_DROPPED_CODES});
+ * - a truncated tree (`size-cap` / `file-count-cap` on `.lastlight`) with no
+ *   config read. GitHub's client skips an over-cap blob before the sanitizer
+ *   sees it, so the truncation is all that is left to say the file was cut.
+ *   This also catches a truncated tree with an empty or missing `lastlight.yml`:
+ *   the gate cannot tell those apart, and waits.
+ */
+export function unappliedRepoConfigFile(layer: RepoLayer | undefined): RepoConfigWarning | undefined {
+  if (!layer) return undefined;
+  const dropped = layer.warnings.find((w) => w.path === REPO_CONFIG_FILE && CONFIG_FILE_DROPPED_CODES.has(w.code));
+  if (dropped) return dropped;
+  if (layer.config !== undefined) return undefined;
+  return layer.warnings.find((w) => w.path === ".lastlight" && (w.code === "size-cap" || w.code === "file-count-cap"));
+}
+
 /** Test-only: clear the in-memory cache. Matches the `resetXForTests()` convention. */
 export function resetRepoConfigForTests(): void {
   memoryCache.clear();

@@ -488,6 +488,61 @@ describe("evaluateBuildMerge — the repo merge layer (I3)", () => {
     expect(res.reason).toMatch(/^repo-config-unknown:/);
     expect(github.mergePullRequest).not.toHaveBeenCalled();
   });
+
+  // R1: a lastlight.yml that is present but dropped is not "no layer". The repo
+  // may have meant to tighten the merge policy, so the gate waits for a fix.
+  async function expectUnusableWaits(tree: unknown): Promise<void> {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub();
+    github.fetchRepoConfigTree.mockResolvedValue(tree);
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(res.decision).toBe("wait");
+    expect(res.reason).toMatch(/^repo-config-unknown:/);
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+    expect(github.postComment).not.toHaveBeenCalled();
+    expect((await ledger(db))[0]).toMatchObject({ decision: "wait", headSha: "B" });
+  }
+
+  it("a lastlight.yml that is not valid YAML waits", async () => {
+    await expectUnusableWaits(layerTree("merge: [unclosed\n  protectedPaths: {\n"));
+  });
+
+  it("a lastlight.yml whose top level is not a mapping waits", async () => {
+    await expectUnusableWaits(layerTree("- merge\n- protectedPaths\n"));
+  });
+
+  it("a lastlight.yml dropped by the layer size cap waits", async () => {
+    const big = `merge:\n  protectedPaths: ["migrations/**"]\n# ${"x".repeat(2 * 1024 * 1024)}\n`;
+    await expectUnusableWaits(layerTree(big));
+  });
+
+  it("a .lastlight/ tree truncated before lastlight.yml was read waits", async () => {
+    // GitHub's client skips an over-cap blob and reports `truncated`; the file
+    // never reaches the sanitizer, so all that is left is the truncation.
+    await expectUnusableWaits({ status: "ok", defaultBranch: "main", treeSha: "tree-1", files: [], truncated: true });
+  });
+
+  it("a valid lastlight.yml with an ignored unknown key still decides on its merge policy", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub({ files: ["src/a.ts", "migrations/001.sql"] });
+    github.fetchRepoConfigTree.mockResolvedValue(
+      layerTree("bogus: 1\nmerge:\n  protectedPaths: [\"migrations/**\"]\n"),
+    );
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(res.decision).toBe("hand-off");
+    expect(res.reason).toBe("protected-path: migrations/001.sql is protected");
+  });
+
+  it("a valid lastlight.yml with an ignored unknown key and no merge block merges", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub();
+    github.fetchRepoConfigTree.mockResolvedValue(layerTree("bogus: 1\n"));
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(res).toMatchObject({ decision: "merge", outcome: "merged" });
+  });
 });
 
 describe("evaluateBuildMerge — a stale review (I4b)", () => {
