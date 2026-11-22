@@ -27,11 +27,11 @@ import {
 import type { ConfigSource } from "../config/config-resolve.js";
 import type { GitHubClient } from "../engine/github/github.js";
 import { finalizeBuildReviewForRun } from "../engine/build-review.js";
-import { NO_AUTONOMY_MERGE } from "./autonomy-merge.js";
 import {
-  STAGE_GATES_KEY,
   decideAutonomyMerge,
   decideStageGates,
+  dispatchExtra,
+  runPolicyContext,
   storedAutonomyMerge,
   storedStageGates,
   withRunApproval,
@@ -1157,17 +1157,23 @@ async function runSimpleWorkflowBody(
   // caller's own maps by identity, so behaviour is unchanged.
   const repoConfig = request.repoConfig;
   const effectiveVariants = repoConfig?.variants ?? variants;
+  // The dispatch's own context, minus the keys only the SERVER may write
+  // (`_stageGates`, `autonomyMerge`): `/api/run` passes `body.context` through
+  // as `extra`, and both the run row and `ctx` below are built by spreading it.
+  // Every read of the dispatch context in this function goes through `extra`.
+  const extra = dispatchExtra(request.extra);
   // The autonomy stage's approval gates, stashed on the dispatch context by the
-  // build gate (`engine/build-gate.ts`) as `_autonomyGates`, and unioned
-  // add-only onto the base map below (`true` leaves only — see
-  // `stage-approval.ts`). The effect is that an autonomous build pauses at
-  // `post_architect` while an `@bot build` on the same repo does not: same
-  // workflow, same repo, different dispatch, and only the autonomous one
-  // carries the stage's gates.
+  // build gate (`engine/build-gate.ts`) as `_autonomyGates`, and spread over the
+  // base map below (see `stage-approval.ts`). The effect is that an autonomous
+  // build pauses at `post_architect` while an `@bot build` on the same repo does
+  // not: same workflow, same repo, different dispatch, and only the autonomous
+  // one (`_stage` set) carries the stage's gates.
   //
   // The per-repo Approvals toggle (Config → Managed repos, `approval-skip-repos`)
-  // drops ONLY these stage-added gates: the base map (operator ⊕ repo layer)
-  // still applies untouched. The toggle is read HERE, once, for a run being
+  // turns the stage's OWN gate names (the keys of its configured `gates`) off
+  // for a stage build, whatever set them — the operator's `approval:`,
+  // `APPROVAL_GATES`, or the repo layer. Every other gate in the base map is
+  // untouched, and a human build keeps them all. The toggle is read HERE, once, for a run being
   // created, and the decision is persisted on the run (`_stageGates`); a run
   // that already exists — admitted from the queue, or re-dispatched after an
   // approval — reads that decision back instead (see `stageGates` below), so a
@@ -1176,7 +1182,7 @@ async function runSimpleWorkflowBody(
   // retry and `@bot retry`, which carry `_stage` and so `_autonomyGates`; a
   // human `@bot build` carries none, so the toggle cannot touch it.
   const mergeRepo = `${owner}/${repo}`;
-  const stageDecision = decideStageGates(request.extra, mergeRepo);
+  const stageDecision = decideStageGates(extra, mergeRepo);
   // The same stage, its OTHER projection: what becomes of the PR this build
   // opens. Read from the operator's config (the gate hands back gates, not a
   // merge policy) and keyed on the same dispatch markers, so an `@bot build`
@@ -1185,7 +1191,7 @@ async function runSimpleWorkflowBody(
   // context carries no `_stage`) swaps in the persisted value below — otherwise
   // a gate run resumed after an approval rendered `{{autonomyMerge.gate}}` false
   // and parked its PR instead of handing it to the merge gate.
-  let autonomyMerge = decideAutonomyMerge(request.extra, mergeRepo);
+  let autonomyMerge = decideAutonomyMerge(extra, mergeRepo);
   if (autonomyMerge.configured !== autonomyMerge.effective) {
     // The one case where the two disagree. Logged rather than silently
     // downgraded: an operator who asked for `auto-low-impact` and got a parked
@@ -1221,16 +1227,16 @@ async function runSimpleWorkflowBody(
   // cost, and how many consecutive `flaky` verdicts it has deferred on. They
   // resolve against the run's EFFECTIVE `fix:` block, so a repo that clamped
   // itself down is escalated and promoted on its own numbers.
-  const flakyDeferrals = numberFromExtra(request.extra, "flakyDeferrals");
+  const flakyDeferrals = numberFromExtra(extra, "flakyDeferrals");
   // The JOURNAL's length, not `attempt` — locked decision 10. `attempt` re-arms
   // on a retry and `priorAttempts` survives one, so this is the field that
   // knows how many times the PR has actually been tried.
-  const priorAttempts = Array.isArray(request.extra?.priorAttempts)
-    ? request.extra.priorAttempts.length
+  const priorAttempts = Array.isArray(extra?.priorAttempts)
+    ? extra.priorAttempts.length
     : undefined;
   const effectiveModels = escalateBuildModels(
     escalateFixModel(workflowName, repoConfig?.models ?? models, priorAttempts, effectiveFix),
-    numberFromExtra(request.extra, "_attempt"),
+    numberFromExtra(extra, "_attempt"),
     getBuildConfig(),
   );
   definition = promoteFlakyDiagnosis(definition, flakyDeferrals, effectiveFix);
@@ -1391,15 +1397,16 @@ async function runSimpleWorkflowBody(
         // is TTL-cached and mutable: by the time anyone asks why a run picked a
         // model, the repo's default branch may have moved on.
         repoConfig: repoConfig ? repoConfigRunRecord(repoConfig) : undefined,
-        ...request.extra,
-        // The stage-gate decision (after the Approvals skip check), pinned for
-        // every later start of this run: admission, boot recovery, Retry and the
-        // re-dispatch after an approval. See `stage-approval.ts`.
-        ...(stageDecision.isStageRun ? { [STAGE_GATES_KEY]: stageDecision.gates } : {}),
-        // …and its merge policy, for the same reason (`isGateRun`, the
-        // reviewer's `fail_on_reject: "{{autonomyMerge.gate}}"`, `prompts/pr.md`).
-        // A human build's inert policy is not stored: it resolves to the same.
-        ...(autonomyMerge !== NO_AUTONOMY_MERGE ? { autonomyMerge } : {}),
+        ...extra,
+        // The run's policy, pinned for every later start of it: admission, boot
+        // recovery, Retry and the re-dispatch after an approval (see
+        // `stage-approval.ts`). ALWAYS written, from the server's own decision —
+        // never a caller's (`extra` has had both keys stripped): the stage-gate
+        // leaves (absent for a non-stage run) and the merge policy (inert for a
+        // human build), read by `isGateRun`, the reviewer's
+        // `fail_on_reject: "{{autonomyMerge.gate}}"`, `prompts/pr.md` and the
+        // merge executor.
+        ...runPolicyContext(stageDecision, autonomyMerge),
       },
       startedAt: new Date().toISOString(),
     });
@@ -1495,7 +1502,7 @@ async function runSimpleWorkflowBody(
   // into request.extra.combinedContext (one screening call). For everything
   // else we fall back to whatever the envelope carried.
 
-  const combinedContext = (request.extra?.combinedContext as string | undefined) || "";
+  const combinedContext = (extra?.combinedContext as string | undefined) || "";
   const issueRef = `${owner}/${repo}${issueNumber ? `#${issueNumber}` : ""}`;
   const hasAnyUserContent = !!(combinedContext || request.issueBody || request.commentBody);
 
@@ -1622,7 +1629,7 @@ async function runSimpleWorkflowBody(
     // Extra workflow-specific args (e.g. mode: scan from cron, or the PR fix
     // payload). These become top-level ctx keys so prompt templates can read
     // them directly via {{failedChecks}} etc.
-    ...(request.extra || {}),
+    ...(extra || {}),
   };
 
   // In server mode, tag the run's config with its artifact identity so the

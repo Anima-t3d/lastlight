@@ -844,6 +844,9 @@ autonomy:
       # the run's effective approval map: this block can turn a gate ON that the
       # workflow left off, never off one the operator's `approval:` block asked
       # for. The names are the gates `workflows/build.yaml` already declares.
+      # The one exception is the dashboard's per-repo Approvals toggle: for a
+      # skip-listed repo, a stage build runs with these gate NAMES off, whatever
+      # turned them on (`approval:`, APPROVAL_GATES or the repo's layer).
       gates:
         post_architect: true
         post_reviewer: true

@@ -409,4 +409,78 @@ describe("a stage build keeps its creation-time approval policy across queue and
     expect(await state(runId)).toEqual({ status: "succeeded", pending: undefined });
     expect(prompts()).toEqual(["architect gate=false", "reviewer gate=false", "pr gate=false"]);
   });
+
+  // ── Server-owned keys: a dispatch cannot supply `_stageGates` or `autonomyMerge` ──
+  //
+  // `/api/run` passes `body.context` through as `extra`, and the run context is
+  // built by spreading it. The persisted policy must only ever be the server's.
+
+  const FORGED_GATES = { _stageGates: { post_architect: false, post_reviewer: false, pre_pr: false } };
+  const FORGED_MERGE = { autonomyMerge: { configured: "gate", effective: "gate", auto: false, gate: true } };
+
+  it("a forged `_stageGates` (no `_stage`) on a queued run has no effect: the base map gates it", async () => {
+    const runId = await queueBuild(FORGED_GATES, ENV_GATES);
+    expect((await db.runs.getRun(runId))?.context?._stageGates).toBeUndefined();
+    await admit(runId, ENV_GATES);
+    expect(await state(runId)).toEqual({ status: "paused", pending: "post_architect" });
+  });
+
+  it("a forged `_stageGates` stored at creation has no effect on the approval re-dispatch", async () => {
+    issue++;
+    await dispatch(FORGED_GATES, ENV_GATES, 5);
+    const [run] = await db.runs.listRecent(1);
+    expect(await state(run!.id)).toEqual({ status: "paused", pending: "post_architect" });
+    // …and one supplied on the re-dispatch itself is ignored too.
+    const pending = await db.approvals.getPendingForWorkflow(run!.id);
+    await db.runs.resolveGateAndResume(pending!.id, "alice");
+    await dispatch({ ...APPROVAL_REDISPATCH, ...FORGED_GATES }, ENV_GATES, 5);
+    expect(await state(run!.id)).toEqual({ status: "paused", pending: "post_reviewer" });
+  });
+
+  it("a forged `autonomyMerge` on a human build is ignored, direct and queued", async () => {
+    mergeGateConfig();
+    issue++;
+    await dispatch(FORGED_MERGE, {}, 5);
+    const [direct] = await db.runs.listRecent(1);
+    expect(direct?.context?.autonomyMerge).toMatchObject({ effective: "none", gate: false });
+    expect(prompts()).toEqual(["architect gate=false", "reviewer gate=false", "pr gate=false"]);
+
+    mockExecuteAgent.mockClear();
+    const queued = await queueBuild(FORGED_MERGE, {});
+    await admit(queued, {});
+    expect(prompts()).toEqual(["architect gate=false", "reviewer gate=false", "pr gate=false"]);
+  });
+
+  it("a bare `_autonomyGates` (no `_stage`) naming pre_pr in a skip-listed repo turns nothing off", async () => {
+    setStoredApprovalSkipRepos({ repos: [REPO] });
+    const operator = { ...ENV_GATES, pre_pr: true };
+    const runId = await queueBuild({ _autonomyGates: { pre_pr: true } }, operator);
+    await admit(runId, operator);
+    expect(await state(runId)).toEqual({ status: "paused", pending: "post_architect" });
+    await approveAndRedispatch(runId, operator);
+    expect(await state(runId)).toEqual({ status: "paused", pending: "post_reviewer" });
+    await approveAndRedispatch(runId, operator);
+    expect(await state(runId)).toEqual({ status: "paused", pending: "pre_pr" });
+  });
+
+  it("a legacy row (no persisted policy) keeps today's behaviour: decided from its stored markers", async () => {
+    setStoredApprovalSkipRepos({ repos: [REPO] });
+    mergeGateConfig();
+    // A queued row as the pre-fix code wrote it: `...request.extra` only.
+    await db.runs.createRun({
+      id: "legacy-1",
+      workflowName: "build",
+      triggerId: `${REPO}#99`,
+      owner: "acme",
+      repo: "widgets",
+      issueNumber: 99,
+      currentPhase: "architect",
+      status: "queued",
+      context: { kind: "build", owner: "acme", ...STAGE_BUILD },
+      startedAt: new Date().toISOString(),
+    });
+    await admit("legacy-1", ENV_GATES);
+    expect(await state("legacy-1")).toEqual({ status: "succeeded", pending: undefined });
+    expect(prompts()).toEqual(["architect gate=true", "reviewer gate=true", "pr gate=true"]);
+  });
 });

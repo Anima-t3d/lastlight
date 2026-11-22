@@ -81,6 +81,37 @@ export interface StageGateDecision {
   isStageRun: boolean;
 }
 
+/**
+ * The run-context keys only the server writes. A dispatch's `extra` is spread
+ * into the run row and the template context, and `/api/run` passes its
+ * `body.context` through as `extra` — so a caller could otherwise supply the
+ * policy a later start trusts. {@link dispatchExtra} strips them.
+ */
+export const SERVER_OWNED_RUN_KEYS: readonly string[] = [STAGE_GATES_KEY, "autonomyMerge"];
+
+/** The dispatch's `extra` without {@link SERVER_OWNED_RUN_KEYS}; by identity when it has none. */
+export function dispatchExtra(
+  extra: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!extra || !SERVER_OWNED_RUN_KEYS.some((k) => k in extra)) return extra;
+  const out = { ...extra };
+  for (const k of SERVER_OWNED_RUN_KEYS) delete out[k];
+  return out;
+}
+
+/**
+ * The policy keys a NEW run's context is created with — always both, always
+ * the server's own decision: the stage-gate leaves (`undefined`, so absent, for
+ * a run that is not a stage run) and the merge policy (the inert one for a
+ * human build). Spread AFTER the dispatch's `extra`.
+ */
+export function runPolicyContext(
+  decision: StageGateDecision,
+  autonomyMerge: AutonomyMergeContext,
+): Record<string, unknown> {
+  return { [STAGE_GATES_KEY]: decision.isStageRun ? decision.gates : undefined, autonomyMerge };
+}
+
 function stageName(extra: Record<string, unknown> | undefined): string | undefined {
   const stage = extra?._stage;
   return typeof stage === "string" && stage.trim() !== "" ? stage : undefined;
@@ -93,38 +124,37 @@ function isPlainMap(raw: unknown): raw is Record<string, unknown> {
 /**
  * Decide the stage gates for a run being CREATED.
  *
+ * Only an autonomous stage dispatch (`_stage` set) gets any: a bare
+ * `_autonomyGates` with no `_stage` is not one, and is ignored.
+ *
  * Not skip-listed: the `true` leaves of the dispatch's `_autonomyGates`.
  * Skip-listed (and on the autonomy list, like the merge list): every gate name
- * the stage declares, set `false`. The names are the keys of `_autonomyGates`
- * — the stage's `gates` map as the build gate stamped it — or, for a stage
- * dispatch that carried none, of the stage's configured `gates`.
+ * the stage declares in the OPERATOR's config (`autonomy.stages.<stage>.gates`
+ * keys), set `false`. The names never come from the dispatch, so a dispatch
+ * cannot widen what the skip turns off.
  */
 export function decideStageGates(
   extra: Record<string, unknown> | undefined,
   repo: string,
 ): StageGateDecision {
   const stage = stageName(extra);
-  const isStageRun = stage !== undefined || extra?._autonomyGates !== undefined;
-  if (!isStageRun) return { gates: {}, skipped: [], isStageRun };
+  if (stage === undefined) return { gates: {}, skipped: [], isStageRun: false };
 
   const skip = isApprovalSkipRepo(repo) && isAutonomousRepo(repo);
-  if (!skip) return { gates: enabledGatesFrom(extra?._autonomyGates), skipped: [], isStageRun };
+  if (!skip) return { gates: enabledGatesFrom(extra?._autonomyGates), skipped: [], isStageRun: true };
 
-  const declared = isPlainMap(extra?._autonomyGates)
-    ? extra._autonomyGates
-    : stage !== undefined
-      ? getAutonomyConfig().stages[stage]?.gates
-      : undefined;
+  const declared = getAutonomyConfig().stages[stage]?.gates;
   const names = isPlainMap(declared) ? Object.keys(declared) : [];
-  return { gates: Object.fromEntries(names.map((n) => [n, false])), skipped: names, isStageRun };
+  return { gates: Object.fromEntries(names.map((n) => [n, false])), skipped: names, isStageRun: true };
 }
 
 /**
  * The stage gates of a run that ALREADY EXISTS, read from its stored context:
- * the persisted creation-time decision when present (boolean leaves only — it
- * is this module's own output). A row written before the decision was
- * persisted falls back to deciding from its stored markers now — the best
- * answer such a row allows.
+ * the persisted creation-time decision when present (boolean leaves only). It
+ * is trusted because only {@link runPolicyContext} writes it — the dispatch's
+ * copy is stripped by {@link dispatchExtra}. A row with no persisted decision (a
+ * non-stage run, or a row written before the key existed) is decided from its
+ * stored markers now — `{}` for a non-stage run, the best answer for a legacy one.
  */
 export function storedStageGates(stored: Record<string, unknown>, repo: string): Record<string, boolean> {
   const persisted = stored[STAGE_GATES_KEY];
@@ -150,9 +180,9 @@ export function decideAutonomyMerge(
 
 /**
  * The merge policy of a run that ALREADY EXISTS: the persisted creation-time
- * value when well-formed, else resolved from the row's stored dispatch markers
- * (a row written before the value was persisted, or a human build, which
- * resolves to the inert policy).
+ * value (only the server writes it — see {@link dispatchExtra}) when
+ * well-formed, else resolved from the row's stored dispatch markers (a row
+ * written before the value was persisted).
  */
 export function storedAutonomyMerge(stored: Record<string, unknown>, repo: string): AutonomyMergeContext {
   return parseAutonomyMerge(stored.autonomyMerge) ?? decideAutonomyMerge(stored, repo);

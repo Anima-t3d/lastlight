@@ -38,7 +38,7 @@ import {
   mergeConfigForLayer,
 } from "../config/config.js";
 import { refreshRepoLayer, unappliedRepoConfigFile, type RepoLayer } from "../config/repo-config.js";
-import { resolveAutonomyMerge } from "../workflows/autonomy-merge.js";
+import { persistedMergeGate, resolveAutonomyMerge } from "../workflows/autonomy-merge.js";
 import { BUILD_WORKFLOW, readBuildReview, type BuildReviewRecord } from "./build-review.js";
 import { issueTriggerId } from "./build-decisions.js";
 import { mayMergeBuild, type BuildMergeDecision } from "./merge-decisions.js";
@@ -217,7 +217,14 @@ async function evaluateOnce(
   ]);
 
   const state = snapshot(repo, prNumber, pr, deps.botLogin, checks);
-  const mergeEnabled = resolveAutonomyMerge(run.context, getAutonomyConfig().stages, mergeListed).gate;
+  // Both must say gate: the policy the run was CREATED with (persisted on its
+  // context), and the live lists + `on_merge` right now. The persisted half
+  // stops a run created as a non-gate run (repo not yet on Merges) from becoming
+  // a gate merge after a later toggle; the live half is the operator's off
+  // switch. A legacy row with no persisted `autonomyMerge` key at all predates
+  // the value and keeps the live-only decision it always had.
+  const liveGate = resolveAutonomyMerge(run.context, getAutonomyConfig().stages, mergeListed).gate;
+  const mergeEnabled = liveGate && (persistedMergeGate(run.context) ?? true);
   const decided = mayMergeBuild(
     {
       state,

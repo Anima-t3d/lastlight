@@ -105,3 +105,15 @@ export function parseAutonomyMerge(raw: unknown): AutonomyMergeContext | undefin
   if (v.auto !== (v.effective === "auto") || v.gate !== (v.effective === "gate")) return undefined;
   return { configured: v.configured, effective: v.effective, auto: v.auto, gate: v.gate };
 }
+
+/**
+ * What a run's PERSISTED merge policy says about the merge gate: `true` / `false`
+ * from a well-formed value, `false` from a malformed one (anything that is not
+ * exactly the server's own shape fails toward "a human merges it"), and
+ * `undefined` only for a LEGACY row with no `autonomyMerge` key at all, which
+ * predates the persisted value and keeps the executor's live-only decision.
+ */
+export function persistedMergeGate(context: Record<string, unknown> | undefined): boolean | undefined {
+  if (!context || !("autonomyMerge" in context)) return undefined;
+  return parseAutonomyMerge(context.autonomyMerge)?.gate === true;
+}

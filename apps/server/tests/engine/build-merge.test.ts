@@ -666,6 +666,48 @@ describe("evaluateBuildMerge — waits and the ledger", () => {
     expect(github.mergePullRequest).not.toHaveBeenCalled();
   });
 
+  // The run's persisted merge policy (`autonomyMerge`, written at creation) AND
+  // the live lists + `on_merge` must both say gate.
+  const STAGE_CTX = { _stage: "ready-for-agent", _autonomous: true, branch: "lastlight/3-widgets" };
+  const GATE = { configured: "gate", effective: "gate", auto: false, gate: true };
+  const NOT_GATE = { configured: "gate", effective: "none", auto: false, gate: false };
+
+  it("a run created as a non-gate run is not gate-merged after its repo joins Merges", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db, { context: { ...STAGE_CTX, autonomyMerge: NOT_GATE } });
+    const github = fakeGithub();
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(res.reason).toMatch(/^merge-disabled:/);
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+  });
+
+  it("a run created as a gate run merges while the live lists and on_merge still say gate", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db, { context: { ...STAGE_CTX, autonomyMerge: GATE } });
+    const github = fakeGithub();
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(res).toMatchObject({ decision: "merge", outcome: "merged" });
+  });
+
+  it("a run created as a gate run does not merge once on_merge is no longer gate", async () => {
+    setRuntimeConfig(config("none"));
+    const db = await makeTestDb();
+    await seedBuildRun(db, { context: { ...STAGE_CTX, autonomyMerge: GATE } });
+    const github = fakeGithub();
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(res.reason).toMatch(/^merge-disabled:/);
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+  });
+
+  it("a malformed persisted autonomyMerge never merges (it is not a legacy row)", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db, { context: { ...STAGE_CTX, autonomyMerge: { gate: true } } });
+    const github = fakeGithub();
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(res.reason).toMatch(/^merge-disabled:/);
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+  });
+
   it("a stage whose on_merge is not gate does not merge", async () => {
     setRuntimeConfig(config("none"));
     const db = await makeTestDb();

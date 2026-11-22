@@ -635,7 +635,11 @@ async function runWorkflowBody(
    * Should an approval gate with this name actually pause the workflow?
    * Reads the EFFECTIVE map, so a repo that raised a gate for runs against
    * itself pauses here. The repo layer is add-only (enforced in
-   * `config/repo-config.ts`), so this can never drop an operator's gate.
+   * `config/repo-config.ts`), so it can never drop an operator's gate. The one
+   * thing that can is the per-repo Approvals skip list: for an autonomous stage
+   * build in a skip-listed repo, the stage's own gate names arrive here `false`
+   * whatever set them (`workflows/stage-approval.ts`); every other gate is the
+   * operator ⊕ repo map.
    */
   const gateEnabled = (gateName: string | undefined): boolean =>
     !!gateName && effectiveApproval?.[gateName] === true;
