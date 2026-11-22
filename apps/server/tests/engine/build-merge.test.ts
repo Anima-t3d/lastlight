@@ -369,6 +369,22 @@ describe("evaluateBuildMerge — hand-off", () => {
     expect(body).toContain("`protected-path: .github/'@team' x.yml is protected`");
   });
 
+  it("the build's own .lastlight/issue-<N>/ notes merge; another issue's dir hands off", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const own = fakeGithub({ files: ["src/a.ts", `.lastlight/issue-${ISSUE}/status.md`] });
+    const ok = await evaluateBuildMerge({ github: own as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(ok.decision).toBe("merge");
+
+    const db2 = await makeTestDb();
+    await seedBuildRun(db2);
+    const other = fakeGithub({ files: ["src/a.ts", `.lastlight/issue-${ISSUE + 1}/status.md`] });
+    const res = await evaluateBuildMerge({ github: other as any, db: db2, botLogin: BOT }, REPO, PR, "sweep");
+    expect(res.decision).toBe("hand-off");
+    expect(res.reason).toBe(`protected-path: .lastlight/issue-${ISSUE + 1}/status.md is protected`);
+    expect(other.mergePullRequest).not.toHaveBeenCalled();
+  });
+
   it("a failed hand-off comment is retried on the next evaluation", async () => {
     const db = await makeTestDb();
     await seedBuildRun(db);

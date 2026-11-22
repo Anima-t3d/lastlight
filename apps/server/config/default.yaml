@@ -935,7 +935,8 @@ dependencies:
 merge:
   method: squash
   minSettledChecks: 1          # the gate needs >= N settled checks on the head SHA
-  protectedPaths:              # a PR touching any of these is never gate-merged
+  protectedPaths:              # a PR touching any of these is never gate-merged. The build's
+                               # own `.lastlight/issue-N/` run notes (N = its issue) are exempt.
     - ".github/**"
     - ".lastlight/**"
     - "**/CODEOWNERS"

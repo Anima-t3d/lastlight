@@ -27,6 +27,11 @@ export interface BuildMergeInputs {
   review: BuildReviewRecord | null;
   /** Changed paths incl. previous names; `null` = completeness unconfirmed. */
   changedPaths: readonly string[] | null;
+  /**
+   * The issue whose build run recorded the review. Its own artifact dir,
+   * `.lastlight/issue-<issueNumber>/`, is exempt from protected-path matching.
+   */
+  issueNumber: number;
   prLabels: readonly string[];
   /** Live labels of the closing issue the build ran for. A hold there holds the PR too. */
   issueLabels: readonly string[];
@@ -126,8 +131,18 @@ export function mayMergeBuild(
   if (i.changedPaths === null) {
     return out("hand-off", "paths-unknown: the changed-file list could not be confirmed complete");
   }
+  // The build commits its own run notes under `.lastlight/issue-<N>/`, which
+  // the default `.lastlight/**` pattern would otherwise protect, so no build PR
+  // could ever merge. Exempt exactly that dir by excluding its paths from
+  // `changedPaths` BEFORE matching (so it holds for every pattern, a repo's own
+  // added ones included). `changedPaths` is a flat list that already carries
+  // each rename's previous name, so a rename of a protected file into the dir
+  // still leaves the protected previous path to match.
+  const ownDir = `.lastlight/issue-${i.issueNumber}/`;
   const globs = cfg.protectedPaths.map(globToRegExp);
-  const hit = i.changedPaths.find((p) => globs.some((g) => g.test(p)));
+  const hit = i.changedPaths
+    .filter((p) => !(p.startsWith(ownDir) && p.length > ownDir.length))
+    .find((p) => globs.some((g) => g.test(p)));
   if (hit !== undefined) {
     inputs.protectedPath = hit;
     return out("hand-off", `protected-path: ${hit} is protected`);

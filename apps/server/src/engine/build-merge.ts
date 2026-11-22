@@ -223,6 +223,7 @@ async function evaluateOnce(
       state,
       review,
       changedPaths,
+      issueNumber,
       prLabels: state.labels,
       issueLabels: labelNames(issue?.labels),
       holdLabel: getHoldLabel(),
