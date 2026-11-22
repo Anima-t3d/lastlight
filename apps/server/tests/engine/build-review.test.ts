@@ -7,6 +7,7 @@ import { join } from "node:path";
 import type { WorkflowRun } from "#src/state/workflow-run-store.js";
 import {
   BUILD_REVIEW_SCRATCH_KEY,
+  captureWorkspaceHead,
   finalizeBuildReview,
   finalizeBuildReviewForRun,
   readWorkspaceHead,
@@ -14,6 +15,14 @@ import {
   recordBuildReview,
 } from "#src/engine/build-review.js";
 import { REVIEW_CHECK_NAME } from "#src/engine/review-check.js";
+import { MERGE_DECISIONS_SCRATCH_KEY } from "#src/engine/build-merge-ledger.js";
+import {
+  resetRuntimeConfigForTests,
+  setAutonomyReposOverride,
+  setMergeReposOverride,
+  setRuntimeConfig,
+  type LastLightConfig,
+} from "#src/config/config.js";
 import { logger } from "#src/logging/logger.js";
 
 // The merge executor is exercised in build-merge.test.ts; here only the hook's
@@ -39,6 +48,7 @@ function fakeDb() {
       mergeScratch: vi.fn(async (_id: string, patch: Record<string, unknown>) => {
         Object.assign(scratch, patch);
       }),
+      getRun: vi.fn(async (id: string) => ({ id, scratch: structuredClone(scratch) })),
     },
   } as any;
 }
@@ -57,6 +67,7 @@ function fakeGithub(over: Record<string, unknown> = {}) {
     getPullRequest: vi.fn().mockResolvedValue(pr()),
     getDefaultBranch: vi.fn().mockResolvedValue("main"),
     createCheckRun: vi.fn().mockResolvedValue(7),
+    postComment: vi.fn().mockResolvedValue(1),
     ...over,
   } as any;
 }
@@ -489,5 +500,152 @@ describe("finalizeBuildReviewForRun — the build-finished merge trigger", () =>
     await vi.waitFor(() => expect(evaluateMerge).toHaveBeenCalled());
     await flush();
     expect(rec?.verdict).toBe("APPROVED");
+  });
+});
+
+describe("captureWorkspaceHead names the refusal", () => {
+  it("returns the sha of a clean checkout", () => {
+    const sandboxDir = mkdtempSync(join(tmpdir(), "bw-"));
+    const repoDir = join(sandboxDir, "t1", "r");
+    mkdirSync(repoDir, { recursive: true });
+    const git = (...a: string[]) => execFileSync("git", ["-C", repoDir, ...a], { encoding: "utf8" }).trim();
+    git("init", "-q");
+    writeFileSync(join(repoDir, "f"), "x");
+    git("add", "f");
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c");
+    expect(captureWorkspaceHead({ sandboxDir }, "t1", "o", "r")).toEqual({ sha: git("rev-parse", "HEAD") });
+    writeFileSync(join(repoDir, "f"), "dirty");
+    expect(captureWorkspaceHead({ sandboxDir }, "t1", "o", "r")).toEqual({ refused: "dirty-tree" });
+  });
+
+  it("returns no-checkout when there is no checkout", () => {
+    expect(captureWorkspaceHead({ sandboxDir: mkdtempSync(join(tmpdir(), "bw-")) }, "t1", "o", "r")).toEqual({
+      refused: "no-checkout",
+    });
+  });
+});
+
+describe("finalizeBuildReviewForRun — a gate run whose approval cannot be recorded (I4a)", () => {
+  const gateCtx = {
+    owner: "o", repo: "r", branch: "lastlight/1-x", issueDir: ".lastlight/issue-1",
+    externalizeArtifacts: true, publicUrl: "https://dash",
+    autonomyMerge: { configured: "gate", effective: "gate", auto: false, gate: true },
+  } as any;
+  const approvedDirty = { success: true, prNumber: 9, review: { approved: true, cycles: 0, headRefusal: "dirty-tree" } };
+  const finalize = (db: any, github: any, over: Record<string, unknown> = {}) =>
+    finalizeBuildReviewForRun(
+      { workflowName: "build", result: approvedDirty, ctx: gateCtx, runId: "run-1", ...over } as any,
+      { db, github: () => github, ...botDeps },
+    );
+
+  beforeEach(() => {
+    evaluateMerge.mockReset();
+  });
+
+  it("posts one comment naming the refusal code, and a second finalize does not repeat it", async () => {
+    const db = fakeDb();
+    const github = fakeGithub();
+    expect(await finalize(db, github)).toBeNull();
+    expect(await finalize(db, github)).toBeNull();
+    expect(github.postComment).toHaveBeenCalledTimes(1);
+    const [owner, repo, number, body] = github.postComment.mock.calls[0];
+    expect([owner, repo, number]).toEqual(["o", "r", 9]);
+    expect(body).toContain("`approval-unrecorded: dirty-tree`");
+    expect(body).toMatch(/a human will need to merge/i);
+    const ledger = db.scratch[MERGE_DECISIONS_SCRATCH_KEY] as any[];
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({
+      trigger: "build-finished", decision: "hand-off", headSha: "head-after-push", commented: true,
+    });
+    expect(db.scratch[BUILD_REVIEW_SCRATCH_KEY]).toBeUndefined();
+    expect(evaluateMerge).not.toHaveBeenCalled();
+  });
+
+  it("a new PR head gets its own comment", async () => {
+    const db = fakeDb();
+    const github = fakeGithub();
+    await finalize(db, github);
+    github.getPullRequest.mockResolvedValue(pr({ head: { ref: "lastlight/1-x", sha: "newer", repo: { full_name: "o/r" } } }));
+    await finalize(db, github);
+    expect(github.postComment).toHaveBeenCalledTimes(2);
+  });
+
+  it("names the S2 mismatch when the PR head is not the reviewed commit", async () => {
+    const db = fakeDb();
+    const github = fakeGithub();
+    await finalize(db, github, {
+      result: { success: true, prNumber: 9, review: { approved: true, headSha: "reviewed-earlier" } },
+    });
+    expect(github.postComment).toHaveBeenCalledTimes(1);
+    expect(github.postComment.mock.calls[0][3]).toContain("`approval-unrecorded: head-not-reviewed`");
+  });
+
+  it("names an S1 mismatch on the bot's own PR", async () => {
+    const db = fakeDb();
+    const github = fakeGithub({ getPullRequest: vi.fn().mockResolvedValue(pr({ base: { ref: "release" } })) });
+    await finalize(db, github);
+    expect(github.postComment.mock.calls[0][3]).toContain("`approval-unrecorded: base-not-default`");
+  });
+
+  it("never comments on a PR another account opened", async () => {
+    const db = fakeDb();
+    const github = fakeGithub({ getPullRequest: vi.fn().mockResolvedValue(pr({ user: { login: "mallory" } })) });
+    await finalize(db, github);
+    expect(github.postComment).not.toHaveBeenCalled();
+  });
+
+  it("an unknown capture refusal is reported as no-capture, never as agent text", async () => {
+    const db = fakeDb();
+    const github = fakeGithub();
+    await finalize(db, github, {
+      result: { success: true, prNumber: 9, review: { approved: true, headRefusal: "@team please merge" } },
+    });
+    const body = github.postComment.mock.calls[0][3] as string;
+    expect(body).toContain("`approval-unrecorded: no-capture`");
+    expect(body).not.toContain("@team");
+  });
+
+  it("stays silent on a run the merge gate does not own", async () => {
+    const db = fakeDb();
+    const github = fakeGithub();
+    await finalize(db, github, { ctx: { ...gateCtx, autonomyMerge: { gate: false } } });
+    expect(github.postComment).not.toHaveBeenCalled();
+  });
+
+  it("stays silent when REQUEST_CHANGES is refused", async () => {
+    const db = fakeDb();
+    const github = fakeGithub({ getPullRequest: vi.fn().mockResolvedValue(pr({ base: { ref: "release" } })) });
+    await finalize(db, github, { result: { success: true, prNumber: 9, review: { approved: false } } });
+    expect(github.postComment).not.toHaveBeenCalled();
+  });
+
+  it("never throws when the comment or the ledger write fails", async () => {
+    const db = fakeDb();
+    db.runs.getRun.mockRejectedValue(new Error("db gone"));
+    const github = fakeGithub({ postComment: vi.fn().mockRejectedValue(new Error("502")) });
+    await expect(finalize(db, github)).resolves.toBeNull();
+  });
+
+  it("a resumed gate run (stage marker, no autonomyMerge on the context) still comments", async () => {
+    setRuntimeConfig({
+      autonomy: {
+        repos: ["o/r"],
+        stages: { "ready-for-agent": { enter: "ready-for-agent", workflow: "build", gates: {}, on_merge: "gate" } },
+        budget: {},
+      },
+    } as unknown as LastLightConfig);
+    setAutonomyReposOverride(["o/r"]);
+    setMergeReposOverride(["o/r"]);
+    try {
+      const db = fakeDb();
+      const github = fakeGithub();
+      const { autonomyMerge: _drop, ...resumed } = gateCtx;
+      await finalize(db, github, { ctx: { ...resumed, _stage: "ready-for-agent" } });
+      expect(github.postComment).toHaveBeenCalledTimes(1);
+    } finally {
+      resetRuntimeConfigForTests();
+      setMergeReposOverride(null);
+      setAutonomyReposOverride(null);
+    }
   });
 });

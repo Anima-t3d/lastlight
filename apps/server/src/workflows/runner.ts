@@ -59,7 +59,7 @@ import { collapseDetail } from "../notify/render.js";
 import { markRunLive } from "./live-runs.js";
 import { nextNotBefore } from "./usage-wait.js";
 import { PhaseRef } from "./phase-ref.js";
-import { readWorkspaceHead } from "../engine/build-review.js";
+import { captureWorkspaceHead, type CaptureRefusal } from "../engine/build-review.js";
 
 // `isTerminated` used to live here; re-exported for API stability.
 export { isTerminated };
@@ -451,14 +451,18 @@ async function runWorkflowBody(
   // anything the reviewer never saw. See `engine/build-review.ts`.
   const reviewerLoop = definition.phases.find((p) => p.output_var === "review" && p.loop);
   let reviewedHead: string | undefined;
+  // Why the last pass's commit was not captured, so a refusal can name it.
+  let reviewedHeadRefusal: CaptureRefusal | undefined;
   const onEnd = async (phase: string, result: PhaseResult): Promise<void> => {
     await callbackOnEnd(phase, result);
     if (!reviewerLoop) return;
     const ref = PhaseRef.parse(phase);
     if (ref.base !== reviewerLoop.name || (ref.kind !== "phase" && ref.kind !== "recheck")) return;
-    reviewedHead = result.success
-      ? readWorkspaceHead(config, taskId, String(ctx.owner), String(ctx.repo))
+    const got = result.success
+      ? captureWorkspaceHead(config, taskId, String(ctx.owner), String(ctx.repo))
       : undefined;
+    reviewedHead = got && "sha" in got ? got.sha : undefined;
+    reviewedHeadRefusal = got && "refused" in got ? got.refused : undefined;
   };
 
   // Terminal step key — dynamic loop steps (re-review / fix cycles) are
@@ -819,7 +823,14 @@ async function runWorkflowBody(
     // so the caller that owns the GitHub client can record the build review
     // (`engine/build-review.ts`). Absent for every workflow without one.
     const withReview = outputs.review
-      ? { ...result, review: { ...(outputs.review as object), headSha: reviewedHead } }
+      ? {
+          ...result,
+          review: {
+            ...(outputs.review as object),
+            headSha: reviewedHead,
+            ...(reviewedHeadRefusal ? { headRefusal: reviewedHeadRefusal } : {}),
+          },
+        }
       : result;
     return quota.hit ? { ...withReview, backpressure: true, ...(quota.notBefore ? { notBefore: quota.notBefore } : {}) } : withReview;
   } catch (err) {

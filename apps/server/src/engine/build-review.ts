@@ -22,6 +22,9 @@ import { dirname, join, resolve } from "node:path";
 import type { ExecutorConfig } from "lastlight-workflow-engine";
 import { hostGit, sanitizeCheckout } from "./host-git.js";
 import { REVIEW_CHECK_NAME } from "./review-check.js";
+import { appendDecision, hasCommented } from "./build-merge-ledger.js";
+import { getAutonomyConfig, isAutonomousRepo, isMergeRepo } from "../config/config.js";
+import { resolveAutonomyMerge } from "../workflows/autonomy-merge.js";
 import { logger } from "../logging/logger.js";
 
 const log = logger("build-review");
@@ -68,6 +71,35 @@ export async function recordBuildReview(
   await db.runs.mergeScratch(runId, { [BUILD_REVIEW_SCRATCH_KEY]: rec });
 }
 
+/** Why {@link captureWorkspaceHead} would not vouch for the reviewer's commit. */
+export const CAPTURE_REFUSALS = [
+  "dirty-tree",
+  "no-commit",
+  "no-checkout",
+  "submodules",
+  "index-flags",
+  "temp-index",
+] as const;
+export type CaptureRefusal = (typeof CAPTURE_REFUSALS)[number];
+
+/**
+ * Why an APPROVED verdict was not recorded: a fixed code, never agent text. The
+ * capture codes come from {@link captureWorkspaceHead}; `no-capture` is a
+ * missing capture with no known cause (a failed review pass, a resume).
+ */
+export type ApprovalRefusal =
+  | CaptureRefusal
+  | "no-capture"
+  | "no-branch"
+  | "no-bot-login"
+  | "no-head-sha"
+  | "head-ref-mismatch"
+  | "fork-head"
+  | "author-mismatch"
+  | "base-not-default"
+  | "head-not-reviewed"
+  | "record-failed";
+
 export interface FinalizeBuildReviewArgs {
   runId: string;
   owner: string;
@@ -81,6 +113,14 @@ export interface FinalizeBuildReviewArgs {
   branch: string;
   /** The workspace HEAD the reviewer's final pass reviewed. */
   reviewedHeadSha?: string;
+  /** Why the reviewed HEAD was not captured, when it was not. */
+  reviewedHeadRefusal?: CaptureRefusal;
+  /**
+   * The merge gate owns this run's PR (`autonomyMerge.gate`). An approval that
+   * cannot be recorded then gets one PR comment, because the gate can never
+   * merge it and would otherwise say nothing.
+   */
+  gateRun?: boolean;
 }
 
 /**
@@ -101,6 +141,10 @@ export interface FinalizeBuildReviewArgs {
  * Never throws: a failure to record or post must not fail a run that already
  * succeeded. The gate fails closed on a missing record. The record is written
  * before the check is posted, so a failed post still leaves the gate its evidence.
+ *
+ * On a gate run, an APPROVED verdict that is refused gets one PR comment per
+ * (PR, head) naming the refusal code, so a human knows the gate will not merge
+ * it ({@link commentApprovalRefused}).
  */
 export async function finalizeBuildReview(
   args: FinalizeBuildReviewArgs,
@@ -110,29 +154,44 @@ export async function finalizeBuildReview(
   if (!github || !args.prNumber) return null;
   const verdict = args.approved ? "APPROVED" : "REQUEST_CHANGES";
   const ctx = { runId: args.runId, prNumber: args.prNumber };
-  try {
-    const refuse = (reason: string): null => {
-      log.warn("Not recording build review", { ...ctx, reason });
-      return null;
-    };
-    if (!args.branch) return refuse("the run's branch is unknown");
-    if (!deps.botLogin) return refuse("the bot login is unknown");
-    const pr = await github.getPullRequest(args.owner, args.repo, args.prNumber);
-    if (pr.head?.ref !== args.branch) return refuse(`PR head ref ${pr.head?.ref} is not the run branch ${args.branch}`);
-    if (pr.head?.repo?.full_name?.toLowerCase() !== `${args.owner}/${args.repo}`.toLowerCase()) {
-      return refuse(`PR head repo ${pr.head?.repo?.full_name} is not ${args.owner}/${args.repo}`);
+  // What a refusal comment needs: the PR as read, when it was read.
+  let prRead: Awaited<ReturnType<GitHubClient["getPullRequest"]>> | undefined;
+  const refuse = async (code: ApprovalRefusal, reason: string): Promise<null> => {
+    log.warn("Not recording build review", { ...ctx, code, reason });
+    if (args.approved && args.gateRun) {
+      await commentApprovalRefused(args, { db, github, botLogin: deps.botLogin }, prRead, code);
     }
-    if (pr.user?.login !== deps.botLogin) return refuse(`PR author ${pr.user?.login} is not ${deps.botLogin}`);
+    return null;
+  };
+  try {
+    if (!args.branch) return await refuse("no-branch", "the run's branch is unknown");
+    if (!deps.botLogin) return await refuse("no-bot-login", "the bot login is unknown");
+    const pr = await github.getPullRequest(args.owner, args.repo, args.prNumber);
+    prRead = pr;
+    if (pr.head?.ref !== args.branch) {
+      return await refuse("head-ref-mismatch", `PR head ref ${pr.head?.ref} is not the run branch ${args.branch}`);
+    }
+    if (pr.head?.repo?.full_name?.toLowerCase() !== `${args.owner}/${args.repo}`.toLowerCase()) {
+      return await refuse("fork-head", `PR head repo ${pr.head?.repo?.full_name} is not ${args.owner}/${args.repo}`);
+    }
+    if (pr.user?.login !== deps.botLogin) {
+      return await refuse("author-mismatch", `PR author ${pr.user?.login} is not ${deps.botLogin}`);
+    }
     const defaultBranch = await github.getDefaultBranch(args.owner, args.repo);
     if (!defaultBranch || pr.base?.ref !== defaultBranch) {
-      return refuse(`PR base ${pr.base?.ref} is not the default branch ${defaultBranch}`);
+      return await refuse("base-not-default", `PR base ${pr.base?.ref} is not the default branch ${defaultBranch}`);
     }
     const reviewedSha = pr.head?.sha;
-    if (!reviewedSha) return refuse("the PR head SHA is unknown");
+    if (!reviewedSha) return await refuse("no-head-sha", "the PR head SHA is unknown");
     if (args.approved) {
-      if (!args.reviewedHeadSha) return refuse("no reviewed commit was captured for the approval");
+      if (!args.reviewedHeadSha) {
+        return await refuse(
+          args.reviewedHeadRefusal ?? "no-capture",
+          "no reviewed commit was captured for the approval",
+        );
+      }
       if (reviewedSha !== args.reviewedHeadSha) {
-        return refuse(`PR head ${reviewedSha} is not the reviewed commit ${args.reviewedHeadSha}`);
+        return await refuse("head-not-reviewed", `PR head ${reviewedSha} is not the reviewed commit ${args.reviewedHeadSha}`);
       }
     }
     const rec: BuildReviewRecord = {
@@ -161,8 +220,80 @@ export async function finalizeBuildReview(
     return rec;
   } catch (err: unknown) {
     log.warn("Failed to record build review", { ...ctx, err });
-    return null;
+    // `refuse` never throws, so this is a read or the record write.
+    return refuse("record-failed", "the PR or the record could not be read or written");
   }
+}
+
+/** The ledger reason case of an approval the gate could not bind. */
+const APPROVAL_UNRECORDED_CASE = "approval-unrecorded";
+
+/**
+ * One PR comment for a gate run whose APPROVED verdict was not recorded: the
+ * gate will never merge it, so a human must. Deduped per (PR, head) through
+ * the run's merge-decision ledger, the same mechanism the merge executor's
+ * hand-offs use. Only on the bot's own same-repo PR: the PR number is
+ * agent-supplied, and a refusal for a PR someone else opened must not comment
+ * there. Never throws.
+ */
+async function commentApprovalRefused(
+  args: FinalizeBuildReviewArgs,
+  deps: { db: StateDb; github: GitHubClient; botLogin?: string },
+  pr: Awaited<ReturnType<GitHubClient["getPullRequest"]>> | undefined,
+  code: ApprovalRefusal,
+): Promise<void> {
+  const ctx = { runId: args.runId, prNumber: args.prNumber, code };
+  try {
+    const headSha = pr?.head?.sha;
+    if (!pr || !headSha) return; // the PR could not be read: nowhere safe to say it
+    if (!deps.botLogin || pr.user?.login !== deps.botLogin) return;
+    if (pr.head?.repo?.full_name?.toLowerCase() !== `${args.owner}/${args.repo}`.toLowerCase()) return;
+    const reason = `${APPROVAL_UNRECORDED_CASE}: ${code}`;
+    const run = await deps.db.runs.getRun(args.runId);
+    if (run && hasCommented(run, headSha, reason)) return;
+    const body = [
+      "The merge gate will not merge this PR on its own: the build review approved it, but the " +
+        `approval could not be bound to the reviewed commit (\`${reason}\`).`,
+      "",
+      "A human will need to merge it, after checking the PR head is what the review approved.",
+      ...(args.verdictUrl ? ["", `Build review: [verdict](${args.verdictUrl})`] : []),
+    ].join("\n");
+    await deps.github.postComment(args.owner, args.repo, args.prNumber, body);
+    log.info("Gate run approval not recorded; handed to a human", { ...ctx, headSha });
+    if (run) {
+      await appendDecision(deps.db, run, {
+        trigger: "build-finished",
+        decision: "hand-off",
+        reason,
+        headSha,
+        commented: true,
+      });
+    }
+  } catch (err: unknown) {
+    log.warn("Failed to comment on an unrecorded gate approval", { ...ctx, err });
+  }
+}
+
+/**
+ * The merge gate owns this run's PR. A fresh dispatch carries
+ * `autonomyMerge.gate` on its context; a resumed one carries only the dispatch
+ * markers (`_stage`), so the policy is resolved from them the way the merge
+ * executor resolves it.
+ */
+function isGateRun(ctx: TemplateContext): boolean {
+  const projected = (ctx as Record<string, unknown>).autonomyMerge as { gate?: unknown } | undefined;
+  if (projected && typeof projected === "object") return projected.gate === true;
+  const repo = `${ctx.owner}/${ctx.repo}`;
+  return resolveAutonomyMerge(
+    ctx as Record<string, unknown>,
+    getAutonomyConfig().stages,
+    isMergeRepo(repo) && isAutonomousRepo(repo),
+  ).gate;
+}
+
+function captureRefusal(raw: unknown): CaptureRefusal | undefined {
+  if (raw === undefined) return undefined;
+  return (CAPTURE_REFUSALS as readonly unknown[]).includes(raw) ? (raw as CaptureRefusal) : undefined;
 }
 
 /** The build workflow, whose `reviewer` loop emits `output_var: review`. */
@@ -190,7 +321,7 @@ export async function finalizeBuildReviewForRun(
   const { result } = args;
   if (args.workflowName !== BUILD_WORKFLOW || !result.success || result.paused) return null;
   if (!result.prNumber) return null;
-  const review = result.review as { approved?: unknown; headSha?: unknown } | undefined;
+  const review = result.review as { approved?: unknown; headSha?: unknown; headRefusal?: unknown } | undefined;
   if (!review || typeof review.approved !== "boolean") return null;
   try {
     const artifact = renderTemplate("{{artifactUrl reviewer-verdict.md}}", args.ctx).trim();
@@ -205,6 +336,8 @@ export async function finalizeBuildReviewForRun(
         verdictUrl: artifact || args.runUrl || "",
         branch: typeof args.ctx.branch === "string" ? args.ctx.branch : "",
         reviewedHeadSha: typeof review.headSha === "string" && review.headSha ? review.headSha : undefined,
+        reviewedHeadRefusal: captureRefusal(review.headRefusal),
+        gateRun: isGateRun(args.ctx),
       },
       { db: deps.db, github, botLogin: deps.botLogin },
     );
@@ -275,10 +408,24 @@ export function readWorkspaceHead(
   owner: string,
   repo: string,
 ): string | undefined {
-  type Reason = "dirty-tree" | "no-commit" | "no-checkout" | "submodules" | "index-flags" | "temp-index";
-  const refuse = (reason: Reason, err?: unknown): undefined => {
+  const got = captureWorkspaceHead(config, taskId, owner, repo);
+  return "sha" in got ? got.sha : undefined;
+}
+
+/**
+ * {@link readWorkspaceHead} with the refusal named: `{ sha }`, or `{ refused }`
+ * carrying the fixed code the warning logged. The runner passes the code on, so
+ * a gate run's refusal comment can say why.
+ */
+export function captureWorkspaceHead(
+  config: Pick<ExecutorConfig, "sandboxDir" | "stateDir">,
+  taskId: string,
+  owner: string,
+  repo: string,
+): { sha: string } | { refused: CaptureRefusal } {
+  const refuse = (reason: CaptureRefusal, err?: unknown): { refused: CaptureRefusal } => {
     log.warn("Not capturing the reviewed commit", { taskId, repo: `${owner}/${repo}`, reason, ...(err ? { err } : {}) });
-    return undefined;
+    return { refused: reason };
   };
   const repoDir = resolve(config.sandboxDir || join(config.stateDir || "data", "sandboxes"), taskId, repo);
   if (!existsSync(join(repoDir, ".git"))) return refuse("no-checkout");
@@ -347,7 +494,7 @@ export function readWorkspaceHead(
     try {
       // Submodules were refused above; never recurse into one regardless.
       const status = ["-c", "submodule.recurse=false", "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=all"];
-      return run(status, indexFile).trim() === "" ? sha : refuse("dirty-tree");
+      return run(status, indexFile).trim() === "" ? { sha } : refuse("dirty-tree");
     } catch (err: unknown) {
       // git could not say whether the tree is clean: do not vouch for it.
       return refuse("dirty-tree", err);
