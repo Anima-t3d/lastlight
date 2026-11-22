@@ -594,6 +594,18 @@ describe("finalizeBuildReviewForRun — a gate run whose approval cannot be reco
     expect(github.postComment).not.toHaveBeenCalled();
   });
 
+  it("never comments on a bot PR whose head is not the run's branch (head-ref-mismatch)", async () => {
+    // The agent-supplied PR number points at a different bot PR: commenting
+    // there would hand the wrong PR to a human.
+    const db = fakeDb();
+    const github = fakeGithub({
+      getPullRequest: vi.fn().mockResolvedValue(pr({ head: { ref: "lastlight/7-other", sha: "other", repo: { full_name: "o/r" } } })),
+    });
+    expect(await finalize(db, github)).toBeNull();
+    expect(github.postComment).not.toHaveBeenCalled();
+    expect(db.scratch[MERGE_DECISIONS_SCRATCH_KEY]).toBeUndefined();
+  });
+
   it("an unknown capture refusal is reported as no-capture, never as agent text", async () => {
     const db = fakeDb();
     const github = fakeGithub();

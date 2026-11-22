@@ -232,9 +232,10 @@ const APPROVAL_UNRECORDED_CASE = "approval-unrecorded";
  * One PR comment for a gate run whose APPROVED verdict was not recorded: the
  * gate will never merge it, so a human must. Deduped per (PR, head) through
  * the run's merge-decision ledger, the same mechanism the merge executor's
- * hand-offs use. Only on the bot's own same-repo PR: the PR number is
- * agent-supplied, and a refusal for a PR someone else opened must not comment
- * there. Never throws.
+ * hand-offs use. Only on this build's own PR: the bot's, same-repo, with the
+ * run's branch as its head. The PR number is agent-supplied, so a refusal for
+ * a PR someone else opened, or for another bot PR (`head-ref-mismatch`), must
+ * not comment there; it logs a warning instead. Never throws.
  */
 async function commentApprovalRefused(
   args: FinalizeBuildReviewArgs,
@@ -246,8 +247,21 @@ async function commentApprovalRefused(
   try {
     const headSha = pr?.head?.sha;
     if (!pr || !headSha) return; // the PR could not be read: nowhere safe to say it
-    if (!deps.botLogin || pr.user?.login !== deps.botLogin) return;
-    if (pr.head?.repo?.full_name?.toLowerCase() !== `${args.owner}/${args.repo}`.toLowerCase()) return;
+    const ownPr =
+      !!deps.botLogin &&
+      pr.user?.login === deps.botLogin &&
+      pr.head?.repo?.full_name?.toLowerCase() === `${args.owner}/${args.repo}`.toLowerCase() &&
+      !!args.branch &&
+      pr.head?.ref === args.branch;
+    if (!ownPr) {
+      log.warn("Approval not recorded on a PR that is not this build's; not commenting", {
+        ...ctx,
+        headRef: pr.head?.ref,
+        branch: args.branch,
+        author: pr.user?.login,
+      });
+      return;
+    }
     const reason = `${APPROVAL_UNRECORDED_CASE}: ${code}`;
     const run = await deps.db.runs.getRun(args.runId);
     if (run && hasCommented(run, headSha, reason)) return;
