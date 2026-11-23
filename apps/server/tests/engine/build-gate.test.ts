@@ -52,14 +52,22 @@ const ISSUE = 412;
 const HOLD = "lastlight-ignore";
 
 /** A GitHub stand-in that records the two label writes the advance is made of. */
-function fakeGithub(over: { addLabels?: () => Promise<void>; live?: () => Promise<unknown> } = {}) {
+function fakeGithub(
+  over: {
+    addLabels?: () => Promise<void>;
+    live?: () => Promise<unknown>;
+    openPrs?: () => Promise<Array<{ number: number; headRef: string }>>;
+  } = {},
+) {
   const addLabels = vi.fn(async (_o: string, _r: string, _n: number, _names: string[]) => {
     if (over.addLabels) await over.addLabels();
   });
   const removeLabel = vi.fn(async () => {});
   const postComment = vi.fn(async () => 1);
   const getIssue = vi.fn(async () => (over.live ? over.live() : { labels: [], state: "open" }));
-  return { addLabels, removeLabel, postComment, getIssue } as unknown as GitHubClient & {
+  const listOpenPullRequests = vi.fn(async (_o: string, _r: string) => (over.openPrs ? over.openPrs() : []));
+  return { addLabels, removeLabel, postComment, getIssue, listOpenPullRequests } as unknown as GitHubClient & {
+    listOpenPullRequests: ReturnType<typeof vi.fn>;
     getIssue: ReturnType<typeof vi.fn>;
     addLabels: ReturnType<typeof vi.fn>;
     removeLabel: ReturnType<typeof vi.fn>;
@@ -788,5 +796,121 @@ describe("applyBuildDispatchGate — budget skip consequences", () => {
       // And the entry label stays on: the issue has not left the queue.
       expect(github.removeLabel).not.toHaveBeenCalled();
     }
+  });
+  describe("already handed off (stale ready-for-agent beside a hand-off, or an open build PR)", () => {
+    const noWrites = (github: ReturnType<typeof fakeGithub>) => {
+      expect(github.addLabels).not.toHaveBeenCalled();
+      expect(github.removeLabel).not.toHaveBeenCalled();
+      expect(github.postComment).not.toHaveBeenCalled();
+    };
+
+    it("skips `handed-off` an issue carrying ready-for-human beside a stale ready-for-agent, on every route", async () => {
+      for (const route of ["labeled", "sweep"] as const) {
+        const github = fakeGithub();
+        const result = await applyBuildDispatchGate(
+          args({ route, labels: [STAGE_READY_FOR_AGENT, STAGE_READY_FOR_HUMAN] }),
+          { db, github },
+        );
+        expect(result.decision).toBe("skip");
+        expect(result.reason).toMatch(/^handed-off:/);
+        noWrites(github);
+      }
+    });
+
+    it("matches the hand-off label case-insensitively", async () => {
+      const github = fakeGithub();
+      const result = await applyBuildDispatchGate(
+        args({ route: "sweep", labels: [STAGE_READY_FOR_AGENT, "Ready-For-Human"] }),
+        { db, github },
+      );
+      expect(result.decision).toBe("skip");
+      expect(result.reason).toMatch(/^handed-off:/);
+    });
+
+    it("skips `handed-off` an issue with an OPEN lastlight/<N>-… PR (factory-test #7 / #8)", async () => {
+      const github = fakeGithub({ openPrs: async () => [{ number: 8, headRef: `lastlight/${ISSUE}-fix-the-thing` }] });
+      const result = await applyBuildDispatchGate(args({ route: "sweep" }), { db, github });
+      expect(result.decision).toBe("skip");
+      expect(result.reason).toMatch(/^handed-off:/);
+      expect(result.reason).toContain("#8");
+      noWrites(github);
+    });
+
+    it("dispatches when the open PR is from another branch (incl. another issue's number prefix)", async () => {
+      const github = fakeGithub({
+        openPrs: async () => [
+          { number: 3, headRef: "feature/x" },
+          { number: 4, headRef: `lastlight/${ISSUE}0-other` },
+          { number: 5, headRef: `lastlight/${ISSUE}` },
+        ],
+      });
+      const result = await applyBuildDispatchGate(args({ route: "sweep" }), { db, github });
+      expect(result.decision).toBe("dispatch");
+    });
+
+    it("dispatches when the build PR is closed or merged (the lookup lists open PRs only)", async () => {
+      // `listOpenPullRequests` never returns a closed or merged PR, so a finished
+      // build's PR reads as an empty list.
+      const github = fakeGithub({ openPrs: async () => [] });
+      const result = await applyBuildDispatchGate(args({ route: "sweep" }), { db, github });
+      expect(result.decision).toBe("dispatch");
+      expect(github.listOpenPullRequests).toHaveBeenCalledWith("cliftonc", "lastlight");
+    });
+
+    it("skips, failing closed, when the PR lookup throws", async () => {
+      const github = fakeGithub({
+        openPrs: async () => {
+          throw new Error("github down");
+        },
+      });
+      const result = await applyBuildDispatchGate(args({ route: "sweep" }), { db, github });
+      expect(result.decision).toBe("skip");
+      expect(result.reason).toMatch(/^handed-off:/);
+      noWrites(github);
+    });
+
+    it("does not touch the escalation route: attempt 2 dispatches, even beside an open build PR", async () => {
+      useBudget({}, "build:\n  maxAttempts: 2\n");
+      await db.runs.createRun({
+        id: "run-a1",
+        workflowName: "build",
+        triggerId: issueTriggerId(REPO, ISSUE),
+        owner: "cliftonc",
+        repo: "lastlight",
+        issueNumber: ISSUE,
+        currentPhase: "executor",
+        status: "failed",
+        context: { _stage: "build", _autonomous: true, _attempt: 1 },
+        startedAt: new Date(Date.now() - 9_000).toISOString(),
+      });
+      const github = fakeGithub({ openPrs: async () => [{ number: 8, headRef: `lastlight/${ISSUE}-x` }] });
+      const result = await applyBuildDispatchGate(
+        args({ route: "escalation", senderIsBot: true, addedLabel: undefined, labels: [STAGE_AGENT_BUILDING], attempt: 2 }),
+        { db, github },
+      );
+      expect(result.decision).toBe("dispatch");
+      expect(result.reason).toMatch(/^escalation:/);
+    });
+
+    it("a human retry (api route) ignores a stale hand-off label but still refuses to duplicate an open build PR", async () => {
+      await seedBuildRun(db);
+      const stale = args({ route: "api", labels: [STAGE_AGENT_BLOCKED, STAGE_READY_FOR_HUMAN] });
+      const ok = await applyBuildDispatchGate(stale, { db, github: fakeGithub() });
+      expect(ok.decision).toBe("dispatch");
+
+      const withPr = fakeGithub({ openPrs: async () => [{ number: 8, headRef: `lastlight/${ISSUE}-x` }] });
+      const blocked = await applyBuildDispatchGate(args({ route: "api", labels: [STAGE_AGENT_BLOCKED] }), {
+        db: await makeTestDb(),
+        github: withPr,
+      });
+      expect(blocked.decision).toBe("skip");
+      expect(blocked.reason).toMatch(/^handed-off:/);
+    });
+
+    it("regression guard: ready-for-agent alone with no PR still dispatches", async () => {
+      const github = fakeGithub();
+      const result = await applyBuildDispatchGate(args({ route: "sweep" }), { db, github });
+      expect(result.decision).toBe("dispatch");
+    });
   });
 });

@@ -108,7 +108,8 @@ function fakeGithub(
     if (over.removeThrows) throw new Error("500 label removal failed");
   });
   const postComment = vi.fn(async () => 1);
-  const client = { getIssue, addLabels, removeLabel, postComment };
+  const listOpenPullRequests = vi.fn(async () => []);
+  const client = { getIssue, addLabels, removeLabel, postComment, listOpenPullRequests };
   return client as unknown as GitHubClient & typeof client;
 }
 

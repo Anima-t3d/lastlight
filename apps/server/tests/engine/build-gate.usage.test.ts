@@ -27,6 +27,7 @@ function github() {
   return {
     addLabels: vi.fn(async () => {}),
     removeLabel: vi.fn(async () => {}),
+    listOpenPullRequests: vi.fn(async () => []),
     postComment: vi.fn(async () => 1),
   } as unknown as GitHubClient & { postComment: ReturnType<typeof vi.fn> };
 }

@@ -133,6 +133,11 @@ export async function applyBuildDispatchGate(
       });
     }
   }
+  // Already handed off? Resolved before the lock, like `usage`: it is a GitHub
+  // read and must not make other gate calls wait on it. Applied below, after the
+  // pure decision, so every other skip outranks it and a hand-off skip never
+  // takes a reservation.
+  const handedOff = await handedOffReason(args, stage, deps.github);
   // The usage-window verdict (`autonomy.budget.usage`; undefined = gate off),
   // read BEFORE the lock: it touches no state the lock protects, and an
   // external source must never make every other gate call wait on it.
@@ -227,6 +232,11 @@ export async function applyBuildDispatchGate(
       maxAttempts: getBuildConfig().maxAttempts,
       escalationDispatched,
     }, budget);
+    // The decision is a `dispatch` here, so every other verdict has already
+    // outranked this one. `inputs` is carried over so the record still says why.
+    if (decision.decision === "dispatch" && handedOff) {
+      return { decision: "skip", reason: handedOff, inputs: decision.inputs } as typeof decision;
+    }
     if (decision.decision === "dispatch") reserve(deps.db, workflow, triggerId, args.repo, attempt);
     return decision;
   });
@@ -306,6 +316,56 @@ export async function applyBuildDispatchGate(
   // they belong to the RUN, which does not exist yet. The union happens where
   // the run's effective approval map is composed (`workflows/simple.ts`).
   return { decision: "dispatch", reason: decision.reason, gates: stage.gates };
+}
+
+/**
+ * `handed-off:` — this issue has already been passed to a human, or already has
+ * a build PR, so building it again is wasted work and a duplicate-PR risk (seen
+ * live: factory-test #7 carried a stale `ready-for-agent` beside `ready-for-human`
+ * and an open PR #8, and was rebuilt). Lives in the gate so label, sweep and
+ * promotion routes are all covered. Returns the skip reason, or `undefined`.
+ *
+ * Two facts, both silent (no comment, no label change; the caller logs):
+ * 1. the stage's `on_success` hand-off label is on the issue (case-insensitive);
+ * 2. an OPEN PR's head branch is this issue's build branch, `lastlight/<N>-…`
+ *    (the prefix `simple.ts` creates). A failed lookup FAILS CLOSED: the sweep
+ *    retries on its next tick.
+ *
+ * Route exemptions, each only where the check would otherwise defeat a route:
+ * - `escalation` skips the PR check: it retries a build that FAILED, possibly
+ *   after opening its PR; the (trigger, attempt) dedupe and `maxAttempts` bound it.
+ *   It never carries the hand-off label (the failed build never reached it), so
+ *   that check is kept.
+ * - a human retry (`api`) skips the label check: an explicit instruction outranks
+ *   a stale label. It keeps the PR check, the safest option: a retry beside an
+ *   open build PR would push a second PR; closing the PR re-enables the retry.
+ */
+async function handedOffReason(
+  args: BuildGateArgs,
+  stage: AutonomyStageConfig,
+  github: GitHubClient | null,
+): Promise<string | undefined> {
+  const subject = `${args.repo}#${args.issueNumber}`;
+  const handOff = stage.on_success.toLowerCase();
+  if (args.route !== "api" && args.labels.some((l) => l.toLowerCase() === handOff)) {
+    return `handed-off: ${subject} carries \`${stage.on_success}\`, so it is already with a human`;
+  }
+  if (args.route === "escalation" || !github) return undefined;
+  const [owner, name] = args.repo.split("/");
+  const prefix = `lastlight/${args.issueNumber}-`;
+  try {
+    const open = await github.listOpenPullRequests(owner ?? "", name ?? "");
+    const pr = open.find((p) => p.headRef.startsWith(prefix));
+    if (pr) return `handed-off: ${subject} already has open build PR #${pr.number} (\`${pr.headRef}\`)`;
+  } catch (err: unknown) {
+    log.warn("Build gate could not list open PRs; skipping as handed-off (fail closed)", {
+      repo: args.repo,
+      issueNumber: args.issueNumber,
+      err,
+    });
+    return `handed-off: could not check ${subject} for an open build PR; the sweep retries`;
+  }
+  return undefined;
 }
 
 /**

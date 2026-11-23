@@ -112,7 +112,8 @@ function fakeGithub(over: { labels?: string[]; isPr?: boolean; throws?: boolean 
     }
     return out;
   });
-  const client = { getIssue, addLabels, removeLabel, postComment, listOpenBoardItems };
+  const listOpenPullRequests = vi.fn(async () => []);
+  const client = { getIssue, addLabels, removeLabel, postComment, listOpenBoardItems, listOpenPullRequests };
   return client as unknown as GitHubClient & typeof client;
 }
 
