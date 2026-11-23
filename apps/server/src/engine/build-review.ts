@@ -25,6 +25,7 @@ import { REVIEW_CHECK_NAME } from "./review-check.js";
 import { appendDecision, hasCommented } from "./build-merge-ledger.js";
 import { getAutonomyConfig, isAutonomousRepo, isMergeRepo } from "../config/config.js";
 import { resolveAutonomyMerge } from "../workflows/autonomy-merge.js";
+import { isInOwnNotesDir, notesOnlyAdvance } from "./own-notes.js";
 import { logger } from "../logging/logger.js";
 
 const log = logger("build-review");
@@ -34,8 +35,18 @@ export const BUILD_REVIEW_SCRATCH_KEY = "buildReview";
 
 export interface BuildReviewRecord {
   prNumber: number;
-  /** The PR head the verdict was posted against. */
+  /**
+   * The commit the verdict is about: the captured workspace HEAD the reviewer
+   * judged (for APPROVED), which is the PR head or an ancestor of it that the
+   * head extends by the build's own notes only.
+   */
   reviewedSha: string;
+  /**
+   * The PR head seen when the record was written, when it was not
+   * `reviewedSha` (it then adds only the build's own notes). The check was
+   * posted there.
+   */
+  headSha?: string;
   verdict: "APPROVED" | "REQUEST_CHANGES";
   /** Where the verdict artifact (or, failing that, the run) can be read. */
   verdictUrl: string;
@@ -57,6 +68,7 @@ export function readBuildReview(run: WorkflowRun): BuildReviewRecord | null {
   return {
     prNumber: r.prNumber,
     reviewedSha: r.reviewedSha,
+    ...(typeof r.headSha === "string" && r.headSha ? { headSha: r.headSha } : {}),
     verdict: r.verdict,
     verdictUrl: r.verdictUrl,
     recordedAt: r.recordedAt,
@@ -116,6 +128,12 @@ export interface FinalizeBuildReviewArgs {
   /** Why the reviewed HEAD was not captured, when it was not. */
   reviewedHeadRefusal?: CaptureRefusal;
   /**
+   * The run's issue number, from the run record (never agent text). Names the
+   * build's own notes dir, `.lastlight/issue-<N>/`: a PR head that adds only
+   * notes there to the reviewed commit still carries the approval.
+   */
+  issueNumber?: number;
+  /**
    * The merge gate owns this run's PR (`autonomyMerge.gate`). An approval that
    * cannot be recorded then gets one PR comment, because the gate can never
    * merge it and would otherwise say nothing.
@@ -135,8 +153,11 @@ export interface FinalizeBuildReviewArgs {
  *    default branch. Otherwise nothing is recorded or posted.
  * 2. An approval is a statement about the commit the reviewer saw. The `pr`
  *    phase can push more, so an APPROVED verdict is recorded only when the PR
- *    head equals the captured reviewed SHA (a missing capture also refuses).
- *    REQUEST_CHANGES carries no authority and is recorded either way.
+ *    head equals the captured reviewed SHA, or GitHub's compare shows the head
+ *    adds ONLY the build's own `.lastlight/issue-<N>/` notes to it (the
+ *    reviewer's verdict and status, the `pr` phase's status update). A missing
+ *    capture refuses. REQUEST_CHANGES carries no authority and is recorded
+ *    either way.
  *
  * Never throws: a failure to record or post must not fail a run that already
  * succeeded. The gate fails closed on a missing record. The record is written
@@ -181,8 +202,9 @@ export async function finalizeBuildReview(
     if (!defaultBranch || pr.base?.ref !== defaultBranch) {
       return await refuse("base-not-default", `PR base ${pr.base?.ref} is not the default branch ${defaultBranch}`);
     }
-    const reviewedSha = pr.head?.sha;
-    if (!reviewedSha) return await refuse("no-head-sha", "the PR head SHA is unknown");
+    const headSha = pr.head?.sha;
+    if (!headSha) return await refuse("no-head-sha", "the PR head SHA is unknown");
+    let reviewedSha = headSha;
     if (args.approved) {
       if (!args.reviewedHeadSha) {
         return await refuse(
@@ -190,20 +212,28 @@ export async function finalizeBuildReview(
           "no reviewed commit was captured for the approval",
         );
       }
-      if (reviewedSha !== args.reviewedHeadSha) {
-        return await refuse("head-not-reviewed", `PR head ${reviewedSha} is not the reviewed commit ${args.reviewedHeadSha}`);
+      if (headSha !== args.reviewedHeadSha) {
+        const notHead = `PR head ${headSha} is not the reviewed commit ${args.reviewedHeadSha}`;
+        if (args.issueNumber === undefined) return await refuse("head-not-reviewed", notHead);
+        // A compare that throws lands in the catch below: `record-failed`.
+        const cmp = await github.compareCommits(args.owner, args.repo, args.reviewedHeadSha, headSha);
+        const advance = notesOnlyAdvance(cmp, args.issueNumber);
+        if (!advance.ok) return await refuse("head-not-reviewed", `${notHead}: ${advance.reason}`);
+        reviewedSha = args.reviewedHeadSha;
       }
     }
     const rec: BuildReviewRecord = {
       prNumber: args.prNumber,
       reviewedSha,
+      ...(reviewedSha !== headSha ? { headSha } : {}),
       verdict,
       verdictUrl: args.verdictUrl,
       recordedAt: new Date().toISOString(),
     };
     await recordBuildReview(db, args.runId, rec);
     try {
-      await github.createCheckRun(args.owner, args.repo, reviewedSha, REVIEW_CHECK_NAME, {
+      // On the PR head: that is where branch protection reads it.
+      await github.createCheckRun(args.owner, args.repo, headSha, REVIEW_CHECK_NAME, {
         status: "completed",
         conclusion: args.approved ? "success" : "failure",
         ...(args.verdictUrl ? { detailsUrl: args.verdictUrl } : {}),
@@ -305,6 +335,38 @@ function isGateRun(ctx: TemplateContext): boolean {
   ).gate;
 }
 
+/**
+ * The run's issue number off its context — set by the server at dispatch
+ * (`issueNumber ?? prNumber`), never by an agent. Undefined unless a positive
+ * integer, which leaves no notes dir exempt.
+ */
+export function runIssueNumber(ctx: TemplateContext): number | undefined {
+  const n = (ctx as Record<string, unknown>).issueNumber;
+  return typeof n === "number" && Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * Every path `git status --porcelain -z` names — both ends of a rename or copy
+ * — or null when the output does not parse (which the caller treats as dirty).
+ * Records are `XY <path>\0`; an `R`/`C` record is followed by its source path.
+ */
+function statusPaths(out: string): string[] | null {
+  const fields = out.split("\0");
+  if (fields[fields.length - 1] === "") fields.pop();
+  const paths: string[] = [];
+  for (let k = 0; k < fields.length; k++) {
+    const rec = fields[k];
+    if (rec.length < 4 || rec[2] !== " ") return null;
+    paths.push(rec.slice(3));
+    if (/[RC]/.test(rec.slice(0, 2))) {
+      const from = fields[++k];
+      if (from === undefined || from === "") return null;
+      paths.push(from);
+    }
+  }
+  return paths;
+}
+
 function captureRefusal(raw: unknown): CaptureRefusal | undefined {
   if (raw === undefined) return undefined;
   return (CAPTURE_REFUSALS as readonly unknown[]).includes(raw) ? (raw as CaptureRefusal) : undefined;
@@ -351,6 +413,7 @@ export async function finalizeBuildReviewForRun(
         branch: typeof args.ctx.branch === "string" ? args.ctx.branch : "",
         reviewedHeadSha: typeof review.headSha === "string" && review.headSha ? review.headSha : undefined,
         reviewedHeadRefusal: captureRefusal(review.headRefusal),
+        issueNumber: runIssueNumber(args.ctx),
         gateRun: isGateRun(args.ctx),
       },
       { db: deps.db, github, botLogin: deps.botLogin },
@@ -415,14 +478,22 @@ function triggerMergeEvaluation(
  * `ls-files` reads only the index: it starts no subprocess and does not
  * recurse (`submodule.recurse` does not apply to it). The dirty check itself
  * runs against a fresh temp index (`temp-index` if that cannot be built).
+ *
+ * One exception to "clean": the build's own notes dir, `.lastlight/issue-<N>/`
+ * with `issueNumber` from the run record. The reviewer writes its verdict and
+ * status there AFTER reviewing, so those changes (modified, added, deleted or
+ * untracked, strictly inside that dir) do not refuse. Any other dirty path
+ * does, including either end of a rename that leaves the dir. The SHA is HEAD
+ * either way; the merge gate checks that the PR head adds only such notes.
  */
 export function readWorkspaceHead(
   config: Pick<ExecutorConfig, "sandboxDir" | "stateDir">,
   taskId: string,
   owner: string,
   repo: string,
+  issueNumber?: number,
 ): string | undefined {
-  const got = captureWorkspaceHead(config, taskId, owner, repo);
+  const got = captureWorkspaceHead(config, taskId, owner, repo, issueNumber);
   return "sha" in got ? got.sha : undefined;
 }
 
@@ -436,6 +507,7 @@ export function captureWorkspaceHead(
   taskId: string,
   owner: string,
   repo: string,
+  issueNumber?: number,
 ): { sha: string } | { refused: CaptureRefusal } {
   const refuse = (reason: CaptureRefusal, err?: unknown): { refused: CaptureRefusal } => {
     log.warn("Not capturing the reviewed commit", { taskId, repo: `${owner}/${repo}`, reason, ...(err ? { err } : {}) });
@@ -507,8 +579,14 @@ export function captureWorkspaceHead(
     }
     try {
       // Submodules were refused above; never recurse into one regardless.
-      const status = ["-c", "submodule.recurse=false", "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=all"];
-      return run(status, indexFile).trim() === "" ? { sha } : refuse("dirty-tree");
+      // `-z`: NUL-terminated, unquoted paths, so a path cannot pose as two.
+      const status = [
+        "-c", "submodule.recurse=false", "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=all",
+      ];
+      const dirty = statusPaths(run(status, indexFile));
+      if (dirty === null) return refuse("dirty-tree");
+      const outside = dirty.some((p) => issueNumber === undefined || !isInOwnNotesDir(p, issueNumber));
+      return outside ? refuse("dirty-tree") : { sha };
     } catch (err: unknown) {
       // git could not say whether the tree is clean: do not vouch for it.
       return refuse("dirty-tree", err);

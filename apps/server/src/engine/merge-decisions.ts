@@ -9,7 +9,8 @@
  *
  * `wait`     — may become mergeable without a human (or is a safe skip).
  * `hand-off` — needs a human.
- * `merge`    — every condition holds on the reviewed head.
+ * `merge`    — every condition holds on the reviewed head (or on a head that
+ *              adds only the build's own notes to it).
  *
  * Fail closed: the PR merges only when nothing below objects, and
  * `mergeableState` is exactly `"clean"`.
@@ -19,6 +20,7 @@ import type { MergeConfig } from "../config/config.js";
 import type { BuildReviewRecord } from "./build-review.js";
 import type { Decision } from "./pr-decisions.js";
 import type { PrState } from "./pr-state.js";
+import { isInOwnNotesDir, notesOnlyAdvance, type CommitComparison } from "./own-notes.js";
 
 export type BuildMergeDecision = "merge" | "wait" | "hand-off";
 
@@ -48,6 +50,12 @@ export interface BuildMergeInputs {
   mergeableState: string | null;
   /** The PR targets the repo's default branch. */
   baseIsDefault: boolean;
+  /**
+   * GitHub's `reviewedSha...headSha` comparison, read only when the head moved
+   * past the reviewed commit. `"error"` = the compare call failed (wait, never
+   * merge); absent/null = not read (the moved head is a stale review).
+   */
+  headComparison?: CommitComparison | "error" | null;
 }
 
 /** `**` = any depth (incl. zero segments), `*` = within one segment, rest literal. */
@@ -138,10 +146,9 @@ export function mayMergeBuild(
   // added ones included). `changedPaths` is a flat list that already carries
   // each rename's previous name, so a rename of a protected file into the dir
   // still leaves the protected previous path to match.
-  const ownDir = `.lastlight/issue-${i.issueNumber}/`;
   const globs = cfg.protectedPaths.map(globToRegExp);
   const hit = i.changedPaths
-    .filter((p) => !(p.startsWith(ownDir) && p.length > ownDir.length))
+    .filter((p) => !isInOwnNotesDir(p, i.issueNumber))
     .find((p) => globs.some((g) => g.test(p)));
   if (hit !== undefined) {
     inputs.protectedPath = hit;
@@ -151,6 +158,18 @@ export function mayMergeBuild(
   if (review && review.prNumber !== state.prNumber) {
     return out("hand-off", `review-mismatch: review is for PR #${review.prNumber}, not #${state.prNumber}`);
   }
+  // The head may sit past the reviewed commit by the build's own notes only:
+  // the reviewer writes its verdict and status into `.lastlight/issue-<N>/`
+  // after reviewing, and the `pr` phase updates the status once more. GitHub's
+  // `reviewedSha...head` comparison decides whether that is ALL that moved
+  // (`notesOnlyAdvance`); then the head counts as reviewed and the executor
+  // pins the merge to it.
+  let headReviewed = !!review && review.reviewedSha === state.headSha;
+  if (review && !headReviewed && i.headComparison && i.headComparison !== "error") {
+    const advance = notesOnlyAdvance(i.headComparison, i.issueNumber);
+    inputs.notesOnlyAdvance = advance.ok ? true : advance.reason;
+    headReviewed = advance.ok;
+  }
   if (review && review.reviewedSha === state.headSha && review.verdict === "REQUEST_CHANGES") {
     return out("hand-off", "changes-requested: the build review requested changes on this head");
   }
@@ -158,8 +177,12 @@ export function mayMergeBuild(
   // The head moved past the reviewed commit (a pr-fix push, a human push).
   // Only a build run records a review, so nothing will ever re-record this
   // head: waiting would be permanent and silent.
-  if (review && review.reviewedSha !== state.headSha) {
-    return out("hand-off", `stale-review: reviewed ${review.reviewedSha}, head is ${state.headSha}`);
+  if (review && !headReviewed && i.headComparison === "error") {
+    return out("wait", "compare-unknown: the reviewed commit could not be compared with the head");
+  }
+  if (review && !headReviewed) {
+    const why = typeof inputs.notesOnlyAdvance === "string" ? ` (${inputs.notesOnlyAdvance})` : "";
+    return out("hand-off", `stale-review: reviewed ${review.reviewedSha}, head is ${state.headSha}${why}`);
   }
   // Only an explicit approval authorises an unattended merge, whatever other
   // verdict a record may carry one day.
@@ -193,5 +216,11 @@ export function mayMergeBuild(
   }
 
   // 4. Merge.
+  if (review.reviewedSha !== state.headSha) {
+    return out(
+      "merge",
+      `clean: reviewed ${review.reviewedSha} approved, head ${state.headSha} adds only the build's own notes, checks green, mergeable`,
+    );
+  }
   return out("merge", `clean: reviewed head ${state.headSha} approved, checks green, mergeable`);
 }

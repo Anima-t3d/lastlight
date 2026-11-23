@@ -3,6 +3,7 @@ import type { Octokit } from "octokit";
 import { githubAppClient, githubTokenClient } from "./github-app-client.js";
 import { getInstallationDirectory } from "./installations.js";
 import type { InlineComment, ReviewEvent } from "./review-poster.js";
+import type { CommitComparison } from "../own-notes.js";
 import { logger } from "../../logging/logger.js";
 
 const log = logger("github");
@@ -2236,6 +2237,41 @@ export class GitHubClient {
     if (fetched >= ceiling) return null;
     if (fetched < pr.changed_files) return null;
     return [...paths];
+  }
+
+  /**
+   * GitHub's `base...head` comparison, in the shape the merge gate's
+   * notes-only check reads (`notesOnlyAdvance`): the status (`ahead`,
+   * `behind`, `diverged`, `identical`), `behind_by`, and every changed file
+   * with its rename source.
+   *
+   * One request, no pagination: the endpoint returns at most 300 files, so the
+   * caller treats a list that long as possibly truncated, and `files: null`
+   * when GitHub sent none. Errors propagate, so a failed read is never
+   * mistaken for an answer.
+   */
+  async compareCommits(
+    owner: string,
+    repo: string,
+    baseSha: string,
+    headSha: string,
+  ): Promise<CommitComparison> {
+    const kit = await this.kit(owner);
+    const { data } = await kit.rest.repos.compareCommitsWithBasehead({
+      owner,
+      repo,
+      basehead: `${baseSha}...${headSha}`,
+    });
+    return {
+      status: String(data.status),
+      behindBy: typeof data.behind_by === "number" ? data.behind_by : Number.NaN,
+      files: Array.isArray(data.files)
+        ? data.files.map((f) => ({
+            filename: f.filename,
+            ...(typeof f.previous_filename === "string" ? { previousFilename: f.previous_filename } : {}),
+          }))
+        : null,
+    };
   }
 
   /**

@@ -7,8 +7,10 @@
  *
  * - The decision is {@link mayMergeBuild}, pure over a snapshot read here. This
  *   module only gathers inputs and acts on the answer.
- * - The merge is pinned to the SHA the build review approved. GitHub refuses it
- *   (`head-moved`) if anything was pushed after the snapshot was read.
+ * - The merge is pinned to the head SHA the decision was made on: the SHA the
+ *   build review approved, or a head that adds only the build's own
+ *   `.lastlight/issue-<N>/` notes to it (GitHub's compare says so). GitHub
+ *   refuses it (`head-moved`) if anything was pushed after the snapshot was read.
  * - A read that throws propagates: no snapshot, no merge. Every trigger catches
  *   and logs, and the 20-minute sweep is the retry.
  * - `fromBuildRun` is true only when a succeeded build run of THIS instance
@@ -43,6 +45,7 @@ import { BUILD_WORKFLOW, readBuildReview, type BuildReviewRecord } from "./build
 import { issueTriggerId } from "./build-decisions.js";
 import { mayMergeBuild, type BuildMergeDecision } from "./merge-decisions.js";
 import { emptyPrState, type PrState } from "./pr-state.js";
+import type { CommitComparison } from "./own-notes.js";
 import type { MergeTrigger } from "./build-merge-route.js";
 import {
   appendDecision,
@@ -217,6 +220,20 @@ async function evaluateOnce(
   ]);
 
   const state = snapshot(repo, prNumber, pr, deps.botLogin, checks);
+  // The head moved past the reviewed commit: ask GitHub what moved. A head that
+  // adds only this build's own notes still counts as reviewed (`mayMergeBuild`
+  // decides; `notesOnlyAdvance`). A failed compare is "error", which waits.
+  let headComparison: CommitComparison | "error" | null = null;
+  if (review && headSha && review.prNumber === prNumber && review.reviewedSha !== headSha) {
+    try {
+      headComparison = await github.compareCommits(owner, name, review.reviewedSha, headSha);
+    } catch (err: unknown) {
+      log.warn("Could not compare the reviewed commit with the PR head", {
+        repo, prNumber, runId: run.id, trigger, reviewedSha: review.reviewedSha, headSha, err,
+      });
+      headComparison = "error";
+    }
+  }
   // Both must say gate: the policy the run was CREATED with (persisted on its
   // context), and the live lists + `on_merge` right now. The persisted half
   // stops a run created as a non-gate run (repo not yet on Merges) from becoming
@@ -238,6 +255,7 @@ async function evaluateOnce(
       fromBuildRun: true,
       mergeableState: typeof pr.mergeable_state === "string" ? pr.mergeable_state : null,
       baseIsDefault: !!defaultBranch && pr.base?.ref === defaultBranch,
+      headComparison,
     },
     mergeConfigForLayer(layer),
   );
@@ -277,11 +295,12 @@ async function evaluateOnce(
     if (priorEntries(run).some((e) => e.outcome === "not-mergeable" && e.headSha === headSha)) {
       return handOff(NOT_MERGEABLE_REASON, notMergeableComment(review));
     }
-    // The decision already holds `review.reviewedSha === state.headSha`; the
-    // reviewed SHA is passed because it is the evidence, and GitHub refuses the
-    // merge if the head is anything else by the time it lands.
+    // The decision holds that `headSha` IS the reviewed commit, or adds only
+    // this build's own notes to it (the comparison read above was of exactly
+    // this `headSha`). The merge is pinned to it, so GitHub refuses it if the
+    // head is anything else by the time it lands.
     const res = await github.mergePullRequest(owner, name, prNumber, {
-      sha: review.reviewedSha,
+      sha: headSha,
       method: "squash",
     });
     if (res.outcome === "not-mergeable") {
@@ -291,7 +310,7 @@ async function evaluateOnce(
     let commented = false;
     if (res.outcome === "merged") {
       log.info("Merged build PR", { ...ctx, sha: res.sha });
-      commented = await comment(github, owner, name, prNumber, mergedComment(repo, prNumber, review, res.sha), ctx);
+      commented = await comment(github, owner, name, prNumber, mergedComment(repo, prNumber, review, res.sha, headSha), ctx);
       emitMerged(run, repo, prNumber, res.sha ?? "");
     } else {
       // `head-moved` / `already-merged`: the next evaluation reads the new state.
@@ -430,13 +449,22 @@ function notMergeableComment(review: BuildReviewRecord, githubMessage?: string):
   return lines.join("\n");
 }
 
-function mergedComment(repo: string, prNumber: number, review: BuildReviewRecord, sha?: string): string {
+function mergedComment(
+  repo: string,
+  prNumber: number,
+  review: BuildReviewRecord,
+  sha: string | undefined,
+  headSha: string,
+): string {
   const lines = [
     `Merged by the merge gate as squash commit ${sha ? codeSpan(sha) : "(SHA not reported)"}.`,
     "",
     `- Build review approved head ${codeSpan(review.reviewedSha)}` +
       (review.verdictUrl ? `: [verdict](${review.verdictUrl})` : ""),
-    `- Checks: [green on that head](https://github.com/${repo}/pull/${prNumber}/checks)`,
+    ...(headSha !== review.reviewedSha
+      ? [`- Merged head ${codeSpan(headSha)} adds only the build's own run notes to it`]
+      : []),
+    `- Checks: [green on the merged head](https://github.com/${repo}/pull/${prNumber}/checks)`,
   ];
   return lines.join("\n");
 }

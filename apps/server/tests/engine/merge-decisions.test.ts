@@ -2,6 +2,7 @@
 import { describe, it, expect } from "vitest";
 import type { PrState } from "#src/engine/pr-state.js";
 import type { MergeConfig } from "#src/config/config.js";
+import type { CommitComparison } from "#src/engine/own-notes.js";
 import {
   mayMergeBuild,
   globToRegExp,
@@ -49,6 +50,13 @@ function inputs(over: Partial<BuildMergeInputs> & { state?: Partial<PrState> } =
   };
 }
 
+const notesOnly = (o: Partial<CommitComparison> = {}): CommitComparison => ({
+  status: "ahead",
+  behindBy: 0,
+  files: [{ filename: ".lastlight/issue-12/reviewer-verdict.md" }, { filename: ".lastlight/issue-12/status.md" }],
+  ...o,
+});
+
 const rev = (o: object) => ({ prNumber: 7, reviewedSha: "B", verdict: "APPROVED" as const, verdictUrl: "u", recordedAt: "t", ...o });
 
 const rows: Array<[string, BuildMergeInputs, "merge" | "wait" | "hand-off", string, MergeConfig?]> = [
@@ -92,6 +100,20 @@ const rows: Array<[string, BuildMergeInputs, "merge" | "wait" | "hand-off", stri
   ["stale-review", inputs({ review: rev({ reviewedSha: "A" }) }), "hand-off", "stale-review"],
   ["stale request-changes", inputs({ review: rev({ reviewedSha: "A", verdict: "REQUEST_CHANGES" }) }), "hand-off", "stale-review"],
   ["stale-review beats pending checks", inputs({ review: rev({ reviewedSha: "A" }), state: { checksState: "pending" } }), "hand-off", "stale-review"],
+  // The head moved past the reviewed commit by the build's own notes only
+  // (the reviewer's verdict, the pr phase's status update): still reviewed.
+  ["notes-only advance merges", inputs({ review: rev({ reviewedSha: "A" }), headComparison: notesOnly() }), "merge", "clean"],
+  ["notes-only advance still waits for checks", inputs({ review: rev({ reviewedSha: "A" }), headComparison: notesOnly(), state: { checksState: "pending" } }), "wait", "checks-pending"],
+  ["notes-only advance, request-changes, is not approved", inputs({ review: rev({ reviewedSha: "A", verdict: "REQUEST_CHANGES" }), headComparison: notesOnly() }), "hand-off", "not-approved"],
+  ["advance with a src/ change", inputs({ review: rev({ reviewedSha: "A" }), headComparison: notesOnly({ files: [{ filename: ".lastlight/issue-12/status.md" }, { filename: "src/x.js" }] }) }), "hand-off", "stale-review"],
+  ["advance behind_by > 0", inputs({ review: rev({ reviewedSha: "A" }), headComparison: notesOnly({ behindBy: 1 }) }), "hand-off", "stale-review"],
+  ["advance diverged", inputs({ review: rev({ reviewedSha: "A" }), headComparison: notesOnly({ status: "diverged", behindBy: 3 }) }), "hand-off", "stale-review"],
+  ["advance renames a file out of the notes dir", inputs({ review: rev({ reviewedSha: "A" }), headComparison: notesOnly({ files: [{ filename: "src/x.js", previousFilename: ".lastlight/issue-12/x" }] }) }), "hand-off", "stale-review"],
+  ["advance with a truncated file list", inputs({ review: rev({ reviewedSha: "A" }), headComparison: notesOnly({ files: null }) }), "hand-off", "stale-review"],
+  ["advance with 300 files", inputs({ review: rev({ reviewedSha: "A" }), headComparison: notesOnly({ files: Array.from({ length: 300 }, (_, k) => ({ filename: `.lastlight/issue-12/n${k}` })) }) }), "hand-off", "stale-review"],
+  ["advance in another issue's notes dir", inputs({ issueNumber: 13, changedPaths: ["src/a.ts"], review: rev({ reviewedSha: "A" }), headComparison: notesOnly() }), "hand-off", "stale-review"],
+  ["compare failed waits, never merges", inputs({ review: rev({ reviewedSha: "A" }), headComparison: "error" }), "wait", "compare-unknown"],
+  ["head == reviewed ignores the comparison", inputs({ headComparison: "error" }), "merge", "clean"],
   // Only an explicit APPROVED authorises a merge (I5).
   ["unknown verdict", inputs({ review: rev({ verdict: "COMMENTED" }) as never }), "hand-off", "not-approved"],
   ["checks-pending", inputs({ state: { checksState: "pending" } }), "wait", "checks-pending"],

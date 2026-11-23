@@ -179,6 +179,51 @@ describe("finalizeBuildReview binds to the build's own PR and the reviewed commi
   it("S2: approved but PR head moved past the captured SHA -> nothing", async () => {
     nothing(await run({}, { reviewedHeadSha: "reviewed-earlier" }));
   });
+  // The reviewer writes its verdict + status into the own notes dir after
+  // reviewing, and the pr phase updates status: the head is notes past the capture.
+  const notesOnly = {
+    status: "ahead",
+    behindBy: 0,
+    files: [{ filename: ".lastlight/issue-1/reviewer-verdict.md" }, { filename: ".lastlight/issue-1/status.md" }],
+  };
+  const withCompare = async (compare: unknown, args: Record<string, any> = {}) => {
+    const db = fakeDb();
+    const github = fakeGithub({
+      compareCommits: compare instanceof Error ? vi.fn().mockRejectedValue(compare) : vi.fn().mockResolvedValue(compare),
+    });
+    const rec = await finalizeBuildReview(
+      { ...base, approved: true, reviewedHeadSha: "reviewed-earlier", issueNumber: 1, ...args },
+      { db, github, ...botDeps },
+    );
+    return { db, github, rec };
+  };
+  it("S2: PR head is the captured SHA plus own notes only -> recorded against the captured SHA", async () => {
+    const { rec, github, db } = await withCompare(notesOnly);
+    expect(github.compareCommits).toHaveBeenCalledWith("o", "r", "reviewed-earlier", "head-after-push");
+    expect(rec).toMatchObject({ reviewedSha: "reviewed-earlier", headSha: "head-after-push", verdict: "APPROVED" });
+    expect(db.scratch[BUILD_REVIEW_SCRATCH_KEY]).toEqual(rec);
+    // The check goes on the PR head, where branch protection reads it.
+    expect(github.createCheckRun).toHaveBeenCalledWith(
+      "o", "r", "head-after-push", REVIEW_CHECK_NAME, expect.objectContaining({ conclusion: "success" }),
+    );
+  });
+  it("S2: PR head past the captured SHA with a src/ change -> nothing", async () => {
+    nothing(await withCompare({ ...notesOnly, files: [...notesOnly.files, { filename: "src/x.js" }] }));
+  });
+  it("S2: PR head not descended from the captured SHA -> nothing", async () => {
+    nothing(await withCompare({ ...notesOnly, status: "diverged", behindBy: 1 }));
+  });
+  it("S2: notes in another issue's dir -> nothing", async () => {
+    nothing(await withCompare(notesOnly, { issueNumber: 2 }));
+  });
+  it("S2: no issue number -> nothing, and no compare", async () => {
+    const out = await withCompare(notesOnly, { issueNumber: undefined });
+    nothing(out);
+    expect(out.github.compareCommits).not.toHaveBeenCalled();
+  });
+  it("S2: a compare that throws -> nothing", async () => {
+    nothing(await withCompare(new Error("502")));
+  });
   it("S2: approved with no captured SHA -> nothing", async () => {
     nothing(await run({}, { reviewedHeadSha: undefined }));
   });
@@ -434,6 +479,112 @@ describe("readWorkspaceHead", () => {
   });
 });
 
+describe("captureWorkspaceHead lets the build's own notes dir be dirty", () => {
+  // A checkout at the executor's commit: code in src/, earlier notes in the own dir.
+  function checkout() {
+    const sandboxDir = mkdtempSync(join(tmpdir(), "bw-"));
+    const repoDir = join(sandboxDir, "t1", "r");
+    mkdirSync(join(repoDir, "src"), { recursive: true });
+    mkdirSync(join(repoDir, ".lastlight", "issue-11"), { recursive: true });
+    const git = (...a: string[]) => execFileSync("git", ["-C", repoDir, ...a], { encoding: "utf8" }).trim();
+    git("init", "-q");
+    writeFileSync(join(repoDir, "src", "x.js"), "code");
+    writeFileSync(join(repoDir, ".lastlight", "issue-11", "status.md"), "executor_status: done");
+    writeFileSync(join(repoDir, ".lastlight", "issue-11", "architect-plan.md"), "plan");
+    git("add", "-A");
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "feat: implement #11");
+    return { sandboxDir, repoDir, git };
+  }
+  const notesDir = (repoDir: string, ...p: string[]) => join(repoDir, ".lastlight", ...p);
+  // What the reviewer leaves behind: a status update, a new verdict, a removed note.
+  const reviewerNotes = (repoDir: string) => {
+    writeFileSync(notesDir(repoDir, "issue-11", "status.md"), "reviewer_status: APPROVED");
+    writeFileSync(notesDir(repoDir, "issue-11", "reviewer-verdict.md"), "APPROVED");
+    rmSync(notesDir(repoDir, "issue-11", "architect-plan.md"));
+    mkdirSync(notesDir(repoDir, "issue-11", "deep"), { recursive: true });
+    writeFileSync(notesDir(repoDir, "issue-11", "deep", "n.md"), "nested");
+  };
+  const cap = (sandboxDir: string, issueNumber?: number) =>
+    captureWorkspaceHead({ sandboxDir }, "t1", "o", "r", issueNumber);
+
+  it("only the own dir dirty (modified, added, deleted, untracked) -> captures HEAD", () => {
+    const { sandboxDir, repoDir, git } = checkout();
+    reviewerNotes(repoDir);
+    expect(cap(sandboxDir, 11)).toEqual({ sha: git("rev-parse", "HEAD") });
+  });
+
+  it("the own dir changes staged in the agent's index -> still captures HEAD", () => {
+    const { sandboxDir, repoDir, git } = checkout();
+    reviewerNotes(repoDir);
+    git("add", "-A");
+    expect(cap(sandboxDir, 11)).toEqual({ sha: git("rev-parse", "HEAD") });
+  });
+
+  it("own dir plus src/x dirty -> dirty-tree", () => {
+    const { sandboxDir, repoDir } = checkout();
+    reviewerNotes(repoDir);
+    writeFileSync(join(repoDir, "src", "x.js"), "changed after review");
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "dirty-tree" });
+  });
+
+  it("an untracked file in another issue's dir -> dirty-tree", () => {
+    const { sandboxDir, repoDir } = checkout();
+    mkdirSync(notesDir(repoDir, "issue-12"), { recursive: true });
+    writeFileSync(notesDir(repoDir, "issue-12", "status.md"), "x");
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "dirty-tree" });
+  });
+
+  it("issue-110 is not issue-11 -> dirty-tree", () => {
+    const { sandboxDir, repoDir } = checkout();
+    mkdirSync(notesDir(repoDir, "issue-110"), { recursive: true });
+    writeFileSync(notesDir(repoDir, "issue-110", "status.md"), "x");
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "dirty-tree" });
+  });
+
+  it("a .lastlight file outside any issue dir -> dirty-tree", () => {
+    const { sandboxDir, repoDir } = checkout();
+    writeFileSync(notesDir(repoDir, "lastlight.yml"), "merge: {}");
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "dirty-tree" });
+  });
+
+  it("a rename from src/x into the own dir -> dirty-tree", () => {
+    const { sandboxDir, git } = checkout();
+    git("mv", "src/x.js", ".lastlight/issue-11/x.js");
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "dirty-tree" });
+  });
+
+  it("a rename from src/x into the own dir, committed-index view -> dirty-tree", () => {
+    const { sandboxDir, repoDir } = checkout();
+    // The same rename done on disk only, with the agent's index untouched.
+    writeFileSync(notesDir(repoDir, "issue-11", "x.js"), "code");
+    rmSync(join(repoDir, "src", "x.js"));
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "dirty-tree" });
+  });
+
+  it("own dir dirty but no issue number -> dirty-tree", () => {
+    const { sandboxDir, repoDir } = checkout();
+    reviewerNotes(repoDir);
+    expect(cap(sandboxDir)).toEqual({ refused: "dirty-tree" });
+    expect(cap(sandboxDir, 0)).toEqual({ refused: "dirty-tree" });
+  });
+
+  it("a path with a newline inside the own dir is parsed as one entry", () => {
+    const { sandboxDir, repoDir, git } = checkout();
+    writeFileSync(notesDir(repoDir, "issue-11", "a\nsrc"), "x");
+    expect(cap(sandboxDir, 11)).toEqual({ sha: git("rev-parse", "HEAD") });
+  });
+
+  it("the S3/S4 refusals still come first", () => {
+    const { sandboxDir, repoDir, git } = checkout();
+    reviewerNotes(repoDir);
+    git("update-index", "--assume-unchanged", "src/x.js");
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "index-flags" });
+    git("update-index", "--no-assume-unchanged", "src/x.js");
+    mkdirSync(join(repoDir, ".git", "modules", "sub"), { recursive: true });
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "submodules" });
+  });
+});
+
 describe("finalizeBuildReviewForRun — the build-finished merge trigger", () => {
   const ctx = {
     owner: "o", repo: "r", branch: "lastlight/1-x", issueDir: ".lastlight/issue-1",
@@ -477,6 +628,26 @@ describe("finalizeBuildReviewForRun — the build-finished merge trigger", () =>
     );
     await flush();
     expect(evaluateMerge).not.toHaveBeenCalled();
+  });
+
+  it("records a notes-only advance with the issue number from the run context", async () => {
+    const db = fakeDb();
+    const github = fakeGithub({
+      compareCommits: vi.fn().mockResolvedValue({
+        status: "ahead", behindBy: 0, files: [{ filename: ".lastlight/issue-1/status.md" }],
+      }),
+    });
+    const rec = await finalizeBuildReviewForRun(
+      {
+        workflowName: "build",
+        result: { ...ok, review: { approved: true, headSha: "reviewed-earlier" } },
+        ctx: { ...ctx, issueNumber: 1 },
+        runId: "run-1",
+      },
+      { db, github: () => github, ...botDeps },
+    );
+    expect(rec).toMatchObject({ reviewedSha: "reviewed-earlier", headSha: "head-after-push" });
+    await vi.waitFor(() => expect(evaluateMerge).toHaveBeenCalled());
   });
 
   it("does not evaluate when no record was written (approval not bound to the PR head)", async () => {

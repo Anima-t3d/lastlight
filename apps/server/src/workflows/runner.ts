@@ -59,7 +59,7 @@ import { collapseDetail } from "../notify/render.js";
 import { markRunLive } from "./live-runs.js";
 import { nextNotBefore } from "./usage-wait.js";
 import { PhaseRef } from "./phase-ref.js";
-import { captureWorkspaceHead, type CaptureRefusal } from "../engine/build-review.js";
+import { captureWorkspaceHead, runIssueNumber, type CaptureRefusal } from "../engine/build-review.js";
 
 // `isTerminated` used to live here; re-exported for API stability.
 export { isTerminated };
@@ -459,7 +459,7 @@ async function runWorkflowBody(
     const ref = PhaseRef.parse(phase);
     if (ref.base !== reviewerLoop.name || (ref.kind !== "phase" && ref.kind !== "recheck")) return;
     const got = result.success
-      ? captureWorkspaceHead(config, taskId, String(ctx.owner), String(ctx.repo))
+      ? captureWorkspaceHead(config, taskId, String(ctx.owner), String(ctx.repo), runIssueNumber(ctx))
       : undefined;
     reviewedHead = got && "sha" in got ? got.sha : undefined;
     reviewedHeadRefusal = got && "refused" in got ? got.refused : undefined;

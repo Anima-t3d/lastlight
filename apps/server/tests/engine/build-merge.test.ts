@@ -30,6 +30,7 @@ import {
 } from "#src/config/config.js";
 import { resetRepoConfigForTests } from "#src/config/repo-config.js";
 import type { StateDb } from "#src/state/db.js";
+import type { CommitComparison } from "#src/engine/own-notes.js";
 import { makeTestDb } from "../helpers/state-db.js";
 
 const BOT = "last-light[bot]";
@@ -54,7 +55,13 @@ function config(onMerge: "gate" | "none" = "gate"): LastLightConfig {
 
 /** A GitHub fake whose PR is a mutable object, so a merge is visible to the next read. */
 function fakeGithub(
-  over: { files?: string[] | null; mergeOutcome?: string; labels?: string[]; issueLabels?: string[] } = {},
+  over: {
+    files?: string[] | null;
+    mergeOutcome?: string;
+    labels?: string[];
+    issueLabels?: string[];
+    compare?: CommitComparison | Error;
+  } = {},
 ) {
   const pr = {
     number: PR,
@@ -75,6 +82,11 @@ function fakeGithub(
     listPullRequestClosingIssues: vi.fn(async () => [{ number: ISSUE, title: "", body: "", url: "", state: "OPEN" }]),
     getChecksSummary: vi.fn(async () => ({ state: "passing", settledCount: 2, pendingCount: 0 })),
     listAllPullRequestFilePaths: vi.fn(async () => (over.files === undefined ? ["src/a.ts"] : over.files)),
+    // `reviewedSha...head`. Default: the head moved by a code change.
+    compareCommits: vi.fn(async (): Promise<CommitComparison> => {
+      if (over.compare instanceof Error) throw over.compare;
+      return over.compare ?? { status: "ahead", behindBy: 0, files: [{ filename: "src/a.ts" }] };
+    }),
     getDefaultBranch: vi.fn(async () => "main"),
     getIssue: vi.fn(async () => ({ number: ISSUE, state: "open", labels: (over.issueLabels ?? []).map((name) => ({ name })) })),
     // The repo's `.lastlight/` layer, refreshed before every decision. Default: none.
@@ -578,6 +590,67 @@ describe("evaluateBuildMerge — a stale review (I4b)", () => {
     github.pr.head.sha = "C";
     await evaluateBuildMerge(deps, REPO, PR, "sweep");
     expect(github.postComment).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("evaluateBuildMerge — the head adds only the build's own notes", () => {
+  // The reviewer wrote its verdict and status after reviewing A; the pr phase
+  // updated status once more. Head B = A + notes in .lastlight/issue-3/.
+  const notes: CommitComparison = {
+    status: "ahead",
+    behindBy: 0,
+    files: [
+      { filename: ".lastlight/issue-3/reviewer-verdict.md" },
+      { filename: ".lastlight/issue-3/status.md" },
+    ],
+  };
+  const run = async (compare: CommitComparison | Error, files?: string[]) => {
+    const db = await makeTestDb();
+    await seedBuildRun(db, { review: { reviewedSha: "A" } });
+    const github = fakeGithub({ compare, files });
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "checks-settled");
+    return { db, github, res };
+  };
+
+  it("notes-only and ahead: merges, pinned to the PR head that was compared", async () => {
+    const { github, res, db } = await run(notes, ["src/a.ts", ".lastlight/issue-3/status.md"]);
+    expect(github.compareCommits).toHaveBeenCalledWith("acme", "widgets", "A", "B");
+    expect(res).toMatchObject({ decision: "merge", outcome: "merged" });
+    expect(github.mergePullRequest).toHaveBeenCalledWith("acme", "widgets", PR, { sha: "B", method: "squash" });
+    expect((await ledger(db))[0]).toMatchObject({ decision: "merge", headSha: "B", outcome: "merged" });
+  });
+
+  it.each<[string, CommitComparison]>([
+    ["ahead with a src/ change", { ...notes, files: [...notes.files!, { filename: "src/x.js" }] }],
+    ["behind_by > 0", { ...notes, behindBy: 1 }],
+    ["diverged", { ...notes, status: "diverged", behindBy: 2 }],
+    ["a rename out of the notes dir", { ...notes, files: [{ filename: "src/x.js", previousFilename: ".lastlight/issue-3/x" }] }],
+    ["a truncated file list", { ...notes, files: null }],
+    ["300 files", { ...notes, files: Array.from({ length: 300 }, (_, k) => ({ filename: `.lastlight/issue-3/n${k}` })) }],
+  ])("%s: stale-review hand-off, no merge", async (_n, compare) => {
+    const { github, res } = await run(compare);
+    expect(res.decision).toBe("hand-off");
+    expect(res.reason).toMatch(/^stale-review:/);
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+  });
+
+  it("a compare call that throws waits: no merge, no comment", async () => {
+    const { github, res, db } = await run(new Error("502"));
+    expect(res.decision).toBe("wait");
+    expect(res.reason).toMatch(/^compare-unknown:/);
+    expect(github.mergePullRequest).not.toHaveBeenCalled();
+    expect(github.postComment).not.toHaveBeenCalled();
+    expect((await ledger(db))[0]).toMatchObject({ decision: "wait", headSha: "B" });
+  });
+
+  it("head == reviewed: no compare call, merges at the reviewed head as before", async () => {
+    const db = await makeTestDb();
+    await seedBuildRun(db);
+    const github = fakeGithub({ compare: new Error("must not be called") });
+    const res = await evaluateBuildMerge({ github: github as any, db, botLogin: BOT }, REPO, PR, "sweep");
+    expect(res).toMatchObject({ decision: "merge", outcome: "merged" });
+    expect(github.compareCommits).not.toHaveBeenCalled();
+    expect(github.mergePullRequest).toHaveBeenCalledWith("acme", "widgets", PR, { sha: "B", method: "squash" });
   });
 });
 
