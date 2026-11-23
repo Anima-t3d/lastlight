@@ -335,11 +335,11 @@ describe("readWorkspaceHead", () => {
     expect(readWorkspaceHead({ sandboxDir }, "t1", "o", "r")).toBeUndefined();
   });
 
-  it("captures nothing when an untracked file is present", () => {
+  it("captures HEAD when an untracked file is present (it belongs to no commit)", () => {
     const sandboxDir = tmp();
-    const { repoDir } = checkout(sandboxDir);
+    const { repoDir, git } = checkout(sandboxDir);
     writeFileSync(join(repoDir, "new"), "y");
-    expect(readWorkspaceHead({ sandboxDir }, "t1", "o", "r")).toBeUndefined();
+    expect(readWorkspaceHead({ sandboxDir }, "t1", "o", "r")).toBe(git("rev-parse", "HEAD"));
   });
 
   it("captures nothing when HEAD has no commit", () => {
@@ -527,23 +527,56 @@ describe("captureWorkspaceHead lets the build's own notes dir be dirty", () => {
     expect(cap(sandboxDir, 11)).toEqual({ refused: "dirty-tree" });
   });
 
-  it("an untracked file in another issue's dir -> dirty-tree", () => {
-    const { sandboxDir, repoDir } = checkout();
+  it("an untracked file in another issue's dir -> captures HEAD", () => {
+    const { sandboxDir, repoDir, git } = checkout();
     mkdirSync(notesDir(repoDir, "issue-12"), { recursive: true });
     writeFileSync(notesDir(repoDir, "issue-12", "status.md"), "x");
-    expect(cap(sandboxDir, 11)).toEqual({ refused: "dirty-tree" });
+    expect(cap(sandboxDir, 11)).toEqual({ sha: git("rev-parse", "HEAD") });
   });
 
-  it("issue-110 is not issue-11 -> dirty-tree", () => {
-    const { sandboxDir, repoDir } = checkout();
+  it("untracked files anywhere (root lockfile, issue-110, .lastlight root) -> captures HEAD", () => {
+    const { sandboxDir, repoDir, git } = checkout();
+    writeFileSync(join(repoDir, "package-lock.json"), "{}");
     mkdirSync(notesDir(repoDir, "issue-110"), { recursive: true });
     writeFileSync(notesDir(repoDir, "issue-110", "status.md"), "x");
+    writeFileSync(notesDir(repoDir, "lastlight.yml"), "merge: {}");
+    expect(cap(sandboxDir, 11)).toEqual({ sha: git("rev-parse", "HEAD") });
+    expect(cap(sandboxDir)).toEqual({ sha: git("rev-parse", "HEAD") });
+  });
+
+  it("a modified tracked src/x.js -> dirty-tree, and the log names the path", () => {
+    const { sandboxDir, repoDir } = checkout();
+    writeFileSync(join(repoDir, "src", "x.js"), "changed");
+    const warn = vi.mocked(logger("t").warn);
+    warn.mockClear();
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "dirty-tree" });
+    expect(warn.mock.calls[0][1]).toMatchObject({ reason: "dirty-tree", paths: ["src/x.js"], more: 0 });
+  });
+
+  it("the log caps the offending paths at 5 and counts the rest", () => {
+    const { sandboxDir, repoDir } = checkout();
+    for (let i = 0; i < 8; i++) writeFileSync(join(repoDir, "src", `m${i}.js`), "x");
+    execFileSync("git", ["-C", repoDir, "add", "-A"]);
+    execFileSync("git", ["-C", repoDir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "more"]);
+    for (let i = 0; i < 8; i++) writeFileSync(join(repoDir, "src", `m${i}.js`), "y");
+    const warn = vi.mocked(logger("t").warn);
+    warn.mockClear();
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "dirty-tree" });
+    const meta = warn.mock.calls[0][1] as { paths: string[]; more: number };
+    expect(meta.paths).toHaveLength(5);
+    expect(meta.more).toBe(3);
+  });
+
+  it("a deleted tracked file -> dirty-tree", () => {
+    const { sandboxDir, repoDir } = checkout();
+    rmSync(join(repoDir, "src", "x.js"));
     expect(cap(sandboxDir, 11)).toEqual({ refused: "dirty-tree" });
   });
 
-  it("a .lastlight file outside any issue dir -> dirty-tree", () => {
+  it("an untracked file plus a modified tracked file -> dirty-tree", () => {
     const { sandboxDir, repoDir } = checkout();
-    writeFileSync(notesDir(repoDir, "lastlight.yml"), "merge: {}");
+    writeFileSync(join(repoDir, "package-lock.json"), "{}");
+    writeFileSync(join(repoDir, "src", "x.js"), "changed");
     expect(cap(sandboxDir, 11)).toEqual({ refused: "dirty-tree" });
   });
 

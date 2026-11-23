@@ -346,9 +346,11 @@ export function runIssueNumber(ctx: TemplateContext): number | undefined {
 }
 
 /**
- * Every path `git status --porcelain -z` names — both ends of a rename or copy
- * — or null when the output does not parse (which the caller treats as dirty).
- * Records are `XY <path>\0`; an `R`/`C` record is followed by its source path.
+ * Every tracked path `git status --porcelain -z` names — both ends of a rename
+ * or copy — or null when the output does not parse (which the caller treats as
+ * dirty). Untracked (`??`) records are skipped: they belong to no commit, so
+ * they cannot change what merges. Records are `XY <path>\0`; an `R`/`C` record
+ * is followed by its source path.
  */
 function statusPaths(out: string): string[] | null {
   const fields = out.split("\0");
@@ -357,6 +359,7 @@ function statusPaths(out: string): string[] | null {
   for (let k = 0; k < fields.length; k++) {
     const rec = fields[k];
     if (rec.length < 4 || rec[2] !== " ") return null;
+    if (rec.startsWith("??")) continue;
     paths.push(rec.slice(3));
     if (/[RC]/.test(rec.slice(0, 2))) {
       const from = fields[++k];
@@ -464,8 +467,8 @@ function triggerMergeEvaluation(
  * committed. Capture succeeds only when the BUILD's own checkout
  * (`<sandboxDir>/<taskId>/<repo>`, never the pr-review layout fallback
  * `resolveHostRepoDir` can return) has a real HEAD commit and nothing
- * uncommitted or untracked (ignored files never reach the commit, so they do
- * not count). Otherwise undefined, which makes an approval unrecordable, with
+ * uncommitted (untracked files, ignored or not, belong to no commit, so they
+ * do not count). Otherwise undefined, which makes an approval unrecordable, with
  * one warning naming the reason.
  *
  * Two shapes are refused before any status runs:
@@ -482,8 +485,9 @@ function triggerMergeEvaluation(
  * One exception to "clean": the build's own notes dir, `.lastlight/issue-<N>/`
  * with `issueNumber` from the run record. The reviewer writes its verdict and
  * status there AFTER reviewing, so those changes (modified, added, deleted or
- * untracked, strictly inside that dir) do not refuse. Any other dirty path
- * does, including either end of a rename that leaves the dir. The SHA is HEAD
+ * untracked, strictly inside that dir) do not refuse. Any other tracked change
+ * does, including either end of a rename that leaves the dir; an untracked file
+ * never does, wherever it is. The SHA is HEAD
  * either way; the merge gate checks that the PR head adds only such notes.
  */
 export function readWorkspaceHead(
@@ -509,8 +513,10 @@ export function captureWorkspaceHead(
   repo: string,
   issueNumber?: number,
 ): { sha: string } | { refused: CaptureRefusal } {
-  const refuse = (reason: CaptureRefusal, err?: unknown): { refused: CaptureRefusal } => {
-    log.warn("Not capturing the reviewed commit", { taskId, repo: `${owner}/${repo}`, reason, ...(err ? { err } : {}) });
+  const refuse = (reason: CaptureRefusal, err?: unknown, offending?: string[]): { refused: CaptureRefusal } => {
+    // Offending paths go to the log only (up to 5, then a count), never a PR comment.
+    const paths = offending ? { paths: offending.slice(0, 5), more: Math.max(0, offending.length - 5) } : {};
+    log.warn("Not capturing the reviewed commit", { taskId, repo: `${owner}/${repo}`, reason, ...paths, ...(err ? { err } : {}) });
     return { refused: reason };
   };
   const repoDir = resolve(config.sandboxDir || join(config.stateDir || "data", "sandboxes"), taskId, repo);
@@ -585,8 +591,8 @@ export function captureWorkspaceHead(
       ];
       const dirty = statusPaths(run(status, indexFile));
       if (dirty === null) return refuse("dirty-tree");
-      const outside = dirty.some((p) => issueNumber === undefined || !isInOwnNotesDir(p, issueNumber));
-      return outside ? refuse("dirty-tree") : { sha };
+      const outside = dirty.filter((p) => issueNumber === undefined || !isInOwnNotesDir(p, issueNumber));
+      return outside.length > 0 ? refuse("dirty-tree", undefined, outside) : { sha };
     } catch (err: unknown) {
       // git could not say whether the tree is clean: do not vouch for it.
       return refuse("dirty-tree", err);
