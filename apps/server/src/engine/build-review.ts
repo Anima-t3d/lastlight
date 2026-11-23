@@ -91,6 +91,7 @@ export const CAPTURE_REFUSALS = [
   "submodules",
   "index-flags",
   "temp-index",
+  "attributes",
 ] as const;
 export type CaptureRefusal = (typeof CAPTURE_REFUSALS)[number];
 
@@ -348,18 +349,22 @@ export function runIssueNumber(ctx: TemplateContext): number | undefined {
 /**
  * Every tracked path `git status --porcelain -z` names — both ends of a rename
  * or copy — or null when the output does not parse (which the caller treats as
- * dirty). Untracked (`??`) records are skipped: they belong to no commit, so
- * they cannot change what merges. Records are `XY <path>\0`; an `R`/`C` record
+ * dirty). Untracked (`??`) records come back apart: they belong to no commit, so
+ * they cannot change what merges, but an attributes file among them can hide a change. Records are `XY <path>\0`; an `R`/`C` record
  * is followed by its source path.
  */
-function statusPaths(out: string): string[] | null {
+function statusPaths(out: string): { tracked: string[]; untracked: string[] } | null {
   const fields = out.split("\0");
   if (fields[fields.length - 1] === "") fields.pop();
   const paths: string[] = [];
+  const untracked: string[] = [];
   for (let k = 0; k < fields.length; k++) {
     const rec = fields[k];
     if (rec.length < 4 || rec[2] !== " ") return null;
-    if (rec.startsWith("??")) continue;
+    if (rec.startsWith("??")) {
+      untracked.push(rec.slice(3));
+      continue;
+    }
     paths.push(rec.slice(3));
     if (/[RC]/.test(rec.slice(0, 2))) {
       const from = fields[++k];
@@ -367,8 +372,17 @@ function statusPaths(out: string): string[] | null {
       paths.push(from);
     }
   }
-  return paths;
+  return { tracked: paths, untracked };
 }
+
+/**
+ * An untracked `.gitattributes` (or `.gitmodules`) anywhere can change how git
+ * normalises worktree files when status compares them, so a modified tracked
+ * file could read as clean. Case-insensitive: a case-folding filesystem honours
+ * `.GitAttributes`.
+ */
+const ATTRIBUTE_FILE = /^\.git(attributes|modules)$/i;
+const isAttributeFile = (path: string): boolean => ATTRIBUTE_FILE.test(path.slice(path.lastIndexOf("/") + 1));
 
 function captureRefusal(raw: unknown): CaptureRefusal | undefined {
   if (raw === undefined) return undefined;
@@ -553,6 +567,8 @@ export function captureWorkspaceHead(
   } catch (err: unknown) {
     return refuse("index-flags", err);
   }
+  // `.git/info/attributes` is the agent's to write and applies to every path.
+  if (existsSync(join(repoDir, ".git", "info", "attributes"))) return refuse("attributes");
   let sha: string;
   try {
     run(["cat-file", "-e", "HEAD^{commit}"]);
@@ -586,11 +602,18 @@ export function captureWorkspaceHead(
     try {
       // Submodules were refused above; never recurse into one regardless.
       // `-z`: NUL-terminated, unquoted paths, so a path cannot pose as two.
+      // `core.attributesFile=/dev/null` drops the user-level attributes file.
+      // git >= 2.40 could also pin `--attr-source=<sha>`, but the deployment image
+      // (node:22-slim, Debian bookworm, git 2.39) predates it: the refusals for an
+      // untracked `.gitattributes` and `.git/info/attributes` cover that instead.
       const status = [
-        "-c", "submodule.recurse=false", "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=all",
+        "-c", "submodule.recurse=false", "-c", "core.attributesFile=/dev/null", "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=all",
       ];
-      const dirty = statusPaths(run(status, indexFile));
-      if (dirty === null) return refuse("dirty-tree");
+      const records = statusPaths(run(status, indexFile));
+      if (records === null) return refuse("dirty-tree");
+      const attrs = records.untracked.filter(isAttributeFile);
+      if (attrs.length > 0) return refuse("attributes", undefined, attrs);
+      const dirty = records.tracked;
       const outside = dirty.filter((p) => issueNumber === undefined || !isInOwnNotesDir(p, issueNumber));
       return outside.length > 0 ? refuse("dirty-tree", undefined, outside) : { sha };
     } catch (err: unknown) {

@@ -729,6 +729,76 @@ describe("captureWorkspaceHead names the refusal", () => {
   });
 });
 
+describe("captureWorkspaceHead refuses when git attributes could hide a change", () => {
+  function checkout() {
+    const sandboxDir = mkdtempSync(join(tmpdir(), "bw-"));
+    const repoDir = join(sandboxDir, "t1", "r");
+    mkdirSync(join(repoDir, "src"), { recursive: true });
+    const git = (...a: string[]) => execFileSync("git", ["-C", repoDir, ...a], { encoding: "utf8" }).trim();
+    git("init", "-q");
+    git("config", "core.autocrlf", "false");
+    writeFileSync(join(repoDir, "src", "x.js"), "line1\nline2\n");
+    git("add", "-A");
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "feat: x");
+    return { sandboxDir, repoDir, git };
+  }
+  const cap = (sandboxDir: string, issueNumber?: number) =>
+    captureWorkspaceHead({ sandboxDir }, "t1", "o", "r", issueNumber);
+
+  it("an untracked src/.gitattributes -> attributes", () => {
+    const { sandboxDir, repoDir } = checkout();
+    writeFileSync(join(repoDir, "src", ".gitattributes"), "* text=auto\n");
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "attributes" });
+  });
+
+  it("an untracked .GitAttributes or .gitmodules, even in the own notes dir -> attributes", () => {
+    const a = checkout();
+    mkdirSync(join(a.repoDir, ".lastlight", "issue-11"), { recursive: true });
+    writeFileSync(join(a.repoDir, ".lastlight", "issue-11", ".GitAttributes"), "x");
+    expect(cap(a.sandboxDir, 11)).toEqual({ refused: "attributes" });
+    const b = checkout();
+    writeFileSync(join(b.repoDir, ".gitmodules"), "x");
+    expect(cap(b.sandboxDir, 11)).toEqual({ refused: "attributes" });
+  });
+
+  it(".git/info/attributes present -> attributes", () => {
+    const { sandboxDir, repoDir } = checkout();
+    mkdirSync(join(repoDir, ".git", "info"), { recursive: true });
+    writeFileSync(join(repoDir, ".git", "info", "attributes"), "* text=auto\n");
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "attributes" });
+  });
+
+  it("a modified tracked .gitattributes -> dirty-tree", () => {
+    const { sandboxDir, repoDir, git } = checkout();
+    writeFileSync(join(repoDir, ".gitattributes"), "*.js -text\n");
+    git("add", ".gitattributes");
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "attrs");
+    writeFileSync(join(repoDir, ".gitattributes"), "* text=auto\n");
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "dirty-tree" });
+  });
+
+  it("only an untracked package-lock.json -> captures", () => {
+    const { sandboxDir, repoDir, git } = checkout();
+    writeFileSync(join(repoDir, "package-lock.json"), "{}");
+    expect(cap(sandboxDir, 11)).toEqual({ sha: git("rev-parse", "HEAD") });
+  });
+
+  it("a CRLF-only change under an untracked `* text=auto` is refused, not silently clean", () => {
+    const { sandboxDir, repoDir } = checkout();
+    writeFileSync(join(repoDir, "src", "x.js"), "line1\r\nline2\r\n");
+    writeFileSync(join(repoDir, ".gitattributes"), "* text=auto\n");
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "attributes" });
+  });
+
+  it("a CRLF-only change under .git/info/attributes is refused", () => {
+    const { sandboxDir, repoDir } = checkout();
+    writeFileSync(join(repoDir, "src", "x.js"), "line1\r\nline2\r\n");
+    mkdirSync(join(repoDir, ".git", "info"), { recursive: true });
+    writeFileSync(join(repoDir, ".git", "info", "attributes"), "* text=auto\n");
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "attributes" });
+  });
+});
+
 describe("finalizeBuildReviewForRun — a gate run whose approval cannot be recorded (I4a)", () => {
   const gateCtx = {
     owner: "o", repo: "r", branch: "lastlight/1-x", issueDir: ".lastlight/issue-1",
