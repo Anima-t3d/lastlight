@@ -607,11 +607,19 @@ export function captureWorkspaceHead(
       // (node:22-slim, Debian bookworm, git 2.39) predates it: the refusals for an
       // untracked `.gitattributes` and `.git/info/attributes` cover that instead.
       const status = [
-        "-c", "submodule.recurse=false", "-c", "core.attributesFile=/dev/null", "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=all",
+        "-c", "submodule.recurse=false", "-c", "core.attributesFile=/dev/null", "-c", "core.excludesFile=/dev/null", "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=all",
       ];
       const records = statusPaths(run(status, indexFile));
       if (records === null) return refuse("dirty-tree");
-      const attrs = records.untracked.filter(isAttributeFile);
+      // Ignored files never show as `??`, and the agent controls every ignore
+      // source: list ALL untracked files (no exclude rules, no `--directory`).
+      let untracked: string[];
+      try {
+        untracked = run(["ls-files", "-o", "-z"], indexFile).split("\0").filter(Boolean);
+      } catch (err: unknown) {
+        return refuse("attributes", err);
+      }
+      const attrs = [...records.untracked, ...untracked].filter(isAttributeFile);
       if (attrs.length > 0) return refuse("attributes", undefined, attrs);
       const dirty = records.tracked;
       const outside = dirty.filter((p) => issueNumber === undefined || !isInOwnNotesDir(p, issueNumber));

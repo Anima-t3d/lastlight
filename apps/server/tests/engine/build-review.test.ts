@@ -790,6 +790,29 @@ describe("captureWorkspaceHead refuses when git attributes could hide a change",
     expect(cap(sandboxDir, 11)).toEqual({ refused: "attributes" });
   });
 
+  it("an untracked src/.gitattributes hidden by an untracked self-ignoring .gitignore -> attributes", () => {
+    const { sandboxDir, repoDir } = checkout();
+    writeFileSync(join(repoDir, "src", ".gitattributes"), "* text=auto\n");
+    writeFileSync(join(repoDir, ".gitignore"), ".gitignore\n.gitattributes\n");
+    writeFileSync(join(repoDir, "src", "x.js"), "line1\r\nline2\r\n");
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "attributes" });
+  });
+
+  it("an attributes file hidden by .git/info/exclude -> attributes", () => {
+    const { sandboxDir, repoDir } = checkout();
+    writeFileSync(join(repoDir, "src", ".gitattributes"), "* text=auto\n");
+    mkdirSync(join(repoDir, ".git", "info"), { recursive: true });
+    writeFileSync(join(repoDir, ".git", "info", "exclude"), ".gitattributes\n");
+    expect(cap(sandboxDir, 11)).toEqual({ refused: "attributes" });
+  });
+
+  it("a large untracked tree with no attributes file -> captures", () => {
+    const { sandboxDir, repoDir, git } = checkout();
+    mkdirSync(join(repoDir, "node_modules", "pkg"), { recursive: true });
+    for (let i = 0; i < 2000; i++) writeFileSync(join(repoDir, "node_modules", "pkg", `f${i}.js`), "x");
+    expect(cap(sandboxDir, 11)).toEqual({ sha: git("rev-parse", "HEAD") });
+  });
+
   it("a CRLF-only change under .git/info/attributes is refused", () => {
     const { sandboxDir, repoDir } = checkout();
     writeFileSync(join(repoDir, "src", "x.js"), "line1\r\nline2\r\n");
