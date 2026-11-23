@@ -1263,6 +1263,8 @@ export class GitHubClient {
       labels: string[];
       headRef: string;
       headSha: string;
+      /** `owner/repo` of the head repo; null when the fork was deleted. */
+      headRepoFullName: string | null;
       createdAt: string;
     }>
   > {
@@ -1283,6 +1285,7 @@ export class GitHubClient {
         .filter(Boolean),
       headRef: p.head?.ref ?? "",
       headSha: p.head?.sha ?? "",
+      headRepoFullName: p.head?.repo?.full_name ?? null,
       createdAt: p.created_at ?? "",
     }));
   }

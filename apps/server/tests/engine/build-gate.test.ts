@@ -51,12 +51,28 @@ const REPO = "cliftonc/lastlight";
 const ISSUE = 412;
 const HOLD = "lastlight-ignore";
 
+interface OpenPr {
+  number: number;
+  headRef: string;
+  authorLogin: string;
+  headRepoFullName: string | null;
+}
+const BOT = "last-light[bot]";
+/** The bot's own same-repo build PR, unless a case overrides a field. */
+const botPr = (headRef: string, over: Partial<OpenPr> = {}) => ({
+  number: 8,
+  headRef,
+  authorLogin: BOT,
+  headRepoFullName: REPO,
+  ...over,
+});
+
 /** A GitHub stand-in that records the two label writes the advance is made of. */
 function fakeGithub(
   over: {
     addLabels?: () => Promise<void>;
     live?: () => Promise<unknown>;
-    openPrs?: () => Promise<Array<{ number: number; headRef: string }>>;
+    openPrs?: () => Promise<Array<Partial<OpenPr> & { number: number; headRef: string }>>;
   } = {},
 ) {
   const addLabels = vi.fn(async (_o: string, _r: string, _n: number, _names: string[]) => {
@@ -828,7 +844,7 @@ describe("applyBuildDispatchGate — budget skip consequences", () => {
     });
 
     it("skips `handed-off` an issue with an OPEN lastlight/<N>-… PR (factory-test #7 / #8)", async () => {
-      const github = fakeGithub({ openPrs: async () => [{ number: 8, headRef: `lastlight/${ISSUE}-fix-the-thing` }] });
+      const github = fakeGithub({ openPrs: async () => [botPr(`lastlight/${ISSUE}-fix-the-thing`)] });
       const result = await applyBuildDispatchGate(args({ route: "sweep" }), { db, github });
       expect(result.decision).toBe("skip");
       expect(result.reason).toMatch(/^handed-off:/);
@@ -846,6 +862,30 @@ describe("applyBuildDispatchGate — budget skip consequences", () => {
       });
       const result = await applyBuildDispatchGate(args({ route: "sweep" }), { db, github });
       expect(result.decision).toBe("dispatch");
+    });
+
+    it("dispatches when a FORK PR carries a matching head ref (public-repo DoS)", async () => {
+      const github = fakeGithub({
+        openPrs: async () => [botPr(`lastlight/${ISSUE}-x`, { headRepoFullName: "mallory/lastlight" })],
+      });
+      expect((await applyBuildDispatchGate(args({ route: "sweep" }), { db, github })).decision).toBe("dispatch");
+    });
+
+    it("dispatches when a deleted-fork PR (no head repo) carries a matching head ref", async () => {
+      const github = fakeGithub({ openPrs: async () => [botPr(`lastlight/${ISSUE}-x`, { headRepoFullName: null })] });
+      expect((await applyBuildDispatchGate(args({ route: "sweep" }), { db, github })).decision).toBe("dispatch");
+    });
+
+    it("dispatches when a same-repo PR by a HUMAN carries a matching head ref", async () => {
+      const github = fakeGithub({ openPrs: async () => [botPr(`lastlight/${ISSUE}-x`, { authorLogin: "alice" })] });
+      expect((await applyBuildDispatchGate(args({ route: "sweep" }), { db, github })).decision).toBe("dispatch");
+    });
+
+    it("skips when the bot login cannot be resolved (fail closed)", async () => {
+      const github = fakeGithub({ openPrs: async () => [] });
+      const result = await applyBuildDispatchGate(args({ route: "sweep" }), { db, github, botLogin: "" });
+      expect(result.decision).toBe("skip");
+      expect(result.reason).toMatch(/^handed-off: could not check/);
     });
 
     it("dispatches when the build PR is closed or merged (the lookup lists open PRs only)", async () => {
@@ -883,7 +923,7 @@ describe("applyBuildDispatchGate — budget skip consequences", () => {
         context: { _stage: "build", _autonomous: true, _attempt: 1 },
         startedAt: new Date(Date.now() - 9_000).toISOString(),
       });
-      const github = fakeGithub({ openPrs: async () => [{ number: 8, headRef: `lastlight/${ISSUE}-x` }] });
+      const github = fakeGithub({ openPrs: async () => [botPr(`lastlight/${ISSUE}-x`)] });
       const result = await applyBuildDispatchGate(
         args({ route: "escalation", senderIsBot: true, addedLabel: undefined, labels: [STAGE_AGENT_BUILDING], attempt: 2 }),
         { db, github },
@@ -898,7 +938,7 @@ describe("applyBuildDispatchGate — budget skip consequences", () => {
       const ok = await applyBuildDispatchGate(stale, { db, github: fakeGithub() });
       expect(ok.decision).toBe("dispatch");
 
-      const withPr = fakeGithub({ openPrs: async () => [{ number: 8, headRef: `lastlight/${ISSUE}-x` }] });
+      const withPr = fakeGithub({ openPrs: async () => [botPr(`lastlight/${ISSUE}-x`)] });
       const blocked = await applyBuildDispatchGate(args({ route: "api", labels: [STAGE_AGENT_BLOCKED] }), {
         db: await makeTestDb(),
         github: withPr,

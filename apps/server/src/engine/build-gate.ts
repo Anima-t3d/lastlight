@@ -23,7 +23,7 @@
  * keeps the footprint of this feature small enough to read in one sitting.
  */
 
-import { getAutonomyConfig, getBuildConfig, getHoldLabel, isAutonomousRepo, stageWorkflow } from "../config/config.js";
+import { getAutonomyConfig, getBotLogin, getBuildConfig, getHoldLabel, isAutonomousRepo, stageWorkflow } from "../config/config.js";
 import type { AutonomyStageConfig } from "../config/config.js";
 import { issueTriggerId, resolveBuildTrigger } from "./build-decisions.js";
 import { advanceStage } from "./stage-advance.js";
@@ -64,6 +64,8 @@ export interface BuildGateDeps {
   db: StateDb;
   /** `null` in chat-only mode — there is then no label to advance. */
   github: GitHubClient | null;
+  /** The bot's GitHub login; defaults to the loaded config's. Empty = unresolvable. */
+  botLogin?: string;
 }
 
 export interface BuildGateResult {
@@ -137,7 +139,7 @@ export async function applyBuildDispatchGate(
   // read and must not make other gate calls wait on it. Applied below, after the
   // pure decision, so every other skip outranks it and a hand-off skip never
   // takes a reservation.
-  const handedOff = await handedOffReason(args, stage, deps.github);
+  const handedOff = await handedOffReason(args, stage, deps.github, deps.botLogin ?? getBotLogin());
   // The usage-window verdict (`autonomy.budget.usage`; undefined = gate off),
   // read BEFORE the lock: it touches no state the lock protects, and an
   // external source must never make every other gate call wait on it.
@@ -327,8 +329,8 @@ export async function applyBuildDispatchGate(
  *
  * Two facts, both silent (no comment, no label change; the caller logs):
  * 1. the stage's `on_success` hand-off label is on the issue (case-insensitive);
- * 2. an OPEN PR's head branch is this issue's build branch, `lastlight/<N>-…`
- *    (the prefix `simple.ts` creates). A failed lookup FAILS CLOSED: the sweep
+ * 2. an OPEN PR by the bot, from this same repo (not a fork), has this issue's
+ *    build branch `lastlight/<N>-…` (the prefix `simple.ts` creates). A failed lookup FAILS CLOSED: the sweep
  *    retries on its next tick.
  *
  * Route exemptions, each only where the check would otherwise defeat a route:
@@ -344,6 +346,7 @@ async function handedOffReason(
   args: BuildGateArgs,
   stage: AutonomyStageConfig,
   github: GitHubClient | null,
+  botLogin: string | undefined,
 ): Promise<string | undefined> {
   const subject = `${args.repo}#${args.issueNumber}`;
   const handOff = stage.on_success.toLowerCase();
@@ -353,9 +356,24 @@ async function handedOffReason(
   if (args.route === "escalation" || !github) return undefined;
   const [owner, name] = args.repo.split("/");
   const prefix = `lastlight/${args.issueNumber}-`;
+  // Anyone can open a fork PR named `lastlight/<N>-x`, so only the bot's own
+  // same-repo PR counts. Same rule as the merge sweep (`authorLogin === botLogin`)
+  // and `build-merge`'s fork test (head repo !== base repo, null = deleted fork).
+  if (!botLogin) {
+    log.warn("Build gate has no bot login to recognise its own PRs; skipping as handed-off (fail closed)", {
+      repo: args.repo,
+      issueNumber: args.issueNumber,
+    });
+    return `handed-off: could not check ${subject} for an open build PR; the sweep retries`;
+  }
   try {
     const open = await github.listOpenPullRequests(owner ?? "", name ?? "");
-    const pr = open.find((p) => p.headRef.startsWith(prefix));
+    const pr = open.find(
+      (p) =>
+        p.authorLogin === botLogin &&
+        p.headRepoFullName?.toLowerCase() === args.repo.toLowerCase() &&
+        p.headRef.startsWith(prefix),
+    );
     if (pr) return `handed-off: ${subject} already has open build PR #${pr.number} (\`${pr.headRef}\`)`;
   } catch (err: unknown) {
     log.warn("Build gate could not list open PRs; skipping as handed-off (fail closed)", {

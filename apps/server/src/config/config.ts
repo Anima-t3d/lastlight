@@ -655,6 +655,10 @@ export function getRoutes(): RouteConfig {
  * loaded yet (unit tests). Drives the router's `@mention` handle plus the
  * derived `botLogin` and git commit author.
  */
+export function getBotLogin(): string | undefined {
+  return currentConfig?.botLogin || undefined;
+}
+
 export function getBotName(): string {
   return currentConfig?.botName || "last-light";
 }
